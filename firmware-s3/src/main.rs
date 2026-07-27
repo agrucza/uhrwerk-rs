@@ -228,6 +228,68 @@ impl Bringup for S3Bringup {
     }
 }
 
+/// ES7210 analog input gain. 30 dB is the esp-bsp / esp_codec_dev
+/// reference default for this ADC and is usable now that the modulator
+/// clock is correct (the earlier "30 dB clips on ambient" reading was
+/// the misclocked modulator's own noise, not real signal). The shared
+/// level-meter constants are calibrated against this value.
+const MIC_GAIN: drivers::es7210::MicGain = drivers::es7210::MicGain::Db30;
+
+/// Per-session audio hardware bring-up, passed to `run_session` as its
+/// `init_hw` future - this board's codec pair (ES8311 DAC + ES7210
+/// ADC) at this board's levels. Runs with the I2S clocks already up;
+/// see the hook's call site in `run_session` for the timing contract
+/// and why it must re-run every session.
+///
+/// The ALDO1 analog rail both codecs need is already enabled at boot
+/// (the FT3168 touch controller shares it - see `Pmu::set_audio_rail`),
+/// so no rail toggle happens here.
+async fn codec_init(i2c_bus: &'static system_core::bus::SharedI2c) {
+    use drivers::es8311::Es8311;
+    use drivers::es7210::Es7210;
+    use embassy_time::{Duration, Timer};
+
+    let mut i2c = i2c_bus.lock().await;
+    let es8311 = Es8311::new();
+    match es8311.init(&mut *i2c) {
+        Ok(()) => {
+            // Reset hold, per the reference driver. Skipping it left
+            // the chip half-reset on a coin-flip of session re-inits:
+            // silent or warbling DAC, hot ADC path.
+            Timer::after(Duration::from_millis(20)).await;
+            match es8311.init_after_reset(&mut *i2c) {
+                Ok(()) => log::info!("Audio: ES8311 ready"),
+                Err(_) => log::error!("Audio: ES8311 config failed"),
+            }
+        }
+        Err(_) => log::error!(
+            "Audio: ES8311 not found at 0x{:02X}",
+            drivers::es8311::ADDR,
+        ),
+    }
+    let _ = es8311.set_volume(&mut *i2c, 0xAF);
+
+    let es7210 = Es7210::new();
+    match es7210.init(&mut *i2c) {
+        Ok(()) => {
+            Timer::after(Duration::from_millis(10)).await;
+            let _ = es7210.init_after_delay(&mut *i2c);
+            Timer::after(Duration::from_millis(10)).await;
+            match es7210.finalize(&mut *i2c) {
+                Ok(()) => {
+                    let _ = es7210.set_gain(&mut *i2c, MIC_GAIN);
+                    log::info!("Audio: ES7210 ready (gain override applied)");
+                }
+                Err(_) => log::error!("Audio: ES7210 finalize failed"),
+            }
+        }
+        Err(_) => log::error!(
+            "Audio: ES7210 not found at 0x{:02X}",
+            drivers::es7210::ADDR,
+        ),
+    }
+}
+
 /// Audio dispatch loop. Owns the board-specific peripheral tokens and
 /// the cross-session state (amp, tone-phase counter),
 /// and reborrows the tokens into a fresh `run_session` for each
@@ -286,7 +348,6 @@ async fn audio_task(
         };
         pending = run_session(
             mode,
-            i2c_bus,
             i2s.reborrow(), dma.reborrow(),
             mclk.reborrow(), bclk.reborrow(), ws.reborrow(),
             dout.reborrow(), din.reborrow(),
@@ -300,6 +361,7 @@ async fn audio_task(
             // TX/RX units clock-coherent on its own (unlike the C6 -
             // see that bin's `tune_i2s`).
             || {},
+            codec_init(i2c_bus),
         )
         .await;
     }

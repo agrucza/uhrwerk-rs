@@ -1,10 +1,8 @@
 extern crate alloc;
 
 use crate::audio_hal::{self, SpeakerAmp};
-use crate::bus::{AudioCommand, AUDIO_COMMAND, EVENTS, SharedI2c};
+use crate::bus::{AudioCommand, AUDIO_COMMAND, EVENTS};
 use app_core::events::SystemEvent;
-use drivers::es8311::Es8311;
-use drivers::es7210::{Es7210, MicGain};
 use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::{
@@ -47,9 +45,9 @@ const TX_RING_BYTES: usize = 4096;
 
 /// Lead-in silence streamed before the first test tone. Covers the
 /// stale-ring lap (~64 ms of whatever the previous session left in
-/// the TX ring) and the ES8311's DAC unmute ramp, both of which were
-/// swallowing the start of the 440 Hz tone. The amp is enabled only
-/// after this has drained.
+/// the TX ring) and the codec boards' DAC unmute ramp, both of which
+/// were swallowing the start of the 440 Hz tone. The amp is enabled
+/// only after this has drained.
 const TONE_LEAD_MS: u64 = 150;
 
 /// LOOP-test parrot recording buffer size in bytes. The recording is
@@ -88,12 +86,6 @@ const MIC_LEVEL_DELTA: u8 = 4;
 /// matching the MOTION sub-view's proven-safe redraw cadence. Emitting
 /// per chunk (~15 Hz) saturates the render loop and locks out touch.
 const MIC_EMIT_MS: u64 = 200;
-
-/// ES7210 analog input gain. 30 dB is the esp-bsp / esp_codec_dev
-/// reference default for this ADC and is usable now that the modulator
-/// clock is correct (the earlier "30 dB clips on ambient" reading was
-/// the misclocked modulator's own noise, not real signal).
-const MIC_GAIN: MicGain = MicGain::Db30;
 
 /// Resting mic noise floor (mean-abs units) gated out so a quiet room
 /// reads ~0 instead of a jittery baseline. Calibrated at 30 dB gain:
@@ -900,9 +892,9 @@ pub enum SessionMode {
 }
 
 /// Run **one** audio session: build the I2S + DMA stack from the
-/// supplied (reborrowed) peripheral handles, re-init the codecs, run
-/// the play/capture loop, and tear everything down cleanly when the
-/// session ends.
+/// supplied (reborrowed) peripheral handles, run the bin's hardware
+/// init hook, run the play/capture loop, and tear everything down
+/// cleanly when the session ends.
 ///
 /// **Why this shape:** esp-hal's circular DMA has no public reset API.
 /// Once the descriptor ring wraps with no consumer draining it (which
@@ -918,21 +910,20 @@ pub enum SessionMode {
 ///
 /// The bin's `audio_task` owns the underlying `Peri<'static, _>` tokens,
 /// the speaker amp, and the tone-phase counter across sessions; this
-/// function borrows them per call. `tune_i2s` is the bin's seam for
-/// chip-specific I2S register fixups (see its call site below).
+/// function borrows them per call. Two seams carry the board and chip
+/// knowledge this crate must not have: `tune_i2s` for chip-specific
+/// I2S register fixups (see its call site below), and `init_hw` - a
+/// future the bin builds per call - for the board's audio hardware
+/// bring-up (codec init, gains, volumes; see ITS call site below for
+/// the timing contract).
 ///
 /// Returns the command the dispatcher should handle next, if the inner
 /// loop consumed one (e.g. a `PlayAlarm` that interrupted capture).
 /// `None` means the session ended cleanly via its mode's Stop and the
 /// dispatcher should park on the next `AUDIO_COMMAND.receive()`.
-///
-/// The ALDO1 analog rail both codecs need is already enabled at boot
-/// (the FT3168 touch controller shares it - see `Pmu::set_audio_rail`),
-/// so no rail toggle happens here.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_session<'d>(
     mode: SessionMode,
-    i2c_bus: &'static SharedI2c,
     i2s: impl esp_hal::i2s::master::Instance + 'd,
     dma_ch: impl DmaChannelFor<AnyI2s<'d>>,
     mclk: impl PeripheralOutput<'d>,
@@ -947,6 +938,7 @@ pub async fn run_session<'d>(
     rx_desc: &'d mut [DmaDescriptor],
     phase: &mut u32,
     tune_i2s: fn(),
+    init_hw: impl core::future::Future<Output = ()>,
 ) -> Option<AudioCommand> {
     log::info!("Audio: session {:?}", mode);
     // Full-duplex bring-up - both sides share one I2S0 + clocks.
@@ -967,9 +959,9 @@ pub async fn run_session<'d>(
     // shared-clock duplex silicon.) The determinism comes at a known
     // cost: one spurious leading byte in the RX stream on both
     // boards' silicon, which `rx_align_offset` detects and the
-    // consumers compensate for. Do not delay RX past codec init
-    // either - tried 2026-07-22, wedges every session's first pop
-    // with `Late`; the RX DMA must be running before the clocks are.
+    // consumers compensate for. Do not delay RX until after the init
+    // hook either - tried 2026-07-22, wedges every session's first
+    // pop with `Late`; the RX DMA must be running before the clocks.
     let mut rx = match i2s_rx.read_dma_circular_async(rx_buf) {
         Ok(r) => r,
         Err(e) => {
@@ -987,7 +979,7 @@ pub async fn run_session<'d>(
         }
     };
     // The session's pop buffer, allocated up here so the RX ring can
-    // be drained IMMEDIATELY - before the flush and codec init below,
+    // be drained IMMEDIATELY - before the flush and init hook below,
     // which together take ~250 ms (more under a render-saturated
     // executor). Waiting until the mode loops' own drains to make the
     // first pop let the ring approach its ~512 ms capacity and birth
@@ -1005,64 +997,21 @@ pub async fn run_session<'d>(
     // Overwrite the stale TX ring with silence before anything else
     // (see `flush_tx_ring`) - here the endless replay is inaudible
     // with the amp off, but loud enough on the DAC output to couple
-    // into the ES7210 and peg the level meter in a quiet room.
+    // into the capture ADC and peg the level meter in a quiet room.
     flush_tx_ring(&mut tx).await;
     Timer::after(Duration::from_millis(10)).await; // MCLK settle
 
-    // Re-init the codecs on EVERY session. The previous session's
-    // transfer drop stopped MCLK flowing to ES7210 / ES8311; on
-    // empirical evidence the codecs don't auto-resume streaming when
-    // MCLK comes back - the ADC silently produces no data, the DMA
-    // never advances, and a capture session's first `pop` never
-    // resolves (capture_until_interrupt races its pops against the
-    // command queue, so even then the task stays responsive). Running
-    // the I2C init sequence here (~30 ms total) re-asserts the codec
-    // enable bits and makes streaming start again. The init is safe
-    // to repeat - it's a defined reset+configure sequence per the
-    // codec drivers.
-    {
-        let mut i2c = i2c_bus.lock().await;
-        let es8311 = Es8311::new();
-        match es8311.init(&mut *i2c) {
-            Ok(()) => {
-                // Reset hold, per the reference driver. Skipping it
-                // left the chip half-reset on a coin-flip of session
-                // re-inits: silent or warbling DAC, hot ADC path.
-                Timer::after(Duration::from_millis(20)).await;
-                match es8311.init_after_reset(&mut *i2c) {
-                    Ok(()) => log::info!("Audio: ES8311 ready"),
-                    Err(_) => log::error!("Audio: ES8311 config failed"),
-                }
-            }
-            Err(_) => log::error!(
-                "Audio: ES8311 not found at 0x{:02X}",
-                drivers::es8311::ADDR,
-            ),
-        }
-        let _ = es8311.set_volume(&mut *i2c, 0xAF);
-
-        let es7210 = Es7210::new();
-        match es7210.init(&mut *i2c) {
-            Ok(()) => {
-                Timer::after(Duration::from_millis(10)).await;
-                let _ = es7210.init_after_delay(&mut *i2c);
-                Timer::after(Duration::from_millis(10)).await;
-                match es7210.finalize(&mut *i2c) {
-                    Ok(()) => {
-                        // Override the driver's 30 dB default - it
-                        // saturates the ADC on ambient.
-                        let _ = es7210.set_gain(&mut *i2c, MIC_GAIN);
-                        log::info!("Audio: ES7210 ready (gain override applied)");
-                    }
-                    Err(_) => log::error!("Audio: ES7210 finalize failed"),
-                }
-            }
-            Err(_) => log::error!(
-                "Audio: ES7210 not found at 0x{:02X}",
-                drivers::es7210::ADDR,
-            ),
-        }
-    }
+    // The bin's hardware bring-up hook, awaited on EVERY session at
+    // exactly this point: the clocks are running (the codecs need
+    // MCLK present to accept configuration) and the mode loops
+    // haven't started. It must re-run per session, not just once:
+    // the previous session's transfer drop stopped the clocks, and
+    // on empirical evidence codecs don't auto-resume streaming when
+    // they return - the ADC silently produces no data, the DMA never
+    // advances, and a capture session's first `pop` never resolves.
+    // WHICH hardware gets initialized (chips, gains, volumes) is the
+    // bin's business - this crate only owns the timing contract.
+    init_hw.await;
 
     let result = match mode {
         SessionMode::Play => {
