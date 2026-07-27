@@ -246,6 +246,77 @@ fn mic_stats(buf: &[u8]) -> MicStats {
     }
 }
 
+/// Digital makeup gain for the PDM-mic capture path, as a left-shift
+/// (3 = x8 = +18 dB). The codec boards' capture runs through the
+/// ADC's +30 dB analog PGA before quantization; a raw PDM mic has no
+/// gain stage anywhere (and this silicon's PDM-to-PCM block has no
+/// amplify stage either), so its -26 dBFS-sensitivity stream arrives
+/// ~30x smaller than the levels the meter constants and the parrot
+/// playback were calibrated against. Chosen from first-hardware
+/// readings: normal-volume ambient sound measured dev ~400-800 raw,
+/// so x8 maps it to ~3200-6400 - the mid-to-high bar zone the meter
+/// constants define for normal speech, leaving headroom above for
+/// genuinely loud input. Raise/lower by 1 if speech undershoots/pegs
+/// the meter after the DC removal below.
+const PDM_RX_GAIN_SHIFT: u32 = 3;
+
+/// RX conditioning for [`run_session_pdm_mic`], run on each popped
+/// chunk before the shared consumers see it: subtract the chunk's
+/// mean (the T3902 carries a documented DC pedestal of up to ~3% of
+/// full scale - measured ~620 on this hardware - and unlike the
+/// codec boards there is no high-pass filter anywhere in the path;
+/// unremoved, the meter reads the pedestal as a permanent ~14/255
+/// and the gain below would multiply it x16), then apply the
+/// saturating makeup gain. Pure sample math, backend-intrinsic, no
+/// chip or board knowledge.
+fn pdm_condition_rx(buf: &mut [u8]) {
+    let mut sum: i64 = 0;
+    let mut n: i64 = 0;
+    for s in buf.chunks_exact(2) {
+        sum += i16::from_le_bytes([s[0], s[1]]) as i64;
+        n += 1;
+    }
+    if n == 0 {
+        return;
+    }
+    let mean = (sum / n) as i32;
+    for s in buf.chunks_exact_mut(2) {
+        let v = i16::from_le_bytes([s[0], s[1]]) as i32;
+        let amplified = ((v - mean) << PDM_RX_GAIN_SHIFT)
+            .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        s.copy_from_slice(&amplified.to_le_bytes());
+    }
+}
+
+/// Parrot playback makeup gain for the PDM-mic session, as a
+/// left-shift (2 = x4 = +12 dB). Applied to the finished recording
+/// just before the playback phase - NOT on the capture side, which
+/// stays at [`PDM_RX_GAIN_SHIFT`] because that value is what the
+/// level meter is calibrated against. The two jobs need different
+/// numbers: hardware-measured conditioned speech averages ~2000
+/// mean-abs, ~10 dB under the tone sweep's 0x1800 amplitude that
+/// the user hears as normal volume, and speech's crest factor makes
+/// it read quieter still. +12 dB closes that gap; loud peaks
+/// saturate softly, which a diagnostic parrot can live with.
+const PDM_PLAY_GAIN_SHIFT: u32 = 2;
+
+/// Playback-side conditioning for [`run_session_pdm_mic`]'s parrot:
+/// the saturating [`PDM_PLAY_GAIN_SHIFT`] gain. No DC handling - the
+/// recording was already conditioned chunk-by-chunk on capture.
+fn pdm_condition_play(buf: &mut [u8]) {
+    for s in buf.chunks_exact_mut(2) {
+        let v = i16::from_le_bytes([s[0], s[1]]) as i32;
+        let amplified = (v << PDM_PLAY_GAIN_SHIFT)
+            .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        s.copy_from_slice(&amplified.to_le_bytes());
+    }
+}
+
+/// The codec sessions' conditioning (both capture and playback
+/// side): none. Their analog PGA and codec high-pass already deliver
+/// calibrated, DC-free samples at verified loudness.
+fn condition_passthrough(_buf: &mut [u8]) {}
+
 /// Detect the RX stream's byte alignment from a chunk of audio, or
 /// `None` if the chunk is too quiet to judge yet.
 ///
@@ -357,9 +428,16 @@ impl LevelMeter {
 /// blocks until the DMA has data, so this self-paces. Returns the next
 /// command to handle (e.g. a `PlayAlarm` that interrupted capture), or
 /// `None` if capture was simply stopped.
+///
+/// `condition_rx` is the session kind's per-chunk sample conditioning
+/// ([`condition_passthrough`] for codec capture, [`pdm_condition_rx`] for
+/// the PDM mic), applied to the aligned chunk before the meter reads
+/// it. The alignment detection runs on the raw chunk, the one-shot
+/// first-frames dump stays raw - both are diagnostics of the wire.
 async fn capture_until_interrupt<B>(
     rx: &mut esp_hal::i2s::master::asynch::I2sReadDmaTransferAsync<'_, B>,
     buf: &mut [u8],
+    condition_rx: fn(&mut [u8]),
 ) -> Option<AudioCommand> {
     // Drain the MCLK-startup window first so the initial level reading
     // is real audio, not codec garbage. Raced against the command
@@ -415,7 +493,9 @@ async fn capture_until_interrupt<B>(
                         rx_off = Some(off);
                     }
                 }
-                meter.feed(&mic_stats(&buf[rx_off.unwrap_or(0)..n]));
+                let off = rx_off.unwrap_or(0);
+                condition_rx(&mut buf[off..n]);
+                meter.feed(&mic_stats(&buf[off..n]));
             }
             Either::First(Err(e)) => {
                 // `Late` permanently wedges the circular transfer -
@@ -536,6 +616,8 @@ async fn loopback_until_interrupt<BT, BR>(
     rx: &mut esp_hal::i2s::master::asynch::I2sReadDmaTransferAsync<'_, BR>,
     amp: &mut SpeakerAmp<'_>,
     buf: &mut [u8],
+    condition_rx: fn(&mut [u8]),
+    condition_play: fn(&mut [u8]),
 ) -> Option<AudioCommand> {
     // The mono 8 kHz accumulation buffer the recording lands in (the
     // pop buffer comes from `run_session`).
@@ -596,6 +678,10 @@ async fn loopback_until_interrupt<BT, BR>(
                         }
                     }
                     let off = rx_off.unwrap_or(0);
+                    // Condition before both consumers: the meter and
+                    // the recording (so the parrot replays at the
+                    // conditioned level, not the raw one).
+                    condition_rx(&mut buf[off..n]);
                     meter.feed(&mic_stats(&buf[off..n]));
                     // Decimate stereo 16 kHz -> mono 8 kHz by
                     // averaging the left (MIC1) samples of each frame
@@ -638,6 +724,7 @@ async fn loopback_until_interrupt<BT, BR>(
         // recording is. A trailing ring of silence stops the tail
         // from stutter-looping through the next record phase (and
         // pre-cleans the ring for the next unmute).
+        condition_play(&mut rec[..w]);
         amp.enable();
         let rec_ms = rec_start.elapsed().as_millis();
         let play_start = Instant::now();
@@ -991,13 +1078,21 @@ pub async fn run_session<'d>(
         SessionMode::Capture => {
             // Defensive: amp stays muted during capture (no feedback).
             amp.disable();
-            capture_until_interrupt(&mut rx, &mut buf).await
+            capture_until_interrupt(&mut rx, &mut buf, condition_passthrough).await
         }
         SessionMode::Loopback => {
             // The loop unmutes itself after the startup drain, so the
             // codec init burst never reaches the speaker.
             amp.disable();
-            loopback_until_interrupt(&mut tx, &mut rx, amp, &mut buf).await
+            loopback_until_interrupt(
+                &mut tx,
+                &mut rx,
+                amp,
+                &mut buf,
+                condition_passthrough,
+                condition_passthrough,
+            )
+            .await
         }
     };
 
@@ -1019,10 +1114,10 @@ pub async fn run_session<'d>(
 /// loops themselves are the shared ones.
 ///
 /// Only `Play` and `Tones` are playable here. The capture modes
-/// (`Capture`, `Loopback`) need a capture backend this board doesn't
-/// have on its I2S bus (its mic is a separate PDM device - a future
-/// effort); a dispatcher shouldn't route them here, and defensively
-/// they end the session immediately.
+/// (`Capture`, `Loopback`) need a capture backend this session kind
+/// doesn't build (a board whose mic is a PDM device routes them to
+/// [`run_session_pdm_mic`] instead); a dispatcher shouldn't send
+/// them here, and defensively they end the session immediately.
 pub async fn run_session_tx<'d>(
     mode: SessionMode,
     i2s: impl esp_hal::i2s::master::Instance + 'd,
@@ -1072,4 +1167,141 @@ pub async fn run_session_tx<'d>(
     // tx drops here, stopping the DMA and BCLK/WS; the amp then
     // enters its own standby. The reborrowed Peri tokens release for
     // the next session, as in run_session.
+}
+
+/// Run **one** audio session on a board whose capture side is a **PDM
+/// microphone** - the third session kind, next to [`run_session`]
+/// (codec duplex) and [`run_session_tx`] (playback only). Same
+/// session-scoped transfer lifecycle, for the same circular-DMA
+/// reasons.
+///
+/// Differences from [`run_session`]:
+/// - No codec exists on either side, so there is no I2C re-init and
+///   no MCLK; the amp is a clock-in-only Class-D and the mic is a raw
+///   PDM device that wakes when its clock starts and auto-sleeps when
+///   the session's transfer drop stops it.
+/// - The RX unit is brought up in the HAL's standard mode and then
+///   flipped into hardware PDM-to-PCM mode by the bin's `tune_i2s`
+///   hook (the HAL has no PDM API; the registers are chip-specific).
+///   The hook runs after the HAL configuration and before the
+///   transfers start, and must commit its writes to the RX clock
+///   domain itself (the HAL only does that during configuration).
+/// - TX and RX have independent clocks here, so the RX stream's head
+///   alignment doesn't depend on TX start order the way the
+///   shared-clock duplex silicon's does. RX is still armed first so
+///   no early DMA window is missed; `rx_align_offset` stays in the
+///   loops as a self-correcting guard either way.
+///
+/// With both PDM line slots enabled by the tune hook, a single mic's
+/// data appears in both 16-bit slots of each frame (the mic holds its
+/// data line through the full clock period - datasheet-documented
+/// single-mic behavior), so the wire format matches the codec boards'
+/// stereo capture and every mode loop is shared unchanged.
+///
+/// All four modes run here. Dispatchers that want the cheaper
+/// TX-only path for pure playback (no RX DMA, mic clock never starts)
+/// can route `Play`/`Tones` to [`run_session_tx`] instead and send
+/// only the capture modes' commands here.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_session_pdm_mic<'d>(
+    mode: SessionMode,
+    i2s: impl esp_hal::i2s::master::Instance + 'd,
+    dma_ch: impl DmaChannelFor<AnyI2s<'d>>,
+    bclk: impl PeripheralOutput<'d>,
+    ws: impl PeripheralOutput<'d>,
+    dout: impl PeripheralOutput<'d>,
+    pdm_clk: impl PeripheralOutput<'d>,
+    pdm_din: impl PeripheralInput<'d>,
+    amp: &mut SpeakerAmp<'_>,
+    tx_buf: &'d mut [u8],
+    tx_desc: &'d mut [DmaDescriptor],
+    rx_buf: &'d mut [u8],
+    rx_desc: &'d mut [DmaDescriptor],
+    phase: &mut u32,
+    tune_i2s: fn(),
+) -> Option<AudioCommand> {
+    log::info!("Audio: PDM-mic session {:?}", mode);
+    let (i2s_tx, i2s_rx) = audio_hal::build_i2s_tx_pdm_rx(
+        i2s, dma_ch, bclk, ws, dout, pdm_clk, pdm_din, tx_desc, rx_desc,
+    );
+    // The bin's hook switches the RX unit into PDM-to-PCM mode (and
+    // is a required step here, not an optional fixup - the HAL left
+    // the unit in standard TDM mode).
+    tune_i2s();
+    // Arm RX before TX, as in run_session. Starting RX also starts
+    // the mic's clock; the mic's wake-up transient (~20 ms for the
+    // T3902) lands in the early drain below.
+    let mut rx = match i2s_rx.read_dma_circular_async(rx_buf) {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("Audio: read_dma_circular_async failed: {:?}", e);
+            return None;
+        }
+    };
+    let mut tx = match i2s_tx.write_dma_circular_async(tx_buf) {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("Audio: write_dma_circular_async failed: {:?}", e);
+            return None;
+        }
+    };
+    // Session pop buffer + immediate RX drain, same rationale as
+    // run_session (an undrained ring wraps into a permanent `Late`).
+    // There is no codec-init window here, but the TX ring flush below
+    // still takes its time and the mode loops expect a fresh ring.
+    let mut buf = alloc::vec![0u8; CAPTURE_CHUNK_BYTES];
+    if let Err(e) = rx.pop(&mut buf).await {
+        log::warn!("Audio: early drain err: {:?}, aborting session", e);
+        return None;
+    }
+    // Stale-ring flush, as in the other session kinds.
+    flush_tx_ring(&mut tx).await;
+    // Mic settle window. After its clock starts the mic's output is
+    // a large decaying ramp (DC-pedestal charge + decimator startup),
+    // hardware-observed still climbing through raw 0x1d0c ~150 ms in
+    // - past every drain above. The moving ramp defeats the per-chunk
+    // mean subtraction, so undrained it reads as a phantom mid-bar
+    // level blip at session open (and the first parrot cycle records
+    // its tail as a click). Wait it out, then discard; the ~250 ms
+    // accumulation sits well under the RX ring's ~512 ms capacity,
+    // and the codec session kind spends a comparable span on codec
+    // init at the same point.
+    Timer::after(Duration::from_millis(250)).await;
+    if let Err(e) = rx.pop(&mut buf).await {
+        log::warn!("Audio: settle drain err: {:?}, aborting session", e);
+        return None;
+    }
+
+    match mode {
+        SessionMode::Play => {
+            amp.enable();
+            play_until_interrupt(&mut tx, amp, phase).await
+        }
+        SessionMode::Tones => {
+            // The sweep enables the amp itself, after its lead-in.
+            amp.disable();
+            play_tones_until_done(&mut tx, amp, phase).await
+        }
+        SessionMode::Capture => {
+            // Amp muted; the TX ring holds silence for the duration.
+            amp.disable();
+            capture_until_interrupt(&mut rx, &mut buf, pdm_condition_rx).await
+        }
+        SessionMode::Loopback => {
+            amp.disable();
+            loopback_until_interrupt(
+                &mut tx,
+                &mut rx,
+                amp,
+                &mut buf,
+                pdm_condition_rx,
+                pdm_condition_play,
+            )
+            .await
+        }
+    }
+    // tx and rx drop here, stopping both DMA transfers and both
+    // units' clocks: the amp enters standby and the mic enters its
+    // sleep mode. The reborrowed Peri tokens release for the next
+    // session, as in run_session.
 }

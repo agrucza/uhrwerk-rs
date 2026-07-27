@@ -161,3 +161,72 @@ pub fn build_i2s_tx<'d>(
         .with_dout(dout)
         .build(tx_desc_static)
 }
+
+/// Build playback TX plus a capture RX destined for a **PDM
+/// microphone** - for boards whose speaker is a clock-in-only Class-D
+/// amp (TX side identical to [`build_i2s_tx`]) and whose mic is a raw
+/// PDM device on its own two pins rather than an I2S-slave codec.
+///
+/// The TX and RX units of one I2S peripheral are independent (own
+/// clock dividers, own pins), so the speaker path here is exactly the
+/// [`build_i2s_tx`] one. The RX unit routes only two signals: its WS
+/// output - which *is* the PDM microphone clock once the unit is in
+/// PDM mode - and DIN for the mic's data line. No BCLK is routed and
+/// no MCLK exists.
+///
+/// The HAL has no PDM API (it configures the RX unit for standard
+/// TDM), so the caller MUST flip the RX unit into PDM-to-PCM mode
+/// via its chip-specific tune hook after this returns and before the
+/// transfers start - see `run_session_pdm_mic`. Once tuned, the
+/// hardware PDM-to-PCM converter delivers interleaved 16-bit PCM at
+/// [`SAMPLE_RATE_HZ`]; with both line slots enabled the wire format
+/// matches [`build_i2s`]'s stereo layout, so the session mode loops
+/// are shared unchanged.
+///
+/// Descriptor lifetime story is identical to [`build_i2s`] - see the
+/// SAFETY comment there.
+#[allow(clippy::too_many_arguments)]
+pub fn build_i2s_tx_pdm_rx<'d>(
+    i2s:          impl esp_hal::i2s::master::Instance + 'd,
+    dma_channel:  impl DmaChannelFor<AnyI2s<'d>>,
+    bclk:         impl PeripheralOutput<'d>,
+    ws:           impl PeripheralOutput<'d>,
+    dout:         impl PeripheralOutput<'d>,
+    pdm_clk:      impl PeripheralOutput<'d>,
+    pdm_din:      impl PeripheralInput<'d>,
+    tx_desc:      &'d mut [DmaDescriptor],
+    rx_desc:      &'d mut [DmaDescriptor],
+) -> (I2sTx<'d, Async>, I2sRx<'d, Async>) {
+    // SAFETY: see build_i2s - the backing storage really is 'static,
+    // the transfers (and these borrows) are dropped at session end.
+    let tx_desc_static: &'static mut [DmaDescriptor] =
+        unsafe { core::mem::transmute(tx_desc) };
+    let rx_desc_static: &'static mut [DmaDescriptor] =
+        unsafe { core::mem::transmute(rx_desc) };
+
+    let i2s = I2s::new(
+        i2s,
+        dma_channel,
+        Config::new_tdm_philips()
+            .with_sample_rate(Rate::from_hz(SAMPLE_RATE_HZ))
+            .with_data_format(DataFormat::Data16Channel16)
+            .with_channels(Channels::STEREO),
+    )
+    .unwrap()
+    .into_async();
+
+    let tx = i2s.i2s_tx
+        .with_bclk(bclk)
+        .with_ws(ws)
+        .with_dout(dout)
+        .build(tx_desc_static);
+
+    // RX unit: WS out doubles as the PDM clock (once the tune hook
+    // has switched the unit into PDM mode), DIN carries the mic data.
+    let rx = i2s.i2s_rx
+        .with_ws(pdm_clk)
+        .with_din(pdm_din)
+        .build(rx_desc_static);
+
+    (tx, rx)
+}

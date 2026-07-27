@@ -15,8 +15,7 @@ bench = false
 
 # LilyGo T-Watch Ultra (ESP32-S3, 16MB flash + 8MB QSPI PSRAM).
 # See src/board.rs for the hardware map. Still absent vs firmware-s3:
-# the audio stack (no codec chip here - needs a backend seam in
-# system-core's session layer) and a real IMU driver (BHI260AP).
+# a real IMU driver (BHI260AP).
 
 [dependencies]
 # --- Espressif bootloader descriptor (required by espflash to verify the image) ---
@@ -60,6 +59,11 @@ esp-alloc = "0.10.0"
 # bin sets it and feature unification carries the choice in (the
 # same pattern as esp-hal).
 esp-storage = { version = "0.9.0", features = ["esp32s3"] }
+
+# Raw PAC for the `tune_pdm_rx` mic bring-up in main.rs - the I2S0
+# RX unit's PDM-to-PCM mode isn't exposed by esp-hal. Version/features
+# mirror esp-hal's own dependency so Cargo dedupes a single copy.
+esp32s3 = { version = "0.35", features = ["critical-section"] }
 
 # --- Local crates ---
 # `display` is for the smoke bin; the main bin reaches the display

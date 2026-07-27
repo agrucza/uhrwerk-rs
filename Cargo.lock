@@ -1088,6 +1088,7 @@ dependencies = [
  "esp-println",
  "esp-rtos",
  "esp-storage",
+ "esp32s3",
  "firmware-hal",
  "log",
  "system-core",

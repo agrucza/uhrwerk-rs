@@ -12,9 +12,10 @@
 //! BHI260AP the shared QMI8658 task can't drive yet (it probes, logs
 //! the miss, and idles - BHI260AP support is a separate effort);
 //! haptics are a DRV2605 dispatched through a bin-local task; and
-//! the speaker is a MAX98357A driven by a TX-only audio task (see
-//! `audio_task` - no codec, no MCLK, no capture; the PDM mic is a
-//! separate effort). The `smoke` bin (src/bin/smoke.rs) is the
+//! audio is codec-less: a MAX98357A speaker on standard I2S TX plus
+//! a T3902 PDM mic on the same I2S0's RX unit in hardware PDM-to-PCM
+//! mode (see `audio_task` / `tune_pdm_rx` - no codec chips, no MCLK,
+//! no audio I2C). The `smoke` bin (src/bin/smoke.rs) is the
 //! standalone hardware diagnostic from bring-up.
 
 extern crate alloc;
@@ -69,12 +70,15 @@ struct TwatchUltraBringup {
     lcd_cs: Option<p::GPIO41<'static>>,
     dma_ch0: Option<p::DMA_CH0<'static>>,
     lcd_reset: Option<p::GPIO37<'static>>,
-    // Speaker (MAX98357A, TX-only - see `audio_task`).
+    // Speaker (MAX98357A, standard I2S TX) and mic (T3902 PDM, RX in
+    // hardware PDM-to-PCM mode) - both on I2S0, see `audio_task`.
     i2s0: Option<p::I2S0<'static>>,
     dma_ch1: Option<p::DMA_CH1<'static>>,
     spk_bclk: Option<p::GPIO9<'static>>,
     spk_ws: Option<p::GPIO10<'static>>,
     spk_dout: Option<p::GPIO11<'static>>,
+    mic_clk: Option<p::GPIO17<'static>>,
+    mic_din: Option<p::GPIO18<'static>>,
     lcd_te: Option<p::GPIO6<'static>>,
     touch_int: Option<p::GPIO12<'static>>,
     btn_boot: Option<p::GPIO0<'static>>,
@@ -252,19 +256,19 @@ impl Bringup for TwatchUltraBringup {
     }
 
     /// Spawns the two bin-local dispatchers: haptics (DRV2605 -
-    /// needs the shared I2C bus) and the TX-only speaker task
-    /// (MAX98357A via `system_core::audio::run_session_tx` - see
-    /// `audio_task`). The RX halves of the DMA macro are zero-sized:
-    /// this board has no I2S capture path (its mic is a PDM device,
-    /// a separate effort).
+    /// needs the shared I2C bus) and the audio task (MAX98357A
+    /// speaker + T3902 PDM mic, both on I2S0 - see `audio_task`).
+    /// Buffer sizes mirror the codec boards: the RX ring must match
+    /// system-core's `CAPTURE_CHUNK_BYTES` pop-buffer contract, the
+    /// TX ring its `TX_RING_BYTES`.
     fn spawn_audio(
         &mut self,
         spawner: embassy_executor::Spawner,
         i2c_bus: &'static system_core::bus::SharedI2c,
     ) {
         spawner.spawn(crate::system::haptics::haptics_task(i2c_bus).unwrap());
-        let (_rx_buffer, _rx_descriptors, tx_buffer, tx_descriptors) =
-            esp_hal::dma_circular_buffers!(0, 4096);
+        let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) =
+            esp_hal::dma_circular_buffers!(32768, 4096);
         spawner.spawn(
             audio_task(
                 self.i2s0.take().unwrap(),
@@ -272,38 +276,158 @@ impl Bringup for TwatchUltraBringup {
                 self.spk_bclk.take().unwrap(),
                 self.spk_ws.take().unwrap(),
                 self.spk_dout.take().unwrap(),
+                self.mic_clk.take().unwrap(),
+                self.mic_din.take().unwrap(),
                 tx_buffer,
                 tx_descriptors,
+                rx_buffer,
+                rx_descriptors,
             )
             .unwrap(),
         );
     }
 }
 
-/// TX-only audio dispatch loop - this board's counterpart of the
-/// other bins' full-duplex `audio_task`. Owns the I2S peripheral
-/// tokens and the cross-session tone-phase counter, and reborrows
-/// them into a fresh `run_session_tx` per session-starting command
-/// (embassy tasks can't be generic, so the concrete types stay
-/// bin-side). The MAX98357A has no enable line (`SpeakerAmp::fixed`)
-/// and no codec init; it wakes when BCLK starts and re-enters
-/// standby when the session's transfer drop stops the clocks.
+/// Flip the I2S0 RX unit into hardware PDM-to-PCM mode for the T3902
+/// mic - 16 kHz mono source, 16-bit PCM out, both line slots enabled.
+/// esp-hal has no PDM API (its config path force-clears `rx_pdm_en`),
+/// so this mirrors ESP-IDF's register sequence (i2s_hal_pdm_set_rx_slot
+/// + i2s_hal_set_rx_clock + i2s_ll_rx_enable_pdm, IDF v5.3) on top of
+/// the HAL's standard bring-up. Runs as `run_session_pdm_mic`'s
+/// `tune_i2s` hook: after the HAL configured the peripheral, before
+/// the transfers start the clocks.
 ///
-/// The capture commands are acknowledged-and-ignored: the mic here
-/// is a TDK T3902 PDM device (own pins, own peripheral mode), not an
-/// I2S-slave ADC - wiring it up is a separate effort. The MIC TEST
-/// views therefore show a dead meter on this board for now.
+/// Clocking (IDF i2s_pdm_rx_calculate_clock, 16 kHz, DSR-8 - the IDF
+/// default the vendor firmware runs on this watch): PDM clock out =
+/// 16 kHz x 64 = 1.024 MHz, inside the T3902's Standard-mode range
+/// (1.0-3.3 MHz; 430 uA). bclk_div = 8 -> MCLK = 8.192 MHz from the
+/// 160 MHz PLL: divider 19 + 17/32, mapped to the fractional fields
+/// per i2s_ll_rx_set_mclk (yn1 = (17*2 > 32) = 1, z = 32-17 = 15,
+/// x = 32/15 - 1 = 1, y = 32%15 = 2). Fallback if the first flash
+/// captures nothing: sinc_dsr_16_en=1 + halved fraction (9 + 49/64)
+/// moves the mic to 2.048 MHz, mid-range instead of edge-of-spec.
+///
+/// Slots: a single mic holds DATA through the whole clock period
+/// (T3902 datasheet, mono figure 9), so with both line slots enabled
+/// (chan0 + chan1) each 4-byte frame carries the same audio twice -
+/// the codec boards' stereo wire format, which keeps every
+/// system-core mode loop unchanged. SELECT is tied to VDD on this
+/// board (vendor firmware configures the left slot).
+///
+/// The write sequence ends with the rx_update handshake: the RX unit
+/// latches APB-side config into its own clock domain only on that
+/// bit, and the HAL performs it during configuration only - i.e.
+/// before this hook ran. Without it every write here is silently
+/// ignored and the mic reads as dead.
+fn tune_pdm_rx() {
+    let i2s = unsafe { &*esp32s3::I2S0::ptr() };
+
+    // Reset the RX FSM + FIFO before reconfiguring (IDF does this at
+    // the top of its PDM slot config).
+    i2s.rx_conf().modify(|_, w| {
+        w.rx_reset().set_bit();
+        w.rx_fifo_reset().set_bit()
+    });
+    i2s.rx_conf().modify(|_, w| {
+        w.rx_reset().clear_bit();
+        w.rx_fifo_reset().clear_bit()
+    });
+
+    // Slot geometry: 16-bit data in 16-bit channels, half_sample = 16
+    // (i2s_hal_pdm_set_rx_slot hardcodes 16 for this silicon), and
+    // the PDM bclk divider (8, from the clock math above).
+    i2s.rx_conf1().modify(|_, w| unsafe {
+        w.rx_bits_mod().bits(15);
+        w.rx_tdm_chan_bits().bits(15);
+        w.rx_half_sample_bits().bits(15);
+        w.rx_bck_div_num().bits(7)
+    });
+
+    // Mode: PDM in, PDM-to-PCM conversion on, TDM off, master, not
+    // mono-duplicating (both slots carry line data), DSR-8.
+    i2s.rx_conf().modify(|_, w| {
+        w.rx_slave_mod().clear_bit();
+        w.rx_mono().clear_bit();
+        w.rx_pdm_sinc_dsr_16_en().clear_bit();
+        w.rx_pdm2pcm_en().set_bit();
+        w.rx_tdm_en().clear_bit();
+        w.rx_pdm_en().set_bit()
+    });
+
+    // Both slots of the single data line (TRM table "PDM-to-PCM Input
+    // Mode": chan0/chan1 = I2S0I_Data_in left/right).
+    i2s.rx_tdm_ctrl().modify(|_, w| {
+        w.rx_tdm_pdm_chan0_en().set_bit();
+        w.rx_tdm_pdm_chan1_en().set_bit();
+        w.rx_tdm_pdm_chan2_en().clear_bit();
+        w.rx_tdm_pdm_chan3_en().clear_bit();
+        w.rx_tdm_pdm_chan4_en().clear_bit();
+        w.rx_tdm_pdm_chan5_en().clear_bit();
+        w.rx_tdm_pdm_chan6_en().clear_bit();
+        w.rx_tdm_pdm_chan7_en().clear_bit()
+    });
+
+    // MCLK divider, in IDF's mandated sequence: park on a small
+    // integer division with zeroed fraction first (double-division
+    // hardware erratum workaround), then set the target coefficients,
+    // integer part last. 160 MHz PLL source (rx_clk_sel = 2).
+    i2s.rx_clkm_conf().modify(|_, w| unsafe {
+        w.rx_clk_sel().bits(2);
+        w.rx_clk_active().set_bit();
+        w.rx_clkm_div_num().bits(2)
+    });
+    i2s.rx_clkm_div_conf().modify(|_, w| unsafe {
+        w.rx_clkm_div_yn1().clear_bit();
+        w.rx_clkm_div_y().bits(1);
+        w.rx_clkm_div_z().bits(0);
+        w.rx_clkm_div_x().bits(0)
+    });
+    i2s.rx_clkm_div_conf().modify(|_, w| unsafe {
+        w.rx_clkm_div_yn1().set_bit();
+        w.rx_clkm_div_z().bits(15);
+        w.rx_clkm_div_y().bits(2);
+        w.rx_clkm_div_x().bits(1)
+    });
+    i2s.rx_clkm_conf()
+        .modify(|_, w| unsafe { w.rx_clkm_div_num().bits(19) });
+
+    // Commit to the RX clock domain (i2s_ll_rx_start's handshake:
+    // set rx_update, hardware clears it once synced).
+    i2s.rx_conf().modify(|_, w| w.rx_update().set_bit());
+    while i2s.rx_conf().read().rx_update().bit_is_set() {}
+}
+
+/// Audio dispatch loop - MAX98357A speaker (standard I2S TX) and
+/// T3902 PDM mic (RX in hardware PDM-to-PCM mode), both on I2S0 with
+/// independent unit clocks. Owns the I2S peripheral tokens and the
+/// cross-session tone-phase counter, and reborrows them into a fresh
+/// session per session-starting command (embassy tasks can't be
+/// generic, so the concrete types stay bin-side).
+///
+/// Two session kinds, routed per command: pure playback (PlayAlarm /
+/// PlayTones) runs `run_session_tx` - no RX DMA, the mic clock never
+/// starts, the mic stays in its 12 uA sleep. The capture modes
+/// (StartCapture / StartLoopback) run `run_session_pdm_mic` with
+/// `tune_pdm_rx` flipping the RX unit into PDM mode each session.
+/// Neither device needs an enable line or codec init: the amp wakes
+/// on BCLK and the mic on its PDM clock, and both self-idle when the
+/// session's transfer drop stops the clocks.
 #[embassy_executor::task]
+#[allow(clippy::too_many_arguments)]
 async fn audio_task(
     mut i2s: p::I2S0<'static>,
     mut dma: p::DMA_CH1<'static>,
     mut bclk: p::GPIO9<'static>,
     mut ws: p::GPIO10<'static>,
     mut dout: p::GPIO11<'static>,
+    mut mic_clk: p::GPIO17<'static>,
+    mut mic_din: p::GPIO18<'static>,
     tx_buffer: &'static mut [u8],
     tx_descriptors: &'static mut [esp_hal::dma::DmaDescriptor],
+    rx_buffer: &'static mut [u8],
+    rx_descriptors: &'static mut [esp_hal::dma::DmaDescriptor],
 ) {
-    use system_core::audio::{run_session_tx, SessionMode};
+    use system_core::audio::{run_session_pdm_mic, run_session_tx, SessionMode};
     use system_core::audio_hal::SpeakerAmp;
     use system_core::bus::{AudioCommand, AUDIO_COMMAND};
 
@@ -326,30 +450,49 @@ async fn audio_task(
             | AudioCommand::StopLoopback => continue,
             AudioCommand::PlayAlarm => SessionMode::Play,
             AudioCommand::PlayTones => SessionMode::Tones,
-            AudioCommand::StartCapture | AudioCommand::StartLoopback => {
-                log::warn!(
-                    "Audio: {:?} ignored - no mic backend on this board yet (PDM)",
-                    cmd,
-                );
-                continue;
+            AudioCommand::StartCapture => SessionMode::Capture,
+            AudioCommand::StartLoopback => SessionMode::Loopback,
+        };
+        pending = match mode {
+            SessionMode::Play | SessionMode::Tones => {
+                run_session_tx(
+                    mode,
+                    i2s.reborrow(),
+                    dma.reborrow(),
+                    bclk.reborrow(),
+                    ws.reborrow(),
+                    dout.reborrow(),
+                    &mut amp,
+                    &mut tx_buffer[..],
+                    &mut tx_descriptors[..],
+                    &mut phase,
+                    // S3 silicon: no fixups needed on the plain TX
+                    // path (same as the other S3 bin).
+                    || {},
+                )
+                .await
+            }
+            SessionMode::Capture | SessionMode::Loopback => {
+                run_session_pdm_mic(
+                    mode,
+                    i2s.reborrow(),
+                    dma.reborrow(),
+                    bclk.reborrow(),
+                    ws.reborrow(),
+                    dout.reborrow(),
+                    mic_clk.reborrow(),
+                    mic_din.reborrow(),
+                    &mut amp,
+                    &mut tx_buffer[..],
+                    &mut tx_descriptors[..],
+                    &mut rx_buffer[..],
+                    &mut rx_descriptors[..],
+                    &mut phase,
+                    tune_pdm_rx,
+                )
+                .await
             }
         };
-        pending = run_session_tx(
-            mode,
-            i2s.reborrow(),
-            dma.reborrow(),
-            bclk.reborrow(),
-            ws.reborrow(),
-            dout.reborrow(),
-            &mut amp,
-            &mut tx_buffer[..],
-            &mut tx_descriptors[..],
-            &mut phase,
-            // S3 silicon: no I2S register fixups needed (same as the
-            // other S3 bin; the C6 is the one that needs them).
-            || {},
-        )
-        .await;
     }
 }
 
@@ -391,6 +534,8 @@ async fn main(spawner: embassy_executor::Spawner) {
         spk_bclk: Some(peripherals.GPIO9),
         spk_ws: Some(peripherals.GPIO10),
         spk_dout: Some(peripherals.GPIO11),
+        mic_clk: Some(peripherals.GPIO17),
+        mic_din: Some(peripherals.GPIO18),
         lcd_te: Some(peripherals.GPIO6),
         touch_int: Some(peripherals.GPIO12),
         btn_boot: Some(peripherals.GPIO0),
