@@ -266,9 +266,9 @@ fn clock_value(data: &SystemData) -> String<20> {
     buf
 }
 
-fn imu_value(_data: &SystemData) -> String<20> {
+fn imu_value(data: &SystemData) -> String<20> {
     let mut buf = String::new();
-    let _ = buf.push_str("QMI8658");
+    let _ = buf.push_str(if data.imu_name.is_empty() { "IMU" } else { data.imu_name });
     buf
 }
 

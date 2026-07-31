@@ -81,6 +81,15 @@ pub enum SystemEvent {
     /// task can service it post-wake - still turns the UI on instead
     /// of being silently lost back into sleep.
     WakeInterrupt,
+    /// The wrist entered the user's viewing pose and settled there
+    /// (classified by the IMU adapter against the bin's wear
+    /// calibration). User activity: undims, resets the idle timer,
+    /// and confirms a provisional motion wake.
+    WristRaised,
+    /// The wrist left the viewing pose and settled elsewhere - the
+    /// user is done looking. The model answers by entering sleep
+    /// (unless an alert is playing).
+    WristLowered,
     /// Fresh IMU snapshot (accel + gyro + die temperature).
     /// Emitted by the IMU task at a fixed cadence while awake
     /// so screens that display live motion data stay current.
@@ -88,6 +97,12 @@ pub enum SystemEvent {
     /// `cached_data.motion` with the payload.
     MotionUpdated {
         data: crate::data::MotionData,
+    },
+    /// The board's IMU chip identified itself (sent once by the IMU
+    /// task at startup). Cached into `SystemData::imu_name` for the
+    /// settings MOTION row - the UI must not hardcode chip names.
+    ImuIdentified {
+        name: &'static str,
     },
 
     // -- Audio --
@@ -270,6 +285,7 @@ pub fn is_user_activity(event: &SystemEvent) -> bool {
             | SystemEvent::Swipe { .. }
             | SystemEvent::BootButtonPressed
             | SystemEvent::PowerButtonShort
+            | SystemEvent::WristRaised
     )
 }
 
@@ -327,6 +343,17 @@ mod tests {
         assert!(is_user_activity(&SystemEvent::TouchReleased));
         assert!(is_user_activity(&SystemEvent::Tap { x: 0, y: 0 }));
         assert!(is_user_activity(&SystemEvent::BootButtonPressed));
+    }
+
+    #[test]
+    fn wrist_intents_classify_as_designed() {
+        // A settled raise is deliberate attention - full user
+        // activity. A lower is neither activity nor a wake source;
+        // the model gives it its own sleep-entry policy.
+        assert!(is_user_activity(&SystemEvent::WristRaised));
+        assert!(!is_user_activity(&SystemEvent::WristLowered));
+        assert!(!is_wake_source(&SystemEvent::WristRaised));
+        assert!(!is_wake_source(&SystemEvent::WristLowered));
     }
 
     #[test]

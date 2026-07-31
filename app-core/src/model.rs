@@ -36,8 +36,16 @@ use crate::ui::types::{
 /// event/tick. In practice even the heaviest handlers emit 2-3.
 pub const MAX_EFFECTS_PER_CALL: usize = 8;
 
+
 /// Fixed-size buffer of effects returned by `Model` methods.
 pub type Effects = Vec<Effect, MAX_EFFECTS_PER_CALL>;
+
+/// Grace window after a provisional wake (motion or bare GPIO): if
+/// no user activity - a wrist-raise, touch, or button - confirms the
+/// wake before this expires, the device goes straight back to sleep
+/// instead of burning the full idle window on a false wake (e.g.
+/// a motion sensor firing on typing).
+const MOTION_WAKE_GRACE: Duration = Duration::from_secs(5);
 
 /// What the caller should do to hardware after a `Model` call.
 ///
@@ -151,6 +159,12 @@ pub struct Model {
     /// screen (and can't change while asleep), so `wake` restarts the
     /// stored mode instead of leaving a dead meter.
     mic_resume_on_wake: Option<MicTestMode>,
+    /// Deadline of the provisional-wake grace window
+    /// ([`MOTION_WAKE_GRACE`]), set when a motion / bare-GPIO wake
+    /// turned the display on with no confirmed human behind it.
+    /// Cleared by any user activity; expiry in `tick` re-enters
+    /// sleep.
+    motion_wake_grace: Option<Instant>,
 }
 
 /// Audio mode of the mic-test diagnostic, mirrored by the model so its
@@ -205,6 +219,7 @@ impl Model {
             buzz: None,
             mic_test: MicTestMode::Off,
             mic_resume_on_wake: None,
+            motion_wake_grace: None,
         }
     }
 
@@ -270,11 +285,15 @@ impl Model {
         if self.sleeping && events::is_wake_source(event) {
             self.wake(now, &mut out);
             // WoM and the manager's synthesized GPIO wake carry no
-            // payload for a screen - they only wake.
+            // payload for a screen - they only wake. Nothing human
+            // is confirmed behind them either, so the wake stays
+            // provisional: without user activity inside the grace
+            // window, `tick` re-enters sleep.
             if matches!(
                 event,
                 SystemEvent::WakeOnMotion | SystemEvent::WakeInterrupt
             ) {
+                self.motion_wake_grace = Some(now + MOTION_WAKE_GRACE);
                 return out;
             }
         }
@@ -283,6 +302,7 @@ impl Model {
         // (if BOOT while awake) triggers a "sleep now" shortcut.
         if events::is_user_activity(event) {
             self.last_activity = now;
+            self.motion_wake_grace = None;
             if self.sleeping {
                 self.wake(now, &mut out);
                 return out; // consume the event so accidental
@@ -294,6 +314,17 @@ impl Model {
                 self.sleep(&mut out);
                 return out;
             }
+        }
+
+        // 3b. Wrist lowered: the wrist left the viewing pose - the
+        // user is done looking. Sleep now instead of waiting out
+        // the idle timer. Never mid-alert: an alarm keeps ringing
+        // until acknowledged.
+        if matches!(event, SystemEvent::WristLowered) {
+            if !self.sleeping && self.buzz.is_none() {
+                self.sleep(&mut out);
+            }
+            return out;
         }
 
         // From here on we only dispatch to the screen when awake.
@@ -376,6 +407,7 @@ impl Model {
         self.tick_buzz(now, &mut out);
         self.apply_dim_state(now, &mut out);
         self.check_idle_sleep(now, &mut out);
+        self.check_motion_wake_grace(now, &mut out);
         // Update the two time-since-boot snapshots screens render.
         // Both are cheap (one duration_since + cast each); keeps the
         // values accurate to the current tick without screens needing
@@ -444,6 +476,9 @@ impl Model {
             }
             SystemEvent::MotionUpdated { data } => {
                 self.cached_data.motion = *data;
+            }
+            SystemEvent::ImuIdentified { name } => {
+                self.cached_data.imu_name = name;
             }
             SystemEvent::MicLevel { level } => {
                 // Drop stale MicLevel events that arrive after capture
@@ -1052,6 +1087,28 @@ impl Model {
             self.sleep(out);
         }
     }
+
+    /// Enforce the provisional-wake grace window: a motion /
+    /// bare-GPIO wake whose deadline passes without any confirming
+    /// user activity goes straight back to sleep. Mid-alert the
+    /// window just dissolves - the alert owns the display, and the
+    /// idle timer takes over once the alert clears.
+    fn check_motion_wake_grace(&mut self, now: Instant, out: &mut Effects) {
+        let Some(deadline) = self.motion_wake_grace else {
+            return;
+        };
+        if self.sleeping {
+            self.motion_wake_grace = None;
+            return;
+        }
+        if now < deadline {
+            return;
+        }
+        self.motion_wake_grace = None;
+        if self.buzz.is_none() {
+            self.sleep(out);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1099,6 +1156,50 @@ mod tests {
             e,
             Effect::TransitionDisplay { to: DisplayState::Active, .. }
         )));
+    }
+
+    #[test]
+    fn wrist_lowered_while_awake_enters_sleep() {
+        let mut m = fresh();
+        let fx = m.handle_event(&SystemEvent::WristLowered, Instant::from_millis(0));
+        assert!(m.sleeping);
+        assert!(fx.contains(&Effect::BroadcastSleep(SleepState::Sleeping)));
+    }
+
+    #[test]
+    fn wrist_raised_wakes_and_counts_as_activity() {
+        let mut m = fresh();
+        m.handle_event(&SystemEvent::WristLowered, Instant::from_millis(0));
+        assert!(m.sleeping);
+        let fx = m.handle_event(&SystemEvent::WristRaised, Instant::from_millis(5_000));
+        assert!(!m.sleeping);
+        assert!(fx.contains(&Effect::BroadcastSleep(SleepState::Awake)));
+    }
+
+    #[test]
+    fn unconfirmed_motion_wake_resleeps_after_grace() {
+        let mut m = fresh();
+        m.handle_event(&SystemEvent::BootButtonPressed, Instant::from_millis(0));
+        assert!(m.sleeping);
+        // A motion wake turns the display on provisionally...
+        m.handle_event(&SystemEvent::WakeOnMotion, Instant::from_millis(10_000));
+        assert!(!m.sleeping);
+        // ...and with no confirming activity the grace expiry
+        // re-sleeps long before the idle-off timeout would.
+        let fx = m.tick(Instant::from_millis(16_000), 16);
+        assert!(m.sleeping);
+        assert!(fx.contains(&Effect::BroadcastSleep(SleepState::Sleeping)));
+    }
+
+    #[test]
+    fn confirmed_motion_wake_stays_awake_past_grace() {
+        let mut m = fresh();
+        m.handle_event(&SystemEvent::BootButtonPressed, Instant::from_millis(0));
+        m.handle_event(&SystemEvent::WakeOnMotion, Instant::from_millis(10_000));
+        // A wrist-raise inside the window confirms the wake.
+        m.handle_event(&SystemEvent::WristRaised, Instant::from_millis(12_000));
+        m.tick(Instant::from_millis(16_000), 16);
+        assert!(!m.sleeping);
     }
 
     #[test]

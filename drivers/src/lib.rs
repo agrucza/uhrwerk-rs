@@ -14,6 +14,9 @@ pub mod display;
 #[cfg(feature = "imu")]
 pub mod imu;
 
+#[cfg(feature = "qmi8658")]
+pub mod qmi8658;
+
 #[cfg(feature = "pmu")]
 pub mod pmu;
 
@@ -37,6 +40,9 @@ pub mod xl9555;
 
 #[cfg(feature = "drv2605")]
 pub mod drv2605;
+
+#[cfg(feature = "bhi260")]
+pub mod bhi260;
 
 pub use embedded_hal;
 

@@ -59,7 +59,7 @@ embedded-hal-bus   = { version = "0.3.0" }
 
 # --- Local crates ---
 app-core     = { path = "../app-core",     features = ["serde"] }
-drivers      = { path = "../drivers",      features = ["display", "imu", "pmu", "rtc", "touch", "sdcard", "es8311", "es7210"] }
+drivers      = { path = "../drivers",      features = ["display", "qmi8658", "pmu", "rtc", "touch", "sdcard", "es8311", "es7210"] }
 firmware-hal = { path = "../firmware-hal" }
 system-core  = { path = "../system-core" }
 

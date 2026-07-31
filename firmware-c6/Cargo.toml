@@ -53,7 +53,7 @@ embedded-hal = { workspace = true }
 # every subsystem; the SD backend type must compile even though this
 # board has no SD slot and uses `Store::init_flash_only`).
 drivers      = { path = "../drivers", default-features = false, features = [
-    "display", "imu", "pmu", "rtc", "touch", "es8311", "es7210", "sdcard",
+    "display", "qmi8658", "pmu", "rtc", "touch", "es8311", "es7210", "sdcard",
 ] }
 firmware-hal = { path = "../firmware-hal" }
 system-core  = { path = "../system-core" }

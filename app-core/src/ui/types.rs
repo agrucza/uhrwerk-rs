@@ -715,6 +715,9 @@ pub struct SystemData {
     pub time: TimeData,
     pub power: PowerData,
     pub motion: MotionData,
+    /// The board's IMU chip name, from `SystemEvent::ImuIdentified`;
+    /// empty until the IMU task announces it.
+    pub imu_name: &'static str,
     pub touch: TouchData,
     /// Live microphone input level (0..=255) while the mic-test
     /// diagnostic is capturing; 0 otherwise. Updated from

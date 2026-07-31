@@ -7,7 +7,10 @@ edition = "2021"
 default = ["defmt"]
 defmt   = ["dep:defmt"]
 display = []
+# Chip-neutral IMU seam (AnyImu + ImuData). Chip drivers pull it in;
+# shared crates that only speak the seam enable just this.
 imu     = []
+qmi8658 = ["imu"]
 pmu     = []
 rtc     = []
 touch   = []
@@ -16,6 +19,7 @@ es8311  = []
 es7210  = []
 xl9555  = []
 drv2605 = []
+bhi260  = []
 # CST92xx touch lives under the touch module (shares TouchEvent).
 cst9217 = ["touch"]
 

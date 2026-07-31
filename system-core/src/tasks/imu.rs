@@ -1,47 +1,40 @@
-//! IMU (QMI8658C) task state.
+//! Shared IMU task - the chip-neutral schedule over the
+//! `drivers::imu::AnyImu` seam.
 //!
-//! Note: the **C** variant targets automotive / industrial /
-//! drone applications. It provides raw 6-axis readings,
-//! AttitudeEngine sensor fusion, FIFO, and Wake-on-Motion -
-//! but no activity-detection engine, so no tap detection, no
-//! pedometer, and no any/no/significant-motion classification
-//! (those live in the A variant aimed at wearables).
+//! This task owns system-facing behavior only: WHEN to sample, WHEN
+//! to arm wake-on-motion, WHEN to run self-tests, and which events to
+//! emit. Everything chip-specific - bring-up, WoM configuration,
+//! sample scaling - lives behind the seam; the bin picks the chip by
+//! constructing the matching [`AnyImu`] variant into
+//! [`ImuTaskState::new`].
 //!
-//! Owns the QMI8658 driver plus the INT1 line (GPIO21). The IMU
-//! operates in two modes driven by the system sleep state:
+//! Two modes, driven by the system sleep state:
 //!
-//!   * **Awake**: accel+gyro at 125 Hz, motion snapshots emitted
-//!     on a periodic cadence so screens that display live
-//!     readings (e.g. the Status screen's accel/gyro bars) stay
-//!     current.
-//!   * **Sleeping**: accel-only at 31.25 Hz with Wake-on-Motion
-//!     configured. The task polls STATUS1.WOM over I2C and emits
-//!     a `WakeOnMotion` event when the bit sets.
+//!   * **Awake**: motion snapshots at 20 Hz, emitted as
+//!     `MotionUpdated` for live-display screens.
+//!   * **Sleeping**: the chip's wake-on-motion engine is armed and
+//!     its event latch polled at 2 Hz; a latched event emits
+//!     `WakeOnMotion`.
 //!
-//! ## Why we poll STATUS1 instead of waiting on INT1
+//! Bring-up runs inside the task (see [`AnyImu::boot_step`]): each
+//! chip advances one short bus transaction at a time, so system boot
+//! never waits on the IMU and a chip that needs a firmware upload
+//! shares the I2C bus fairly. The boot self-tests run through the
+//! seam once bring-up completes, then their results are replayed
+//! over the event bus.
 //!
-//! On paper, the QMI8658C can signal WoM events on the INT1 pin
-//! (selectable via CAL1_H bits 7:6). In practice, on this silicon
-//! revision (`rev=0x7C`) and this board, the chip sets STATUS1.WOM
-//! internally but never drives the INT1 output pin for WoM events,
-//! regardless of CAL1_H polarity, CTRL8 handshake routing, or CTRL8
-//! bit 6 (motion-event pin select). Both polarities and both pull
-//! configurations were verified via a debug poll loop that read the
-//! raw pin level alongside the STATUS1 register - the pin stayed at
-//! its pull-resistor level across hundreds of polls including
-//! deliberate shakes, while STATUS1.WOM toggled reliably.
-//!
-//! The original driver in commit 5502388 already shipped with a
-//! timeout-driven STATUS1 fallback poll next to the edge wait,
-//! which strongly suggests the author hit the same silicon behavior
-//! then. Polling is the supported wake path per datasheet section
-//! 9.3 ("When a Wake on Motion event is detected the QMI8658C will
-//! set bit 2 (WoM) in the STATUS1 register. Reading STATUS1 [...]
-//! will clear the WoM bit").
+//! Why the sleep path polls a latch instead of awaiting the INT pin:
+//! on the QMI8658C silicon this system started on, the WoM interrupt
+//! output provably never fires even though the chip latches the
+//! event in STATUS1 (verified against both polarities and pull
+//! configurations). Polling the seam's latch works on every chip and
+//! costs one short register read per poll.
 
 use app_core::events::{NUM_SELF_TESTS, SelfTestError, SelfTestId, SelfTestResult, SystemEvent};
 use crate::bus::{EVENTS, IMU_COMMAND, ImuCommand, SleepState, SharedI2c, SLEEP_WATCH};
-use drivers::imu::{ImuData, Qmi8658, Config as ImuConfig, Odr, WomConfig, WomInterrupt};
+use drivers::imu::{
+    AnyImu, BootStep, ImuData, SelfTestAxes, SelfTestKind, SelfTestPoll, WristIntent,
+};
 use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_time::{Duration, Timer};
 use embedded_hal::i2c::I2c as I2cTrait;
@@ -52,20 +45,168 @@ use esp_hal::gpio::Input;
 /// I2C bus.
 const AWAKE_POLL_MS: u64 = 50;
 
-/// STATUS1.WOM poll cadence while sleeping. 500 ms = 2 Hz is a
-/// compromise between wake latency and I2C traffic / power. The
-/// WoM blanking filter is ~2 s after accel enable, so faster
-/// polling wouldn't help during that window anyway.
+/// Wake-on-motion latch poll cadence while sleeping. 500 ms = 2 Hz
+/// is a compromise between wake latency and I2C traffic / power.
 const WOM_POLL_MS: u64 = 500;
 
-/// IMU task: two modes driven by [`SLEEP_WATCH`]. Awake it
-/// emits `MotionUpdated` events at 20 Hz; sleeping it arms WoM
-/// and polls STATUS1.WOM at 2 Hz, emitting `WakeOnMotion` on set.
+/// Self-test pacing: seam polls every 10 ms with the bus released in
+/// between, up to ~5 s total. The budget covers a chip's observed
+/// power-down quiesce phase plus the test itself (the reference host
+/// library allows 1 s for the test alone).
+const SELF_TEST_POLL_MS: u64 = 10;
+const SELF_TEST_POLLS: u32 = 500;
+
+// `MotionData` (struct + Default + From<&ImuData>) lives in
+// `app_core::data`. Re-exported so `crate::tasks::imu::
+// MotionData` imports in firmware keep resolving.
+pub use app_core::data::MotionData;
+
+pub struct ImuTaskState<'d> {
+    pub imu: AnyImu,
+    int_pin: Input<'d>,
+    /// Last known result of each IMU-owned self-test, indexed by
+    /// `SelfTestId as usize`. Populated by the task after bring-up
+    /// completes; updated in place by [`handle_command`] when a UI
+    /// re-run request comes through [`IMU_COMMAND`].
+    self_tests: [SelfTestResult; NUM_SELF_TESTS],
+}
+
+impl<'d> ImuTaskState<'d> {
+    /// Wrap the bin's chip choice. No bus traffic happens here -
+    /// bring-up runs inside [`imu_task`] via the seam's staged
+    /// `boot_step`.
+    pub fn new(imu: AnyImu, int_pin: Input<'d>) -> Self {
+        Self {
+            imu,
+            int_pin,
+            self_tests: [SelfTestResult::NotRun; NUM_SELF_TESTS],
+        }
+    }
+
+    /// Read a single IMU snapshot and return it as `MotionData`.
+    /// Returns `Default` (all zeros) if the read fails or the chip
+    /// never came up.
+    pub fn snapshot(&mut self, i2c: &mut impl I2cTrait) -> MotionData {
+        self.imu.read(i2c).ok().as_ref().map(MotionData::from).unwrap_or_default()
+    }
+
+    /// Raw seam-level read. Kept for places that want access to the
+    /// un-converted `ImuData` (e.g. calibration routines).
+    #[allow(dead_code)]
+    pub fn read(&mut self, i2c: &mut impl I2cTrait) -> Option<ImuData> {
+        self.imu.read(i2c).ok()
+    }
+
+    /// Async wait for an IMU interrupt. Not used by the WoM wake
+    /// path (see module docs for why) but kept in case the INT line
+    /// is ever repurposed - e.g. for data-ready pacing.
+    #[allow(dead_code)]
+    pub async fn wait_for_int(&mut self) {
+        self.int_pin.wait_for_rising_edge().await;
+    }
+
+}
+
+/// Run one self-test by id: start it through the seam, then pace the
+/// polls with the bus free between checks (a chip may take the
+/// better part of a second), and map the outcome onto the UI's
+/// result type. The seam restores the chip's running configuration
+/// on every exit path.
+async fn run_self_test(
+    bus: &'static SharedI2c,
+    state: &mut ImuTaskState<'static>,
+    id: SelfTestId,
+) -> SelfTestResult {
+    let (label, unit, kind) = match id {
+        SelfTestId::ImuAccel => ("accel", "mg", SelfTestKind::Accel),
+        SelfTestId::ImuGyro => ("gyro", "dps", SelfTestKind::Gyro),
+    };
+    let started = {
+        let mut i2c = bus.lock().await;
+        state.imu.self_test_start(&mut *i2c, kind)
+    };
+    if started {
+        for _ in 0..SELF_TEST_POLLS {
+            Timer::after(Duration::from_millis(SELF_TEST_POLL_MS)).await;
+            let poll = {
+                let mut i2c = bus.lock().await;
+                state.imu.self_test_poll(&mut *i2c)
+            };
+            match poll {
+                SelfTestPoll::Pending => continue,
+                SelfTestPoll::Done(SelfTestAxes { passed, values }) => {
+                    log::info!(
+                        "IMU: {} self-test {} [{} {} {}] {}",
+                        label,
+                        if passed { "PASS" } else { "FAIL" },
+                        values[0],
+                        values[1],
+                        values[2],
+                        unit,
+                    );
+                    return if passed {
+                        SelfTestResult::PassAxes3(values)
+                    } else {
+                        SelfTestResult::FailAxes3(values)
+                    };
+                }
+                SelfTestPoll::Error => break,
+            }
+        }
+        // Budget exhausted or errored - make sure the chip is back
+        // in its running configuration (no-op after a clean end).
+        let mut i2c = bus.lock().await;
+        state.imu.self_test_abort(&mut *i2c);
+    }
+    log::warn!("IMU: {} self-test failed to complete", label);
+    SelfTestResult::Error(SelfTestError::Timeout)
+}
+
+/// IMU task: staged bring-up, boot self-tests, then two modes driven
+/// by [`SLEEP_WATCH`]. Awake it emits `MotionUpdated` events at
+/// 20 Hz; sleeping it arms WoM and polls the seam's latch at 2 Hz,
+/// emitting `WakeOnMotion` on set.
 #[embassy_executor::task]
 pub async fn imu_task(bus: &'static SharedI2c, mut state: ImuTaskState<'static>) {
-    // Replay the boot-time self-test results once, so whichever
-    // screen is interested can pick them up from `cached_data`
-    // without having to re-run the tests on first open.
+    // Staged chip bring-up: one short bus transaction per iteration,
+    // paced by the seam's delay hints. On failure the task keeps
+    // running with an inert chip - snapshots read all-zero and sleep
+    // has no motion wake (GPIO wake sources are unaffected).
+    let ready = loop {
+        let step = {
+            let mut i2c = bus.lock().await;
+            state.imu.boot_step(&mut *i2c)
+        };
+        match step {
+            BootStep::Ready => break true,
+            BootStep::Pending { delay_ms } => {
+                Timer::after(Duration::from_millis(delay_ms as u64)).await;
+            }
+            BootStep::Failed(why) => {
+                log::error!("IMU: bring-up failed: {}", why);
+                break false;
+            }
+        }
+    };
+
+    // Boot self-tests, through the seam's staged path for every
+    // chip.
+    if ready {
+        for id in [SelfTestId::ImuAccel, SelfTestId::ImuGyro] {
+            let result = run_self_test(bus, &mut state, id).await;
+            state.self_tests[id as usize] = result;
+        }
+    }
+
+    // Announce which chip this board carries (the UI renders it on
+    // the settings MOTION row instead of hardcoding a name).
+    EVENTS
+        .send(SystemEvent::ImuIdentified { name: state.imu.name() })
+        .await;
+
+    // Replay the self-test results once, so whichever screen is
+    // interested can pick them up from `cached_data` without having
+    // to re-run the tests on first open.
     for id in [SelfTestId::ImuAccel, SelfTestId::ImuGyro] {
         let result = state.self_tests[id as usize];
         EVENTS.send(SystemEvent::SelfTestUpdated { id, result }).await;
@@ -92,12 +233,24 @@ pub async fn imu_task(bus: &'static SharedI2c, mut state: ImuTaskState<'static>)
                             state.snapshot(&mut *i2c)
                         };
                         EVENTS.send(SystemEvent::MotionUpdated { data }).await;
+                        // Forward any semantic wrist intent the
+                        // seam's classifier settled on during that
+                        // read. No bus traffic.
+                        if let Some(intent) = state.imu.take_intent() {
+                            log::info!("IMU: wrist {:?}", intent);
+                            EVENTS
+                                .send(match intent {
+                                    WristIntent::Raised => SystemEvent::WristRaised,
+                                    WristIntent::Lowered => SystemEvent::WristLowered,
+                                })
+                                .await;
+                        }
                     }
                     Either3::Second(new) => {
                         sleep_state = new;
                         if new == SleepState::Sleeping {
                             let mut i2c = bus.lock().await;
-                            state.enter_wom_mode(&mut *i2c);
+                            state.imu.enter_wom(&mut *i2c);
                         }
                     }
                     Either3::Third(cmd) => {
@@ -106,16 +259,14 @@ pub async fn imu_task(bus: &'static SharedI2c, mut state: ImuTaskState<'static>)
                 }
             }
             SleepState::Sleeping => {
-                // Poll STATUS1.WOM at WOM_POLL_MS cadence. See the
-                // module-level "Why we poll STATUS1 instead of waiting
-                // on INT1" section for the reasoning - the short form
-                // is that the INT1 output pin doesn't fire for WoM on
-                // this silicon, even though the register bit does.
+                // Poll the seam's WoM latch at WOM_POLL_MS cadence.
+                // See the module-level docs for why this polls
+                // instead of waiting on the INT pin.
                 let wom_fired = async {
                     loop {
                         Timer::after(Duration::from_millis(WOM_POLL_MS)).await;
                         let mut i2c = bus.lock().await;
-                        if state.wom_event(&mut *i2c) {
+                        if state.imu.wom_event(&mut *i2c) {
                             break;
                         }
                     }
@@ -128,288 +279,12 @@ pub async fn imu_task(bus: &'static SharedI2c, mut state: ImuTaskState<'static>)
                         sleep_state = new;
                         if new == SleepState::Awake {
                             let mut i2c = bus.lock().await;
-                            state.exit_wom_mode(&mut *i2c);
+                            state.imu.exit_wom(&mut *i2c);
                         }
                     }
                 }
             }
         }
-    }
-}
-
-// ---- Wake-on-Motion tunables ----------------------------------------------------
-
-/// Accelerometer ODR while in Wake-on-Motion sleep. A low ODR
-/// reduces per-sample slopes from micro-vibrations (USB cable,
-/// desk noise) so the threshold can reject noise while still
-/// catching real wrist motion.
-const WOM_ACCEL_ODR: Odr = Odr::Hz31_25;
-
-/// Motion threshold in milli-g for the WoM engine. Slopes
-/// smaller than this are ignored. 80 mg filters out table
-/// vibrations; real wrist motion produces much larger slopes.
-const WOM_THRESHOLD_MG: u8 = 80;
-
-/// Which interrupt pin WoM drives, and its idle-state value.
-/// INT1 starts low and toggles high on each motion event;
-/// reading STATUS1 resets it.
-const WOM_INTERRUPT: WomInterrupt = WomInterrupt::Int1Low;
-
-/// Blanking time after WoM enable, in accelerometer samples.
-/// 63 is the max of the 6-bit blanking field - at 31.25 Hz
-/// that's about 2 s, enough to skip power-up transients.
-const WOM_BLANKING_SAMPLES: u8 = 63;
-
-/// Number of samples averaged for the initial gyro bias at
-/// boot. At 125 Hz that's ~512 ms; the device must be held
-/// still during this window.
-#[allow(dead_code)]
-const GYRO_BIAS_SAMPLES: u8 = 64;
-
-// `MotionData` (struct + Default + From<&ImuData>) lives in
-// `app_core::data`. Re-exported so `crate::tasks::imu::
-// MotionData` imports in firmware keep resolving.
-pub use app_core::data::MotionData;
-
-pub struct ImuTaskState<'d> {
-    pub imu: Qmi8658,
-    int_pin: Input<'d>,
-    /// Last known result of each IMU-owned self-test, indexed by
-    /// `SelfTestId as usize`. Populated during [`init`] with the
-    /// boot-time run; updated in place by [`handle_command`] when
-    /// a UI re-run request comes through [`IMU_COMMAND`].
-    ///
-    /// [`init`]: ImuTaskState::init
-    self_tests: [SelfTestResult; NUM_SELF_TESTS],
-}
-
-impl<'d> ImuTaskState<'d> {
-    /// Soft-reset the chip, configure the default accel/gyro, and
-    /// collect a gyroscope bias estimate. The device must be held
-    /// still for ~500 ms during this call. Also runs the datasheet
-    /// self-tests once and stashes their results in `self_tests`
-    /// so the task can replay them over the event bus on startup.
-    pub async fn init(int_pin: Input<'d>, i2c: &mut impl I2cTrait) -> Self {
-        log::info!("IMU: initializing QMI8658C...");
-        let imu_config = ImuConfig::default();
-        let mut imu = Qmi8658::new(ImuConfig::default());
-        let mut self_tests: [SelfTestResult; NUM_SELF_TESTS] =
-            [SelfTestResult::NotRun; NUM_SELF_TESTS];
-
-        // Soft reset to clear any leftover state from a previous
-        // boot (WoM config, pedometer, etc.).
-        if imu.soft_reset(i2c).is_ok() {
-            log::info!("IMU: soft reset OK");
-            Timer::after(Duration::from_millis(20)).await;
-        } else {
-            log::warn!("IMU: soft reset failed (continuing anyway)");
-        }
-
-        match imu.init(i2c, &imu_config) {
-            Err(_) => log::error!("IMU: device not found at I2C address 0x{:02X}", drivers::imu::ADDR),
-            Ok(()) => {
-                match imu.read_ids(i2c) {
-                    Ok((chip_id, rev)) => log::info!("IMU: QMI8658C chip_id=0x{:02X} rev=0x{:02X}", chip_id, rev),
-                    Err(_) => log::warn!("IMU: init OK but failed to read IDs"),
-                }
-
-                // Settling delay before the first self-test. 100 ms
-                // (the previous value) is enough for a re-run hours
-                // into a boot but not enough right after the soft
-                // reset + init sequence - the first self-test after
-                // boot times out on STATUSINT.bit0. 250 ms reliably
-                // clears that window. The second test (run right
-                // after) doesn't need another settling delay because
-                // the chip has been running continuously by then.
-                Timer::after(Duration::from_millis(250)).await;
-
-                // Run both self-tests per datasheet section 11. These
-                // leave CTRL7 = 0 and touch CTRL2/CTRL3, so we re-run
-                // init() afterwards to restore the normal config. The
-                // results are stashed in `self_tests` so `imu_task`
-                // can replay them as `SelfTestUpdated` events once it
-                // starts (see the top of `imu_task`).
-                self_tests[SelfTestId::ImuAccel as usize] = match imu.run_accel_self_test(i2c) {
-                    Ok(r) => {
-                        log::info!(
-                            "IMU: accel self-test {} [{} {} {}] mg",
-                            if r.passed { "PASS" } else { "FAIL" },
-                            r.x_mg, r.y_mg, r.z_mg,
-                        );
-                        let values = [r.x_mg, r.y_mg, r.z_mg];
-                        if r.passed { SelfTestResult::PassAxes3(values) }
-                        else { SelfTestResult::FailAxes3(values) }
-                    }
-                    Err(_) => {
-                        log::warn!("IMU: accel self-test failed to complete");
-                        SelfTestResult::Error(SelfTestError::Timeout)
-                    }
-                };
-                self_tests[SelfTestId::ImuGyro as usize] = match imu.run_gyro_self_test(i2c) {
-                    Ok(r) => {
-                        log::info!(
-                            "IMU: gyro self-test {} [{} {} {}] dps",
-                            if r.passed { "PASS" } else { "FAIL" },
-                            r.x_dps, r.y_dps, r.z_dps,
-                        );
-                        let values = [r.x_dps, r.y_dps, r.z_dps];
-                        if r.passed { SelfTestResult::PassAxes3(values) }
-                        else { SelfTestResult::FailAxes3(values) }
-                    }
-                    Err(_) => {
-                        log::warn!("IMU: gyro self-test failed to complete");
-                        SelfTestResult::Error(SelfTestError::Timeout)
-                    }
-                };
-                if imu.init(i2c, &imu_config).is_err() {
-                    log::error!("IMU: re-init after self-test failed");
-                }
-
-                Timer::after(Duration::from_millis(100)).await;
-
-                log::info!("IMU: collecting gyro bias (keep device still ~512ms)...");
-                match imu.collect_gyro_bias(i2c, 64) {
-                    Err(_) => log::error!("IMU: failed to collect gyro bias"),
-                    Ok((bx, by, bz)) => {
-                        log::info!("IMU: gyro bias raw [{} {} {}]", bx, by, bz);
-                        imu.set_gyro_bias(bx, by, bz);
-                        log::info!("IMU: gyro bias applied (software)");
-                    }
-                }
-            }
-        }
-
-        Self { imu, int_pin, self_tests }
-    }
-
-    /// Read a single IMU snapshot and return it as `MotionData`.
-    /// Returns `Default` (all zeros) if the I2C read fails.
-    ///
-    /// Called periodically by the IMU task while awake; the
-    /// result is sent via the event channel so the main loop
-    /// can update `cached_data.motion` for live-display
-    /// screens like the accelerometer visualizer.
-    pub fn snapshot(&mut self, i2c: &mut impl I2cTrait) -> MotionData {
-        self.imu.read(i2c).ok().as_ref().map(MotionData::from).unwrap_or_default()
-    }
-
-    /// Raw driver-level read. Kept for places that want access
-    /// to the un-converted `ImuData` (e.g. calibration routines).
-    #[allow(dead_code)]
-    pub fn read(&mut self, i2c: &mut impl I2cTrait) -> Option<ImuData> {
-        self.imu.read(i2c).ok()
-    }
-
-    /// Enter Wake-on-Motion mode per QMI8658C datasheet section 9.4:
-    ///
-    /// 1. Disable sensors (CTRL7 = 0x00)
-    /// 2. Switch accelerometer ODR to 31.25 Hz (low power)
-    /// 3. Write WoM threshold, interrupt pin, and blanking time
-    /// 4. Issue CTRL9 0x08 (CTRL_CMD_WRITE_WOM_SETTING)
-    /// 5. Enable the accelerometer
-    pub fn enter_wom_mode(&mut self, i2c: &mut impl I2cTrait) {
-        if self.imu.disable_all(i2c).is_err() {
-            log::error!("IMU: failed to disable sensors for WoM");
-            return;
-        }
-
-        if self.imu.set_accel_odr(i2c, WOM_ACCEL_ODR).is_err() {
-            log::warn!("IMU: failed to set accel ODR for WoM");
-        }
-
-        let wom_cfg = WomConfig {
-            threshold_mg: WOM_THRESHOLD_MG,
-            interrupt: WOM_INTERRUPT,
-            blanking_samples: WOM_BLANKING_SAMPLES,
-        };
-        if self.imu.configure_wom(i2c, &wom_cfg).is_err() {
-            log::error!("IMU: WoM configuration failed");
-            return;
-        }
-
-        if self.imu.set_accel_enable(i2c, true).is_err() {
-            log::error!("IMU: failed to enable accel for WoM");
-            return;
-        }
-
-        // Clear any stale STATUS1.WOM bit left over from a previous
-        // sleep cycle so the poll loop doesn't fire immediately.
-        let _ = self.imu.wom_event(i2c);
-
-        log::info!(
-            "IMU: WoM enabled ({} mg threshold, 31.25 Hz accel ODR)",
-            wom_cfg.threshold_mg,
-        );
-    }
-
-    /// Exit Wake-on-Motion mode per datasheet section 9.6 and
-    /// re-initialize with the default 125 Hz accel+gyro config.
-    pub fn exit_wom_mode(&mut self, i2c: &mut impl I2cTrait) {
-        // Clear any pending WoM flag and reset INT1 to its initial value.
-        let _ = self.imu.wom_event(i2c);
-
-        // Disable WoM (zero threshold, issue CTRL9 0x08).
-        if self.imu.disable_wom(i2c).is_err() {
-            log::warn!("IMU: failed to disable WoM");
-        }
-
-        // Re-init with normal config (restores ODR, scale, LPF, enables).
-        let cfg = ImuConfig::default();
-        if self.imu.init(i2c, &cfg).is_err() {
-            log::error!("IMU: re-init after WoM failed");
-        } else {
-            log::info!("IMU: WoM mode exited");
-        }
-    }
-
-    /// Read STATUS1 to check if a WoM event is latched. Reading
-    /// also clears the flag and resets INT1 to its initial value.
-    pub fn wom_event(&self, i2c: &mut impl I2cTrait) -> bool {
-        self.imu.wom_event(i2c).unwrap_or(false)
-    }
-
-    /// Async wait for an IMU interrupt. Not used by the WoM wake
-    /// path (see module docs for why) but kept in case INT1 is
-    /// ever repurposed - e.g. for CTRL9 handshake if the driver
-    /// stops routing through STATUSINT.bit7, or for data-ready.
-    #[allow(dead_code)]
-    pub async fn wait_for_int(&mut self) {
-        self.int_pin.wait_for_rising_edge().await;
-    }
-
-    /// Run one specific self-test by id, synchronously on the
-    /// caller's I2C lock. Returns the new [`SelfTestResult`] without
-    /// touching `self.self_tests` - the caller decides whether to
-    /// cache the result (command handler does; boot-time init
-    /// already has its own storage path).
-    fn run_self_test(&mut self, i2c: &mut impl I2cTrait, id: SelfTestId) -> SelfTestResult {
-        let result = match id {
-            SelfTestId::ImuAccel => match self.imu.run_accel_self_test(i2c) {
-                Ok(r) => {
-                    let values = [r.x_mg, r.y_mg, r.z_mg];
-                    if r.passed { SelfTestResult::PassAxes3(values) }
-                    else { SelfTestResult::FailAxes3(values) }
-                }
-                Err(_) => SelfTestResult::Error(SelfTestError::Timeout),
-            },
-            SelfTestId::ImuGyro => match self.imu.run_gyro_self_test(i2c) {
-                Ok(r) => {
-                    let values = [r.x_dps, r.y_dps, r.z_dps];
-                    if r.passed { SelfTestResult::PassAxes3(values) }
-                    else { SelfTestResult::FailAxes3(values) }
-                }
-                Err(_) => SelfTestResult::Error(SelfTestError::Timeout),
-            },
-        };
-
-        // Both self-tests leave sensors disabled and CTRL2/CTRL3
-        // partially modified - restore the normal config before
-        // handing the bus back to the caller.
-        let cfg = ImuConfig::default();
-        if self.imu.init(i2c, &cfg).is_err() {
-            log::error!("IMU: re-init after self-test failed");
-        }
-        result
     }
 }
 
@@ -432,13 +307,10 @@ async fn handle_command(
                 result: SelfTestResult::Running,
             }).await;
 
-            // Lock the bus, run the test, release the lock before
-            // sending the result event so the main loop can run its
-            // dispatch without waiting on the I2C mutex.
-            let result = {
-                let mut i2c = bus.lock().await;
-                state.run_self_test(&mut *i2c, id)
-            };
+            // The runner paces itself and only holds the bus for
+            // short start/poll transactions, so redraws keep flowing
+            // while the test runs.
+            let result = run_self_test(bus, state, id).await;
 
             // Cache locally so the next post-wake replay shows the
             // latest result rather than the stale boot-time one.

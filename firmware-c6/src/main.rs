@@ -189,11 +189,13 @@ impl Bringup for C6Bringup {
     ) -> (RtcTaskState<'static>, ImuTaskState<'static>) {
         // No RTC_INT GPIO routed on this board -> poll-only RTC task.
         let rtc_state = RtcTaskState::init(None, i2c);
-        let imu = ImuTaskState::init(
+        // The chip choice is the board's: QMI8658 behind the AnyImu
+        // seam. Bring-up (reset, bias, self-tests) runs inside the
+        // shared IMU task, staged over the shared bus.
+        let imu = ImuTaskState::new(
+            drivers::imu::AnyImu::Qmi8658(drivers::imu::QmiImu::new()),
             Input::new(self.imu_int1.take().unwrap(), InputConfig::default().with_pull(Pull::Down)),
-            i2c,
-        )
-        .await;
+        );
         (rtc_state, imu)
     }
 

@@ -309,35 +309,9 @@ pub struct WomConfig {
 
 // ---- Sensor data snapshot -------------------------------------------------------
 
-/// A single snapshot of all IMU sensor data.
-///
-/// All values are raw 16-bit signed integers straight from the device.
-/// Use [`AccelScale::lsb_per_g`] and [`GyroScale::lsb_per_dps`] to convert
-/// to physical units, or call [`ImuData::temp_celsius`] for temperature.
-///
-/// # Converting raw readings
-///
-/// ```ignore
-/// let accel_x_g   = data.accel_x as f32 / config.accel_scale.lsb_per_g() as f32;
-/// let gyro_x_dps  = data.gyro_x  as f32 / config.gyro_scale.lsb_per_dps() as f32;
-/// ```
-#[derive(Debug, Clone, Default)]
-pub struct ImuData {
-    /// X-axis acceleration (raw signed 16-bit, little-endian from device).
-    pub accel_x: i16,
-    /// Y-axis acceleration.
-    pub accel_y: i16,
-    /// Z-axis acceleration.
-    pub accel_z: i16,
-    /// X-axis angular rate (raw signed 16-bit, little-endian from device).
-    pub gyro_x: i16,
-    /// Y-axis angular rate.
-    pub gyro_y: i16,
-    /// Z-axis angular rate.
-    pub gyro_z: i16,
-    /// Raw temperature value.  Divide by 256 for degrees Celsius.
-    pub temp_raw: i16,
-}
+// The snapshot struct is the cross-chip data contract and lives with
+// the seam; re-exported here so `qmi8658::ImuData` keeps resolving.
+pub use crate::imu::ImuData;
 
 impl ImuData {
     /// Temperature rounded to the nearest whole degree Celsius.

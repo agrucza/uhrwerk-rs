@@ -9,8 +9,8 @@
 //! event loop. Board deltas from the S3: touch is a CST92xx whose
 //! reset runs through the XL9555 expander (built here, handed to the
 //! shared task via `TouchTaskState::with_driver`); the IMU is a
-//! BHI260AP the shared QMI8658 task can't drive yet (it probes, logs
-//! the miss, and idles - BHI260AP support is a separate effort);
+//! BHI260AP hub driven through the AnyImu seam (its firmware upload
+//! and discovery run staged inside the shared IMU task);
 //! haptics are a DRV2605 dispatched through a bin-local task; and
 //! audio is codec-less: a MAX98357A speaker on standard I2S TX plus
 //! a T3902 PDM mic on the same I2S0's RX unit in hardware PDM-to-PCM
@@ -239,15 +239,55 @@ impl Bringup for TwatchUltraBringup {
         let _ = rtc_int.wakeup_enable(true, WakeEvent::LowLevel);
         let rtc_state = RtcTaskState::init(Some(rtc_int), i2c);
 
-        // No QMI8658 on this board - the shared IMU task probes it,
-        // logs the miss, and idles on an INT that never fires. The
-        // BHI260AP on GPIO8 needs its own driver (firmware upload at
-        // init) - a separate planned effort.
-        let imu = ImuTaskState::init(
-            Input::new(self.imu_int.take().unwrap(), InputConfig::default().with_pull(Pull::Down)),
-            i2c,
-        )
-        .await;
+        // This board's IMU is the BHI260AP hub: its firmware upload
+        // and sensor discovery run inside the shared IMU task via
+        // the AnyImu seam, staged chunk by chunk over the shared bus
+        // (the UI boots without waiting; the IMU comes alive a few
+        // seconds later). The mounting remap is the IDENTITY:
+        // measured on hardware (2026-07-29, three-pose gravity
+        // check) the chip sits in the datasheet-default frame
+        // relative to THIS firmware's screen orientation. The
+        // vendor's remap (LilyGoLib: TOP_LAYER_BOTTOM_RIGHT_CORNER,
+        // 180 deg around Z) serves LilyGo's display rotation, which
+        // is 180 deg from ours - do not copy it. The wake-gesture
+        // algorithm evaluates this device frame and is blind when
+        // it is wrong.
+        let imu = ImuTaskState::new(
+            drivers::imu::AnyImu::Bhi260(drivers::imu::bhi260_imu::Bhi260Imu::new(
+                drivers::bhi260::Bhi260::pack_orientation_matrix([
+                    1, 0, 0, //
+                    0, 1, 0, //
+                    0, 0, 1,
+                ]),
+                // Wear calibration from the guided measurement
+                // session (2026-07-31, this user's wrist): the
+                // viewing pose holds gravity on +Y - from ~3900
+                // (formal, face near-vertical) down to ~2700 (lazy
+                // glance, ~45 deg) - while every desk pose stays at
+                // or below ~1100 and arm-hang sits on -X. The
+                // enter/exit thresholds are centered in that gap;
+                // the band between them is hysteresis.
+                drivers::imu::WearCalibration {
+                    axis: [0, 1, 0],
+                    enter_lsb: 2400,
+                    exit_lsb: 1800,
+                },
+            )),
+            {
+                // The BHI260AP interrupt line is a wake source: with
+                // the AP-suspend contract, only wake-up sensor
+                // events assert it during sleep (active high, level;
+                // meta events are disabled for the wake FIFO), so a
+                // wrist-raise wakes in milliseconds instead of
+                // waiting for the next heartbeat poll.
+                let mut imu_int = Input::new(
+                    self.imu_int.take().unwrap(),
+                    InputConfig::default().with_pull(Pull::Down),
+                );
+                let _ = imu_int.wakeup_enable(true, WakeEvent::HighLevel);
+                imu_int
+            },
+        );
         (rtc_state, imu)
     }
 
