@@ -1,12 +1,12 @@
 # uhrwerk-rs
 
 One movement, different cases: Rust-native (`no_std`, esp-hal +
-embassy) firmware for ESP32 AMOLED touch devices - currently two
-desk displays and a smartwatch. One shared, board-agnostic system layer (`system-core`:
-manager, tasks, UI model, storage, audio) runs on three boards through
-a `Board` trait plus per-chip driver seams; each `firmware-*` bin crate
-only supplies pins, board bring-up, and its chip choices. Long-term
-goal: a push-to-talk Home Assistant voice assistant (Wyoming over TCP).
+embassy) firmware for ESP32 AMOLED smartwatches. One shared,
+board-agnostic system layer (`system-core`: manager, tasks, UI model,
+storage, audio) runs on three watches through a `Board` trait plus
+per-chip driver seams; each `firmware-*` bin crate only supplies pins,
+board bring-up, and its chip choices. Long-term goal: a push-to-talk
+Home Assistant voice assistant (Wyoming over TCP).
 
 ## Workspace
 
@@ -18,7 +18,7 @@ goal: a push-to-talk Home Assistant voice assistant (Wyoming over TCP).
 
 ## Hardware status
 
-| Subsystem | Waveshare ESP32-S3-Touch-AMOLED-S3-2.06 | Waveshare ESP32-S3-Touch-AMOLED-C6-2.06 | LilyGo T-Watch Ultra |
+| Subsystem | Waveshare ESP32-S3-Touch-AMOLED-2.06 | Waveshare ESP32-C6-Touch-AMOLED-2.06 | LilyGo T-Watch Ultra |
 |---|---|---|---|
 | Display (CO5300 QSPI AMOLED 410x502) | working | working | working |
 | Touch | working (FT3168) | working (FT3168) | working (CST9217/9220) |
