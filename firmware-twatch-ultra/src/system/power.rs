@@ -19,7 +19,7 @@
 //! rail table in `board.rs` - everything 3.3 V except ALDO4 at 1.8 V
 //! (the BHI260AP is a 1.8 V part; see board.rs).
 
-use drivers::pmu::{Config as PmuConfig, Pmu};
+use drivers::pmu::{Config as PmuConfig, InterruptConfig, InterruptSource, Pmu};
 use drivers::xl9555::{Config as ExpanderConfig, Xl9555};
 use embedded_hal::i2c::I2c;
 use esp_hal::gpio::{Input, Output};
@@ -77,6 +77,28 @@ impl TwatchUltraBoard {
         pmu.enable_all_rails(i2c).map_err(|_| ())?;
         pmu.enable_all_adc(i2c).map_err(|_| ())?;
         pmu.enable_battery_monitor(i2c).map_err(|_| ())?;
+
+        // Explicit IRQ whitelist. This is the first board where the
+        // PMU IRQ line reaches a GPIO and is armed as a light-sleep
+        // wake source, so every enabled source here is a wake. The
+        // AXP2101 is battery-backed: without this write the enable
+        // mask stays whatever the last firmware left behind
+        // (observed: the fuel gauge's new-SOC tick enabled - a
+        // spurious wake every ~80 s while charging). Kept sources:
+        // PKEY presses (power task events, wake button), VBUS
+        // insert/remove (charger plug/unplug wakes the UI), SOC
+        // warnings (one-shot low-battery notice per discharge).
+        // Everything else stays off - hardware protections (OV/OT/
+        // UV, JEITA) act regardless of IRQ reporting, and all UI
+        // state comes from status polling, not latches.
+        let irq_whitelist = InterruptConfig::none()
+            .enable(InterruptSource::PowerOnShortPress)
+            .enable(InterruptSource::PowerOnLongPress)
+            .enable(InterruptSource::VbusInsert)
+            .enable(InterruptSource::VbusRemove)
+            .enable(InterruptSource::SocWarningLevel1)
+            .enable(InterruptSource::SocWarningLevel2);
+        pmu.configure_interrupts(i2c, &irq_whitelist).map_err(|_| ())?;
 
         // Discard PMU IRQ bits latched before boot: the >= 1 s PWRON
         // hold that powers the watch on latches PKEY press events,
