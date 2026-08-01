@@ -357,6 +357,34 @@ impl Pmu {
         self.write_register(i2c, registers::REG_LDO_EN0, new)
     }
 
+    /// Enable or disable BLDO1.
+    ///
+    /// The consumer is board-specific: unclaimed on the original
+    /// board (enabled at a safe voltage by [`enable_all_rails`]),
+    /// the GPS receiver's main rail on the T-Watch Ultra - whose
+    /// bin turns it off at boot: the receiver's backup domain hangs
+    /// on the always-on VRTC, so a dark main rail is u-blox
+    /// hardware backup mode (RTC time and ephemeris retained on
+    /// backup current, acquisition engine off).
+    ///
+    /// Only BLDO1 is touched - all other rail enables in REG 90h
+    /// are preserved via a read-modify-write.
+    ///
+    /// [`enable_all_rails`]: Pmu::enable_all_rails
+    pub fn set_bldo1_enable<I2C, E>(&self, i2c: &mut I2C, enable: bool) -> Result<(), Error<E>>
+    where
+        I2C: I2cTrait<Error = E>,
+    {
+        use registers::ldo_en0;
+        let cur = self.read_register(i2c, registers::REG_LDO_EN0)?;
+        let new = if enable {
+            cur | ldo_en0::BLDO1
+        } else {
+            cur & !ldo_en0::BLDO1
+        };
+        self.write_register(i2c, registers::REG_LDO_EN0, new)
+    }
+
     /// Enable or disable ALDO2 (net `DSI_PWR_EN`, the AMOLED display rail).
     ///
     /// ALDO2 is enabled at boot by [`enable_all_rails`] and powers the

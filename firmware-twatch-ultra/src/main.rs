@@ -23,7 +23,7 @@ extern crate alloc;
 mod board;
 mod system;
 
-use crate::system::power::TwatchUltraBoard;
+use crate::system::power::{LoraSleepPins, TwatchUltraBoard};
 use drivers::touch::cst9217::Cst9217;
 use drivers::touch::AnyTouch;
 use drivers::xl9555::{Config as ExpanderConfig, Xl9555};
@@ -61,6 +61,10 @@ struct TwatchUltraBringup {
     // Shared-SPI chip selects held deselected (see TwatchUltraBoard).
     lora_cs: Option<p::GPIO36<'static>>,
     nfc_cs: Option<p::GPIO4<'static>>,
+    // SX1262 reset/busy - used once at boot for the cold-sleep park,
+    // kept in the struct for the future LoRa effort.
+    lora_rst: Option<p::GPIO47<'static>>,
+    lora_busy: Option<p::GPIO48<'static>>,
     spi2: Option<p::SPI2<'static>>,
     lcd_sclk: Option<p::GPIO40<'static>>,
     lcd_sio0: Option<p::GPIO38<'static>>,
@@ -123,10 +127,39 @@ impl Bringup for TwatchUltraBringup {
 
         let lora_cs =
             Output::new(self.lora_cs.take().unwrap(), Level::High, OutputConfig::default());
+        // NFC CS idles LOW: the ST25R3916's rail (DLDO1) is off, and
+        // a driven-high line would back-feed the unpowered chip
+        // through its input-protection diodes (see TwatchUltraBoard).
         let nfc_cs =
-            Output::new(self.nfc_cs.take().unwrap(), Level::High, OutputConfig::default());
+            Output::new(self.nfc_cs.take().unwrap(), Level::Low, OutputConfig::default());
 
-        let (board, pmu) = TwatchUltraBoard::init(i2c, pmu_irq, lora_cs, nfc_cs)
+        // One-shot SX1262 cold-sleep pins. SCK/MOSI are reborrowed -
+        // make_store still builds the SD SPI from the same pins
+        // later; RST/BUSY stay in the bringup struct for a future
+        // LoRa effort.
+        let lora = LoraSleepPins {
+            rst: Output::new(
+                self.lora_rst.as_mut().unwrap().reborrow(),
+                Level::High,
+                OutputConfig::default(),
+            ),
+            busy: Input::new(
+                self.lora_busy.as_mut().unwrap().reborrow(),
+                InputConfig::default().with_pull(Pull::None),
+            ),
+            sck: Output::new(
+                self.sd_sck.as_mut().unwrap().reborrow(),
+                Level::Low,
+                OutputConfig::default(),
+            ),
+            mosi: Output::new(
+                self.sd_mosi.as_mut().unwrap().reborrow(),
+                Level::Low,
+                OutputConfig::default(),
+            ),
+        };
+
+        let (board, pmu) = TwatchUltraBoard::init(i2c, pmu_irq, lora_cs, nfc_cs, lora)
             .expect("PMU init failed - halting");
 
         // Card detect (XL9555 P12, active low). Read once at boot;
@@ -560,6 +593,8 @@ async fn main(spawner: embassy_executor::Spawner) {
         pmu_irq: Some(peripherals.GPIO7),
         lora_cs: Some(peripherals.GPIO36),
         nfc_cs: Some(peripherals.GPIO4),
+        lora_rst: Some(peripherals.GPIO47),
+        lora_busy: Some(peripherals.GPIO48),
         spi2: Some(peripherals.SPI2),
         lcd_sclk: Some(peripherals.GPIO40),
         lcd_sio0: Some(peripherals.GPIO38),

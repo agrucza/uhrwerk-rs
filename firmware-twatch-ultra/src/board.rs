@@ -93,11 +93,11 @@ pub const RTC_INT: u8 = 1;
 //   LDO1/VRTC  GPS backup          3.3V   (can't be turned off)
 //   ALDO1      SD card             3.3V
 //   ALDO2      Display (VCI)       3.3V   (ANDed with XL9555 VCI_EN)
-//   ALDO3      LoRa                3.3V
+//   ALDO3      LoRa                3.3V   (chip parked in cold sleep at boot)
 //   ALDO4      Sensor (BHI260AP)   1.8V
-//   BLDO1      GPS                 3.3V
+//   BLDO1      GPS                 3.3V   (off at boot - u-blox hw backup mode)
 //   BLDO2      Speaker (MAX98357A) 3.3V
-//   DLDO1      NFC                 3.3V
+//   DLDO1      NFC                 3.3V   (never enabled - chip undriven)
 //   VBACKUP    RTC button battery  3.3V
 //   DC2-DC5, CPUSLDO: unused
 // =============================================================================
@@ -125,8 +125,8 @@ pub const SPI_SCK:  u8 = 35;
 pub const SD_CS:    u8 = 21;    // SD detect is XL9555 P12, not a GPIO
 
 pub const LORA_CS:   u8 = 36;   // SX1262 (this unit's radio variant)
-pub const LORA_RST:  u8 = 47;
-pub const LORA_BUSY: u8 = 48;
+pub const LORA_RST:  u8 = 47;   // pulsed once at boot (cold-sleep park)
+pub const LORA_BUSY: u8 = 48;   // high while the chip sleeps (20k pull)
 pub const LORA_IRQ:  u8 = 14;
 
 pub const NFC_CS:  u8 = 4;      // ST25R3916
@@ -170,7 +170,11 @@ pub const EXP_DISP_EN: u8 = 7;
 pub const EXP_TOUCH_RST: u8 = 8;
 /// SD card detect - P12, net SD_DET. Input; LOW = card inserted.
 pub const EXP_SD_DET: u8 = 10;
-/// LoRa antenna RF switch select - P13, net LORA_SEL.
+/// LoRa antenna RF switch select - P13, net LORA_SEL. Routing, not
+/// an enable: HIGH = built-in LoRa antenna (vendor default), LOW =
+/// RF to the USB-connector path. Deliberately left unconfigured:
+/// the XL9555's internal ~100 k pull-up parks it HIGH, i.e. the
+/// default route. The LoRa effort drives it explicitly.
 pub const EXP_LORA_RF_SW: u8 = 11;
 
 // =============================================================================

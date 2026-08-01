@@ -18,6 +18,12 @@
 //! the vendor firmware also sets it on every boot. Voltages per the
 //! rail table in `board.rs` - everything 3.3 V except ALDO4 at 1.8 V
 //! (the BHI260AP is a 1.8 V part; see board.rs).
+//!
+//! The three undriven radios are parked at boot so they stop costing
+//! battery: GPS main rail (BLDO1) off = u-blox hardware backup mode,
+//! SX1262 commanded into cold sleep (see [`sx1262_cold_sleep`]), NFC
+//! rail (DLDO1) never enabled. Each future radio effort undoes only
+//! its own parking.
 
 use drivers::pmu::{Config as PmuConfig, InterruptConfig, InterruptSource, Pmu};
 use drivers::xl9555::{Config as ExpanderConfig, Xl9555};
@@ -32,11 +38,89 @@ pub struct TwatchUltraBoard {
     /// input so `arm_wake_sources` can make a PWR-button press wake
     /// the watch from light sleep.
     _pmu_irq: Input<'static>,
-    /// Chip selects of the not-yet-driven shared-SPI peripherals,
-    /// held high (deselected) so SD-card traffic on the shared bus
-    /// can't address them.
+    /// SX1262 chip select, held HIGH: deselected on the shared SPI
+    /// bus AND keeping the chip in the cold sleep commanded at init
+    /// (a falling edge on this line is the chip's wake-up).
     _lora_cs: Output<'static>,
+    /// ST25R3916 chip select, held LOW: its rail (DLDO1) is off, and
+    /// a driven-high line would back-feed the unpowered chip through
+    /// its input-protection diodes. The future NFC effort must raise
+    /// CS before enabling DLDO1.
     _nfc_cs: Output<'static>,
+}
+
+/// Bit-bang pins for the one-shot SX1262 sleep command in
+/// [`TwatchUltraBoard::init`]. Short-lived: the bin reborrows the
+/// shared-bus SCK/MOSI so the SD SPI can still be built from the
+/// same pins later; RST/BUSY stay in the bringup struct for a
+/// future LoRa effort.
+pub struct LoraSleepPins<'a> {
+    pub rst: Output<'a>,
+    pub busy: Input<'a>,
+    pub sck: Output<'a>,
+    pub mosi: Output<'a>,
+}
+
+/// Put the SX1262 into cold sleep, its deepest state (~160 nA,
+/// datasheet Table 3-5). No driver exists yet, so losing the chip
+/// config is free power. Sequence per datasheet sections 8.1 /
+/// 8.3.1 / 13.1.1: NRESET low >= 100 us (factory reset +
+/// auto-calibration, ends in STDBY_RC), wait BUSY low, then
+/// SetSleep (0x84) with sleepConfig 0x00 (cold start, RTC off) on a
+/// mode-0 SPI frame - bit-banged, since the SPI peripheral isn't up
+/// this early. The chip powers down ~500 us after the CS rising
+/// edge and wakes only on a CS falling edge, so the board's
+/// held-high CS both deselects it and keeps it asleep; its
+/// MOSI/SCK pads go Hi-Z in sleep, so SD traffic on the shared bus
+/// can't disturb it. BUSY reads high in sleep (internal 20 k
+/// pull-up) - expected, not an error.
+fn sx1262_cold_sleep(cs: &mut Output<'_>, pins: &mut LoraSleepPins<'_>) {
+    let delay = esp_hal::delay::Delay::new();
+
+    // Factory reset into a known state; the pin wants >= 100 us low.
+    pins.rst.set_low();
+    delay.delay_micros(200);
+    pins.rst.set_high();
+
+    // Boot + calibration end with BUSY dropping (sleep-to-standby
+    // is spec'd at 3.5 ms; give the post-reset boot a 100 ms budget).
+    let mut ready = false;
+    for _ in 0..1000 {
+        if pins.busy.is_low() {
+            ready = true;
+            break;
+        }
+        delay.delay_micros(100);
+    }
+    if !ready {
+        log::warn!("LoRa: SX1262 BUSY stuck high after reset - sleep skipped");
+        return;
+    }
+
+    // SetSleep(cold): mode-0 frame, MSB first, ~250 kHz - far inside
+    // the chip's 16 MHz limit, and SPI mode 0 has no minimum rate.
+    cs.set_low();
+    delay.delay_micros(1);
+    for byte in [0x84u8, 0x00] {
+        for bit in (0..8).rev() {
+            if (byte >> bit) & 1 == 1 {
+                pins.mosi.set_high();
+            } else {
+                pins.mosi.set_low();
+            }
+            delay.delay_micros(1);
+            pins.sck.set_high();
+            delay.delay_micros(1);
+            pins.sck.set_low();
+        }
+    }
+    delay.delay_micros(1);
+    cs.set_high();
+
+    // The chip is unresponsive for ~500 us after the CS edge while
+    // its blocks switch off; don't let anything touch the bus yet.
+    delay.delay_micros(600);
+    log::info!("LoRa: SX1262 in cold sleep");
 }
 
 impl TwatchUltraBoard {
@@ -47,8 +131,9 @@ impl TwatchUltraBoard {
     pub fn init(
         i2c: &mut impl I2c,
         pmu_irq: Input<'static>,
-        lora_cs: Output<'static>,
+        mut lora_cs: Output<'static>,
         nfc_cs: Output<'static>,
+        mut lora: LoraSleepPins<'_>,
     ) -> Result<(Self, Pmu), ()> {
         let pmu = Pmu::new(PmuConfig::default());
         log::info!("PMU: initializing AXP2101...");
@@ -75,6 +160,17 @@ impl TwatchUltraBoard {
         pmu.set_bldo1_voltage(i2c, 3300).map_err(|_| ())?; // GPS
         pmu.set_bldo2_voltage(i2c, 3300).map_err(|_| ())?; // Speaker amp
         pmu.enable_all_rails(i2c).map_err(|_| ())?;
+        // GPS main rail straight back off (enable_all_rails is a
+        // whole-register write, so the blip is milliseconds): the
+        // MIA-M10Q's V_BCKP hangs on VRTC - the rail that can't be
+        // switched off - so a dark BLDO1 is u-blox hardware backup
+        // mode: RTC time and ephemeris retained on backup current,
+        // acquisition engine (~25-30 mA when left searching) off.
+        // Matches the vendor firmware's own GPS power-off. The
+        // voltage stays programmed above so the future GPS effort
+        // only re-enables (its UART runs 38400 baud).
+        pmu.set_bldo1_enable(i2c, false).map_err(|_| ())?;
+        log::info!("GPS: rail off (hardware backup mode)");
         pmu.enable_all_adc(i2c).map_err(|_| ())?;
         pmu.enable_battery_monitor(i2c).map_err(|_| ())?;
 
@@ -126,6 +222,10 @@ impl TwatchUltraBoard {
             expander.set_output(i2c, pin, true).map_err(|_| ())?;
         }
         log::info!("PMU: rails + expander gates up");
+
+        // Park the LoRa radio last: its rail (ALDO3) is guaranteed up
+        // by now, and the sequence needs no I2C.
+        sx1262_cold_sleep(&mut lora_cs, &mut lora);
 
         Ok((
             Self {
