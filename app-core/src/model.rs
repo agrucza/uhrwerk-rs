@@ -19,7 +19,7 @@ use embassy_time::{Duration, Instant};
 use heapless::Vec;
 
 use crate::buzz::{BuzzAction, BuzzPattern};
-use crate::commands::{AudioCommand, ImuCommand, RtcCommand, SleepState};
+use crate::commands::{AudioCommand, GpsCommand, ImuCommand, RtcCommand, SleepState};
 use crate::config::Config;
 use crate::data::TouchData;
 use crate::events::{
@@ -81,6 +81,12 @@ pub enum Effect {
     /// gates `PlayAlarm` on `config.sound_enabled` (mirroring how
     /// `MotorOn` gates on `haptics_enabled`); `Stop` always forwards.
     AudioCommand(AudioCommand),
+
+    /// Forward a command to the board's GPS task via `GPS_COMMAND`.
+    /// Boards without a GPS task have no consumer; the UI entry
+    /// point is capability-gated, so this only fires where hardware
+    /// exists.
+    GpsCommand(GpsCommand),
 
     /// Immediate shutdown request (Action::Shutdown from a screen).
     Shutdown,
@@ -559,6 +565,17 @@ impl Model {
                 self.cached_data.storage = *usage;
                 self.needs_redraw = true;
             }
+            SystemEvent::GpsSyncUpdated { state } => {
+                // Cache + repaint only on change: the task re-emits
+                // Syncing on a fixed cadence even when nothing moved,
+                // and a dark sleeping display doesn't need frames at
+                // all (needs_redraw is harmless then - render is
+                // display-state gated).
+                if self.cached_data.gps_sync != *state {
+                    self.cached_data.gps_sync = *state;
+                    self.needs_redraw = true;
+                }
+            }
             SystemEvent::TouchPressed { x, y } => {
                 self.cached_data.touch = TouchData { x: Some(*x), y: Some(*y) };
             }
@@ -831,6 +848,25 @@ impl Model {
                 // auto-lock.
                 self.config.display.dim_timeout_s =
                     ((secs as u64 * 2 / 3)).max(5);
+                self.cached_data.config = self.config;
+                self.config_dirty = true;
+                self.needs_redraw = true;
+            }
+            Action::GpsSync => {
+                let _ = out.push(Effect::GpsCommand(GpsCommand::SyncOnce {
+                    tz_offset_minutes: self.config.tz_offset_minutes,
+                }));
+                // Optimistic transition so the SYNC button disables
+                // on the very tap; the task's first real Syncing
+                // event overwrites the placeholder counts.
+                self.cached_data.gps_sync =
+                    crate::data::GpsSyncState::Syncing { sats: 0, fix_ok: false };
+                self.needs_redraw = true;
+            }
+            Action::AdjustTimezone { delta_min } => {
+                self.config.tz_offset_minutes = (self.config.tz_offset_minutes
+                    + delta_min)
+                    .clamp(Config::TZ_OFFSET_MIN, Config::TZ_OFFSET_MAX);
                 self.cached_data.config = self.config;
                 self.config_dirty = true;
                 self.needs_redraw = true;

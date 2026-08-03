@@ -245,6 +245,20 @@ pub enum Action {
     /// The Model closes any active overlay before sleeping so the
     /// next wake lands on the underlying app, not the dismissed QA.
     Sleep,
+
+    /// Start a GPS time-sync session. The Model forwards this as
+    /// `Effect::GpsCommand(SyncOnce)` carrying the configured
+    /// timezone offset; progress comes back as
+    /// `SystemEvent::GpsSyncUpdated`. Emitted by the settings GPS
+    /// view's SYNC button (which the view disables while a session
+    /// is already running).
+    GpsSync,
+
+    /// Shift `config.tz_offset_minutes` by `delta_min` (the settings
+    /// GPS view's +/- 15-minute stepper). The Model clamps to the
+    /// real-world UTC offset range and marks config dirty; the next
+    /// `TouchReleased` persists it.
+    AdjustTimezone { delta_min: i16 },
 }
 
 // -- Persistent app state ----------------------------------------------------
@@ -768,6 +782,17 @@ pub struct SystemData {
     /// far higher rate relative to `uptime_secs` means the CPU is
     /// instant-waking instead of gating off.
     pub sleep_cycles: u32,
+
+    /// Which optional hardware this board carries. Set once by the
+    /// manager from the bin's `Bringup::capabilities` before the
+    /// model is constructed; never changes at runtime. Screens gate
+    /// board-specific rows/views on it.
+    pub capabilities: crate::data::Capabilities,
+
+    /// Progress of the latest GPS time-sync session, from
+    /// `SystemEvent::GpsSyncUpdated`. Only ever leaves `Idle` on
+    /// boards whose capabilities include GPS.
+    pub gps_sync: crate::data::GpsSyncState,
 }
 
 // -- Screen trait -------------------------------------------------------------

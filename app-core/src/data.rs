@@ -12,6 +12,43 @@ use drivers::pmu::{ChargeVoltage, ChargerPhase, CurrentDirection, InputCurrentLi
 use drivers::rtc::DateTime as RtcDateTime;
 
 // ============================================================================
+// Capabilities - which optional hardware this board carries.
+// ============================================================================
+
+/// Optional hardware present on the running board, provided by the
+/// bin at boot through the `Bringup` seam and cached in `SystemData`.
+/// The shared UI gates board-specific rows/views on these flags -
+/// screens never reference board names, only capabilities.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    /// A GNSS receiver with a sync task listening on the GPS command
+    /// channel (currently the T-Watch Ultra's MIA-M10Q).
+    pub gps: bool,
+}
+
+// ============================================================================
+// GpsSyncState - progress of a GPS time-sync session.
+// ============================================================================
+
+/// State of the most recent GPS sync session, cached from
+/// `SystemEvent::GpsSyncUpdated` for the settings GPS view.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GpsSyncState {
+    /// No session since boot.
+    #[default]
+    Idle,
+    /// Session running; live satellite count and whether a position
+    /// fix is currently held.
+    Syncing { sats: u8, fix_ok: bool },
+    /// Session finished having set the RTC; payload is the local
+    /// time that was written (the view renders "SYNCED HH:MM").
+    Synced { hour: u8, minute: u8 },
+    /// Session ended without a trustworthy time (budget exhausted,
+    /// no signal, or the receiver failed to come up).
+    NoSignal,
+}
+
+// ============================================================================
 // TimeData - calendar time of day, consumed by clock-style screens.
 // ============================================================================
 

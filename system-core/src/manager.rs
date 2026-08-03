@@ -128,6 +128,9 @@ pub struct SystemParts<B: Board> {
     pub rtc_state: RtcTaskState<'static>,
     pub imu: ImuTaskState<'static>,
     pub power: PowerTaskState,
+    /// The board's optional-hardware flags (from
+    /// [`Bringup::capabilities`]), cached into `SystemData`.
+    pub capabilities: app_core::data::Capabilities,
 }
 
 /// The board-agnostic system brain. Generic over the [`Board`] seam;
@@ -262,6 +265,7 @@ impl<B: Board> SystemManager<'static, B> {
             rtc_state,
             imu: imu_state,
             power: power_state,
+            capabilities,
         } = parts;
 
         // Seed the shared wall clock so any SD writes before the
@@ -309,6 +313,7 @@ impl<B: Board> SystemManager<'static, B> {
         cached_data.power = initial_power;
         cached_data.alarms = loaded_alarms;
         cached_data.storage = initial_usage;
+        cached_data.capabilities = capabilities;
         crate::event_log::load_battery_history(
             &mut store, &mut cached_data.battery_history,
         );
@@ -458,6 +463,7 @@ impl<B: Board> SystemManager<'static, B> {
                         log::warn!("audio: command queue full, dropped {:?}", cmd);
                     }
                 }
+                Effect::GpsCommand(cmd) => crate::bus::GPS_COMMAND.signal(cmd),
                 Effect::Shutdown => {
                     log::info!("System: shutdown requested");
                     self.board.shutdown();
@@ -771,6 +777,27 @@ impl<B: Board> SystemManager<'static, B> {
                 if !self.model.sleeping() {
                     return;
                 }
+            }
+            // An active hardware session holds a wake lock (a GPS
+            // sync today; audio is the planned second holder): its
+            // peripheral needs continuously running clocks, and
+            // hardware light sleep gates the UART/I2S clocks and
+            // silently drops their data. Idle here instead - the
+            // display stays dark, embassy time keeps running, the
+            // session's task and events flow - and real light sleep
+            // resumes on the first pass after the hold is released.
+            // Deliberately BEFORE enter_light_sleep so none of its
+            // wake diagnostics (cycle counts, slept-ms probes,
+            // summary lines) fire for these idle passes.
+            if crate::bus::wake_held() {
+                match select(
+                    EVENTS.receive(),
+                    Timer::after(Duration::from_millis(500)),
+                ).await {
+                    Either::First(event) => self.handle_event(event).await,
+                    Either::Second(_) => {}
+                }
+                return;
             }
             let (wake_cause, slept_ms) = self.enter_light_sleep().await;
             let gpio_wake = wake_cause & Self::WAKE_CAUSE_GPIO != 0;
@@ -1154,6 +1181,14 @@ pub trait Bringup {
         _i2c_bus: &'static crate::bus::SharedI2c,
     ) {
     }
+
+    /// Which optional hardware this board carries. Cached into
+    /// `SystemData` before the model is built; the shared UI gates
+    /// board-specific rows/views on it. Default: none - a board
+    /// declares only what it actually spawns a task for.
+    fn capabilities(&self) -> app_core::data::Capabilities {
+        app_core::data::Capabilities::default()
+    }
 }
 
 /// Shared boot orchestration: build every piece via the board's
@@ -1211,6 +1246,7 @@ pub async fn run<T: Bringup>(
         rtc_state,
         imu,
         power: power_state,
+        capabilities: bringup.capabilities(),
     });
 
     // Each task is spawned exactly once at boot; `.unwrap()` on the

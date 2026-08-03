@@ -151,6 +151,18 @@ pub enum SystemEvent {
         result: SelfTestResult,
     },
 
+    // -- GPS --
+    /// Progress of a GPS time-sync session, emitted by the board's
+    /// GPS task: `Syncing` at session start and on every status
+    /// cadence, then exactly one terminal `Synced` / `NoSignal`.
+    /// The main loop caches it in `cached_data.gps_sync` for the
+    /// settings GPS view. Like `MicLevel`: neither user activity
+    /// nor a wake source - a session running while the display
+    /// sleeps must not turn the screen on.
+    GpsSyncUpdated {
+        state: crate::data::GpsSyncState,
+    },
+
     // -- Flash-backed storage --
     /// Fresh flash-filesystem usage snapshot. Emitted by the
     /// manager once at boot (after the initial load), and after
@@ -329,6 +341,10 @@ pub fn classify_for_log(event: &SystemEvent) -> Option<LoggedEvent> {
         SystemEvent::VbusRemoved              => LoggedEvent { tag: "vbus_out",      detail: None },
         SystemEvent::PowerButtonLong          => LoggedEvent { tag: "shutdown_req",  detail: None },
         SystemEvent::BatteryChanged { percent } => LoggedEvent { tag: "battery",     detail: Some(*percent as u32) },
+        // Only the terminal success is log-worthy; Syncing is cadence
+        // chatter and NoSignal is the common indoor outcome.
+        SystemEvent::GpsSyncUpdated { state: crate::data::GpsSyncState::Synced { .. } } =>
+            LoggedEvent { tag: "gps_sync", detail: None },
         _ => return None,
     })
 }

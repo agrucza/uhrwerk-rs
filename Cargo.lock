@@ -1076,6 +1076,7 @@ dependencies = [
 name = "firmware-twatch-ultra"
 version = "0.1.0"
 dependencies = [
+ "app-core",
  "drivers",
  "embassy-executor",
  "embassy-futures",

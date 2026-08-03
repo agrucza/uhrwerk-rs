@@ -69,6 +69,19 @@ pub enum AudioCommand {
     StopLoopback,
 }
 
+/// Main-loop -> GPS task commands. Boards without a GPS task have
+/// no consumer on the channel; the UI entry points are capability-
+/// gated, so commands only flow where hardware exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpsCommand {
+    /// Run one rail-gated sync session: power the receiver, hunt for
+    /// a trustworthy time (and fix) within the session budget, set
+    /// the RTC, power back down. Progress comes back as
+    /// `SystemEvent::GpsSyncUpdated`. Carries the configured
+    /// local-time offset so the task stays config-blind.
+    SyncOnce { tz_offset_minutes: i16 },
+}
+
 /// Main-loop -> IMU task commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImuCommand {

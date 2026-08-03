@@ -33,7 +33,7 @@ use static_cell::StaticCell;
 // so `Effect` can carry them. The `Signal` and `Watch` statics
 // below still live here - they're hardware-coupled (task wakers,
 // interrupt-safe mutexes).
-pub use app_core::commands::{AudioCommand, ImuCommand, RtcCommand, SleepState};
+pub use app_core::commands::{AudioCommand, GpsCommand, ImuCommand, RtcCommand, SleepState};
 
 /// Size of the system event channel. Should be large enough to
 /// buffer a burst of events without blocking producers but small
@@ -108,6 +108,51 @@ pub static RTC_COMMAND: Signal<CriticalSectionRawMutex, RtcCommand> = Signal::ne
 /// Single-consumer: only the audio task should call `receive()` on
 /// this.
 pub static AUDIO_COMMAND: Channel<CriticalSectionRawMutex, AudioCommand, 4> = Channel::new();
+
+/// Main-to-GPS command signal.
+///
+/// The main loop publishes a [`GpsCommand`] here
+/// (`Effect::GpsCommand`). On boards with a GNSS receiver the
+/// bin-spawned GPS task waits on it; on boards without one nothing
+/// listens and a signal (unreachable anyway - the UI entry point is
+/// capability-gated) is simply overwritten.
+///
+/// Single-consumer: only the GPS task should call `wait()` on this.
+pub static GPS_COMMAND: Signal<CriticalSectionRawMutex, GpsCommand> = Signal::new();
+
+/// Count of live wake holds - sessions that need the executor and
+/// peripheral clocks continuously up (a GPS sync session's UART
+/// today; audio playback/capture is the planned second holder).
+/// While nonzero, the manager idles across the heartbeat instead of
+/// entering hardware light sleep, because light sleep gates the
+/// UART/I2S clocks and silently drops their data. UI sleep (display
+/// off, relaxed polling) is unaffected.
+///
+/// Hold through [`WakeHold`], not by touching this directly.
+pub static WAKE_HOLDS: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+/// RAII wake hold: constructing registers the hold, dropping (any
+/// path, including early returns) releases it.
+pub struct WakeHold(());
+
+impl WakeHold {
+    pub fn new() -> Self {
+        WAKE_HOLDS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        Self(())
+    }
+}
+
+impl Drop for WakeHold {
+    fn drop(&mut self) {
+        WAKE_HOLDS.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// True while any [`WakeHold`] is alive.
+pub fn wake_held() -> bool {
+    WAKE_HOLDS.load(core::sync::atomic::Ordering::SeqCst) > 0
+}
 
 /// Type alias for the shared I2C bus, protected by an async mutex.
 ///

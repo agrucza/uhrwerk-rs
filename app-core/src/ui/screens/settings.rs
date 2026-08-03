@@ -26,6 +26,7 @@ use embedded_graphics::{
 use heapless::String;
 use core::fmt::Write;
 
+use crate::data::GpsSyncState;
 use crate::ui::{fonts, glyphs, layout, theme};
 use crate::ui::types::{
     Action, RenderCtx, Screen, SelfTestId, SelfTestResult, SystemData, SystemEvent,
@@ -161,6 +162,10 @@ enum SettingsView {
     Clock,
     TimeEntry,
     DateEntry,
+    /// GPS time sync: status, the SYNC trigger, and the timezone
+    /// stepper. Only reachable on boards with the gps capability
+    /// (the index row is gated).
+    Gps,
     /// Battery status + history graph (samples from the flash event log).
     Battery,
     /// Storage sub-index. Routes to the storage leaves below.
@@ -208,6 +213,7 @@ enum RowIcon {
     Wifi,
     Bluetooth,
     Zigbee,
+    Gps,
 }
 
 fn draw_row_icon<D: DrawTarget<Color = Rgb565>>(
@@ -231,6 +237,7 @@ fn draw_row_icon<D: DrawTarget<Color = Rgb565>>(
         RowIcon::Wifi      => glyphs::signal_small(display, cx, cy, r, color),
         RowIcon::Bluetooth => glyphs::bluetooth_small(display, cx, cy, r, color),
         RowIcon::Zigbee    => glyphs::zigbee(display, cx, cy, r, color),
+        RowIcon::Gps       => glyphs::signal_small(display, cx, cy, r, color),
     }
 }
 
@@ -257,12 +264,44 @@ enum RowKind {
 struct IndexRow {
     label: &'static str,
     icon: RowIcon,
+    /// Capability gate: the row renders and hit-tests only when this
+    /// returns true (rows below it shift up). `always` for standard
+    /// rows; capability probes (e.g. [`has_gps`]) for rows whose
+    /// hardware only some boards carry.
+    visible: fn(&SystemData) -> bool,
     kind: RowKind,
+}
+
+/// Standard-row visibility: every board has this hardware.
+fn always(_data: &SystemData) -> bool {
+    true
+}
+
+/// GPS rows exist only on boards whose bin declared the capability.
+fn has_gps(data: &SystemData) -> bool {
+    data.capabilities.gps
 }
 
 fn clock_value(data: &SystemData) -> String<20> {
     let mut buf = String::new();
     let _ = write!(buf, "{:02}:{:02}:{:02}", data.time.hour, data.time.minute, data.time.second);
+    buf
+}
+
+/// Index-row inline value for GPS: the live session state while one
+/// runs, otherwise the configured timezone.
+fn gps_value(data: &SystemData) -> String<20> {
+    let mut buf = String::new();
+    match data.gps_sync {
+        crate::data::GpsSyncState::Syncing { .. } => {
+            let _ = buf.push_str("SYNCING");
+        }
+        _ => {
+            let m = data.config.tz_offset_minutes;
+            let a = m.unsigned_abs();
+            let _ = write!(buf, "UTC{}{}:{:02}", if m < 0 { '-' } else { '+' }, a / 60, a % 60);
+        }
+    }
     buf
 }
 
@@ -341,21 +380,25 @@ const STORAGE_INDEX_ROWS: &[IndexRow] = &[
     IndexRow {
         label: "FLASH",
         icon: RowIcon::Flash,
+        visible: always,
         kind: RowKind::Navigate { target: SettingsView::StorageFlash, value_fn: storage_flash_value },
     },
     IndexRow {
         label: "SD CARD",
         icon: RowIcon::SdCard,
+        visible: always,
         kind: RowKind::Navigate { target: SettingsView::StorageSd, value_fn: storage_sd_value },
     },
     IndexRow {
         label: "RESTORE FROM SD",
         icon: RowIcon::Restore,
+        visible: always,
         kind: RowKind::Navigate { target: SettingsView::StorageRestoreFlash, value_fn: storage_restore_value },
     },
     IndexRow {
         label: "FACTORY RESET",
         icon: RowIcon::Skull,
+        visible: always,
         kind: RowKind::Navigate { target: SettingsView::StorageFactoryReset, value_fn: storage_reset_value },
     },
 ];
@@ -369,62 +412,80 @@ const INDEX_ROWS: &[IndexRow] = &[
     IndexRow {
         label: "DISPLAY",
         icon: RowIcon::Display,
+        visible: always,
         kind: RowKind::Navigate { target: SettingsView::Display, value_fn: empty_value },
     },
     IndexRow {
         label: "SOUNDS",
         icon: RowIcon::Sounds,
+        visible: always,
         kind: RowKind::Toggle { is_on: sound_is_on, action: Action::ToggleSound },
     },
     IndexRow {
         label: "VIBRATE",
         icon: RowIcon::Vibrate,
+        visible: always,
         kind: RowKind::Toggle { is_on: haptics_is_on, action: Action::ToggleHaptics },
     },
     IndexRow {
         label: "DND",
         icon: RowIcon::Dnd,
+        visible: always,
         kind: RowKind::Toggle { is_on: dnd_is_on, action: Action::ToggleDnd },
     },
     IndexRow {
         label: "WIFI",
         icon: RowIcon::Wifi,
+        visible: always,
         kind: RowKind::Navigate { target: SettingsView::Wifi, value_fn: empty_value },
     },
     IndexRow {
         label: "BLUETOOTH",
         icon: RowIcon::Bluetooth,
+        visible: always,
         kind: RowKind::Navigate { target: SettingsView::Bluetooth, value_fn: empty_value },
     },
     IndexRow {
         label: "ZIGBEE",
         icon: RowIcon::Zigbee,
+        visible: always,
         kind: RowKind::Navigate { target: SettingsView::Zigbee, value_fn: empty_value },
     },
     // Diagnostic / drill rows.
     IndexRow {
         label: "CLOCK",
         icon: RowIcon::Clock,
+        visible: always,
         kind: RowKind::Navigate { target: SettingsView::Clock, value_fn: clock_value },
+    },
+    IndexRow {
+        label: "GPS",
+        icon: RowIcon::Gps,
+        visible: has_gps,
+        kind: RowKind::Navigate { target: SettingsView::Gps, value_fn: gps_value },
     },
     IndexRow {
         label: "BATTERY",
         icon: RowIcon::Battery,
+        visible: always,
         kind: RowKind::Navigate { target: SettingsView::Battery, value_fn: battery_value },
     },
     IndexRow {
         label: "MOTION",
         icon: RowIcon::Imu,
+        visible: always,
         kind: RowKind::Navigate { target: SettingsView::Imu, value_fn: imu_value },
     },
     IndexRow {
         label: "MIC TEST",
         icon: RowIcon::Mic,
+        visible: always,
         kind: RowKind::Navigate { target: SettingsView::MicTest, value_fn: empty_value },
     },
     IndexRow {
         label: "STORAGE",
         icon: RowIcon::Storage,
+        visible: always,
         kind: RowKind::Navigate { target: SettingsView::Storage, value_fn: storage_value },
     },
     // Destructive action - last, danger-tinted icon. Re-uses the
@@ -433,6 +494,7 @@ const INDEX_ROWS: &[IndexRow] = &[
     IndexRow {
         label: "PURGE+RESET",
         icon: RowIcon::Skull,
+        visible: always,
         kind: RowKind::Navigate { target: SettingsView::StorageFactoryReset, value_fn: empty_value },
     },
 ];
@@ -557,6 +619,7 @@ impl Screen for SettingsScreen {
             SettingsView::Imu => self.render_imu(display, data, ctx),
             SettingsView::MicTest => self.render_mic_test(display, data, ctx),
             SettingsView::Clock => self.render_clock(display, data, ctx),
+            SettingsView::Gps => self.render_gps(display, data, ctx),
             SettingsView::TimeEntry => self.render_time_entry(display, data, ctx),
             SettingsView::DateEntry => self.render_date_entry(display, data, ctx),
             SettingsView::Battery => self.render_battery(display, data, ctx),
@@ -582,6 +645,7 @@ impl Screen for SettingsScreen {
             SettingsView::Imu => self.imu_event(event, data),
             SettingsView::MicTest => self.mic_test_event(event, data),
             SettingsView::Clock => self.clock_event(event, data),
+            SettingsView::Gps => self.gps_event(event, data),
             SettingsView::TimeEntry => self.time_entry_event(event, data),
             SettingsView::DateEntry => self.date_entry_event(event, data),
             SettingsView::Battery => self.battery_event(event, data),
@@ -607,19 +671,19 @@ impl SettingsScreen {
         draw_header(display, data, "SETTINGS", theme::SIGNAL, ctx);
         render_scrolled(
             display, self.index_scroll.offset(),
-            index_viewport_rect(), index_content_h(), theme::SIGNAL, ctx,
+            index_viewport_rect(), index_content_h(data), theme::SIGNAL, ctx,
             |clipped, scroll| render_rows(clipped, data, INDEX_ROWS, scroll, ctx),
         );
     }
 
-    fn index_event(&mut self, event: &SystemEvent, _data: &mut SystemData) -> Action {
+    fn index_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
             SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
                 Action::Back
             }
             SystemEvent::Tap { x, y } => {
                 if let Some(action) = row_hit(
-                    *x, *y, INDEX_ROWS,
+                    *x, *y, INDEX_ROWS, data,
                     self.index_scroll.offset(),
                     &index_viewport_rect(),
                     &mut self.view,
@@ -639,7 +703,7 @@ impl SettingsScreen {
             SystemEvent::TouchPressed { .. } | SystemEvent::TouchReleased => {
                 let viewport_h = index_viewport_rect().size.height as i32;
                 if handle_scroll_drag(
-                    &mut self.index_scroll, event, viewport_h, index_content_h(),
+                    &mut self.index_scroll, event, viewport_h, index_content_h(data),
                 ) {
                     return Action::Redraw;
                 }
@@ -661,9 +725,10 @@ fn index_viewport_rect() -> Rectangle {
     )
 }
 
-/// Total content height of the index row list.
-fn index_content_h() -> i32 {
-    INDEX_ROWS.len() as i32 * ROW_H
+/// Total content height of the index row list - visible rows only,
+/// so scroll extents track capability gating.
+fn index_content_h(data: &SystemData) -> i32 {
+    INDEX_ROWS.iter().filter(|r| (r.visible)(data)).count() as i32 * ROW_H
 }
 
 // -- Shared row rendering / hit-testing for index + storage sub-index --------
@@ -675,8 +740,15 @@ fn index_content_h() -> i32 {
 fn render_rows<D: DrawTarget<Color = Rgb565>>(
     display: &mut D, data: &SystemData, rows: &[IndexRow], scroll: i32, ctx: &RenderCtx,
 ) {
-    for (i, r) in rows.iter().enumerate() {
-        let rect = row_rect(i, scroll);
+    let mut pos = 0;
+    for r in rows.iter() {
+        // Capability-gated rows vanish entirely; rows below shift up
+        // (`pos` counts only visible rows).
+        if !(r.visible)(data) {
+            continue;
+        }
+        let rect = row_rect(pos, scroll);
+        pos += 1;
         // Skip rows whose y-range falls entirely outside this tile.
         // This is where the tile-aware optimization lives: without it,
         // a 10-row index walks all 10 rows for each of the 11 tiles
@@ -725,14 +797,22 @@ fn render_rows<D: DrawTarget<Color = Rgb565>>(
 /// `view` via the `&mut SettingsView` and return `Action::Redraw`;
 /// toggle rows return their own action variant.
 fn row_hit(
-    x: u16, y: u16, rows: &[IndexRow],
+    x: u16, y: u16, rows: &[IndexRow], data: &SystemData,
     scroll: i32, viewport: &Rectangle,
     view: &mut SettingsView,
 ) -> Option<Action> {
     let pt = Point::new(x as i32, y as i32);
     if !viewport.contains(pt) { return None; }
-    for (i, r) in rows.iter().enumerate() {
-        if !row_rect(i, scroll).contains(pt) { continue; }
+    let mut pos = 0;
+    for r in rows.iter() {
+        // Mirror render_rows exactly: same visible-position
+        // indexing, or draw and hit-test drift apart.
+        if !(r.visible)(data) {
+            continue;
+        }
+        let rect = row_rect(pos, scroll);
+        pos += 1;
+        if !rect.contains(pt) { continue; }
         return Some(match r.kind {
             RowKind::Navigate { target, .. } => {
                 *view = target;
@@ -1428,7 +1508,7 @@ impl SettingsScreen {
         render_rows(display, data, STORAGE_INDEX_ROWS, 0, ctx);
     }
 
-    fn storage_index_event(&mut self, event: &SystemEvent, _data: &mut SystemData) -> Action {
+    fn storage_index_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
             SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
                 self.view = SettingsView::Index;
@@ -1444,7 +1524,7 @@ impl SettingsScreen {
             }
             SystemEvent::Tap { x, y } => {
                 if let Some(action) = row_hit(
-                    *x, *y, STORAGE_INDEX_ROWS,
+                    *x, *y, STORAGE_INDEX_ROWS, data,
                     0, &index_viewport_rect(),
                     &mut self.view,
                 ) {
@@ -2053,6 +2133,139 @@ impl SettingsScreen {
         }
     }
 
+    fn render_gps<D: DrawTarget<Color = Rgb565>>(
+        &self,
+        display: &mut D,
+        data: &SystemData,
+        ctx: &RenderCtx,
+    ) {
+        draw_header(display, data, "GPS", theme::SIGNAL, ctx);
+        let slots = gps_slots();
+
+        // Session status: state line + the field lesson as a hint
+        // (low-e window glazing blocks GNSS outright - sessions need
+        // real sky).
+        chamfered_panel(display, slots.status_panel, NOTCH, theme::STEEL, 1);
+        tag_label(
+            display,
+            slots.status_panel.top_left.x, slots.status_panel.top_left.y,
+            "STATUS", theme::STEEL, NOTCH,
+        );
+        let mut line: String<24> = String::new();
+        match data.gps_sync {
+            GpsSyncState::Idle => { let _ = line.push_str("READY"); }
+            GpsSyncState::Syncing { sats, fix_ok } => {
+                let _ = write!(line, "SYNCING - {} SATS", sats);
+                if fix_ok { let _ = line.push_str(" FIX"); }
+            }
+            GpsSyncState::Synced { hour, minute } => {
+                let _ = write!(line, "SYNCED {:02}:{:02}", hour, minute);
+            }
+            GpsSyncState::NoSignal => { let _ = line.push_str("NO SIGNAL"); }
+        }
+        let value_rect = Rectangle::new(
+            Point::new(
+                slots.status_panel.top_left.x,
+                slots.status_panel.top_left.y + 28,
+            ),
+            Size::new(slots.status_panel.size.width, 32),
+        );
+        fonts::draw_centered_in_rect(
+            display, &fonts::value(), line.as_str(), value_rect, theme::FG,
+        );
+        let hint_rect = Rectangle::new(
+            Point::new(
+                slots.status_panel.top_left.x,
+                slots.status_panel.top_left.y + 64,
+            ),
+            Size::new(slots.status_panel.size.width, 20),
+        );
+        fonts::draw_centered_in_rect(
+            display, &fonts::caption(), "NEEDS CLEAR SKY", hint_rect, theme::FG_MUTED,
+        );
+
+        // SYNC trigger: rendered disabled while a session runs;
+        // gps_event drops the tap too (the same screen owns both
+        // halves of the disabled contract).
+        if matches!(data.gps_sync, GpsSyncState::Syncing { .. }) {
+            chamfered_button(
+                display, slots.sync_btn, "SYNCING...",
+                ButtonVariant::Ghost, theme::FG_MUTED,
+            );
+        } else {
+            chamfered_button(
+                display, slots.sync_btn, "SYNC NOW",
+                ButtonVariant::Primary, theme::SIGNAL,
+            );
+        }
+
+        // Timezone stepper: +/- 15 min covers every real UTC offset
+        // (Newfoundland, Nepal); the value between the steppers.
+        chamfered_panel(display, slots.tz_panel, NOTCH, theme::STEEL, 1);
+        tag_label(
+            display,
+            slots.tz_panel.top_left.x, slots.tz_panel.top_left.y,
+            "TIMEZONE", theme::STEEL, NOTCH,
+        );
+        chamfered_button(
+            display, slots.tz_minus, "-", ButtonVariant::Ghost, theme::STEEL,
+        );
+        chamfered_button(
+            display, slots.tz_plus, "+", ButtonVariant::Ghost, theme::STEEL,
+        );
+        let m = data.config.tz_offset_minutes;
+        let a = m.unsigned_abs();
+        let mut tz: String<12> = String::new();
+        let _ = write!(tz, "UTC{}{}:{:02}", if m < 0 { '-' } else { '+' }, a / 60, a % 60);
+        let between_x = slots.tz_minus.top_left.x + slots.tz_minus.size.width as i32;
+        let tz_rect = Rectangle::new(
+            Point::new(between_x, slots.tz_minus.top_left.y),
+            Size::new(
+                (slots.tz_plus.top_left.x - between_x) as u32,
+                slots.tz_minus.size.height,
+            ),
+        );
+        fonts::draw_centered_in_rect(
+            display, &fonts::value(), tz.as_str(), tz_rect, theme::FG,
+        );
+    }
+
+    fn gps_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
+        match event {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+                self.view = SettingsView::Index;
+                Action::Redraw
+            }
+            SystemEvent::Tap { x, y } => {
+                let slots = gps_slots();
+                if rect_hit(slots.sync_btn, *x, *y) {
+                    // Visually disabled while syncing - the tap must
+                    // die here too, not just look dead.
+                    if matches!(data.gps_sync, GpsSyncState::Syncing { .. }) {
+                        return Action::None;
+                    }
+                    return Action::GpsSync;
+                }
+                if rect_hit(slots.tz_minus, *x, *y) {
+                    return Action::AdjustTimezone { delta_min: -15 };
+                }
+                if rect_hit(slots.tz_plus, *x, *y) {
+                    return Action::AdjustTimezone { delta_min: 15 };
+                }
+                Action::None
+            }
+            SystemEvent::Swipe {
+                dir: crate::events::SwipeDir::Right,
+                region: crate::events::SwipeRegion::Content,
+                ..
+            } => {
+                self.view = SettingsView::Index;
+                Action::Redraw
+            }
+            _ => Action::None,
+        }
+    }
+
     fn stub_event(&mut self, event: &SystemEvent, _data: &mut SystemData) -> Action {
         match event {
             SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
@@ -2216,6 +2429,52 @@ fn mic_test_slots() -> (Rectangle, Rectangle, Rectangle) {
     s.gap(18);
     let (tones, loop_b) = s.pair(36, 12);
     (panel, tones, loop_b)
+}
+
+// -- GPS sub-view layout -----------------------------------------------------
+
+/// All rects the GPS sub-view needs. Render and event handlers both
+/// call [`gps_slots`] and read the same fields, so geometry can
+/// never drift between draw and hit-test.
+struct GpsSlots {
+    /// Outer chamfered panel for the session status section.
+    status_panel: Rectangle,
+    /// The SYNC NOW trigger (disabled while a session runs).
+    sync_btn: Rectangle,
+    /// Outer chamfered panel for the timezone section.
+    tz_panel: Rectangle,
+    /// -15 min stepper inside `tz_panel`.
+    tz_minus: Rectangle,
+    /// +15 min stepper inside `tz_panel`.
+    tz_plus: Rectangle,
+}
+
+fn gps_slots() -> GpsSlots {
+    let mut s = layout::VStack::new(LEAF_TOP_Y);
+    let status_panel = s.slot(96);
+    s.gap(18);
+    let sync_btn = s.slot(44);
+    s.gap(18);
+    let tz_panel = s.slot(84);
+    // The +/- steppers flank the timezone readout inside the panel,
+    // vertically centered below its tag label.
+    let inset: i32 = 14;
+    let btn: i32 = 44;
+    let by = tz_panel.top_left.y
+        + TAG_LABEL_H
+        + (tz_panel.size.height as i32 - TAG_LABEL_H - btn) / 2;
+    let tz_minus = Rectangle::new(
+        Point::new(tz_panel.top_left.x + inset, by),
+        Size::new(btn as u32, btn as u32),
+    );
+    let tz_plus = Rectangle::new(
+        Point::new(
+            tz_panel.top_left.x + tz_panel.size.width as i32 - inset - btn,
+            by,
+        ),
+        Size::new(btn as u32, btn as u32),
+    );
+    GpsSlots { status_panel, sync_btn, tz_panel, tz_minus, tz_plus }
 }
 
 // -- Display sub-view layout ----------------------------------------------

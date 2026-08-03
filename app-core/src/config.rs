@@ -11,6 +11,17 @@
 //! do right now: structuring the values as mutable state instead of
 //! `const`s means a settings screen or serial-command debug knob can
 //! mutate them at runtime and the new values take effect immediately.
+//!
+//! PERSISTENCE REALITY CHECK: the flash blob is postcard - positional,
+//! not self-describing - so the `serde(default)` attributes below do
+//! NOT make added fields backwards-compatible. Adding any field makes
+//! old blobs fail wholesale (`DeserializeUnexpectedEnd`) and the
+//! loader falls back to `Config::default()`: a one-time reset of every
+//! setting per schema change. Accepted for now (few, cheap settings);
+//! a versioned-blob migration scheme is queued for when config grows
+//! data that must survive (the WiFi effort's credentials). The
+//! attributes stay because they cost nothing and become live the day
+//! the format is versioned or self-describing.
 
 /// Display power-management parameters.
 #[derive(Debug, Clone, Copy)]
@@ -81,6 +92,13 @@ pub struct Config {
     /// routing lands when those screens get real backing.
     #[cfg_attr(feature = "serde", serde(default))]
     pub dnd: bool,
+    /// Local-time offset from UTC in minutes, applied to GPS time
+    /// before it is written into the RTC. User-adjustable in 15 min
+    /// steps (odd offsets like +5:45 exist); a fixed offset, so DST
+    /// is a manual twice-a-year nudge. Range clamped by the model to
+    /// -12 h .. +14 h (the real-world UTC offset span).
+    #[cfg_attr(feature = "serde", serde(default = "default_tz_offset"))]
+    pub tz_offset_minutes: i16,
 }
 
 impl Config {
@@ -101,13 +119,30 @@ impl Config {
         haptics_enabled: true,
         sound_enabled: true,
         dnd: false,
+        tz_offset_minutes: 120,
     };
+
+    /// Clamp bounds for `tz_offset_minutes`: UTC-12:00 (Baker
+    /// Island) to UTC+14:00 (Line Islands).
+    pub const TZ_OFFSET_MIN: i16 = -12 * 60;
+    pub const TZ_OFFSET_MAX: i16 = 14 * 60;
 }
 
-/// Serde fallback for [`Config::sound_enabled`] when loading a blob
-/// persisted before the field existed. Audible alerts default on, so
-/// a missing field must deserialize to `true` (a bare `serde(default)`
-/// would give `false` and silently mute upgraded installs).
+/// Serde fallback for [`Config::tz_offset_minutes`]: keep the
+/// compile-time default (CEST) instead of a silent UTC+0. Same
+/// caveat as [`default_true`] - inert until the blob format can
+/// actually skip missing fields.
+#[cfg(feature = "serde")]
+fn default_tz_offset() -> i16 {
+    Config::DEFAULT.tz_offset_minutes
+}
+
+/// Serde fallback for [`Config::sound_enabled`]. NOTE: with the
+/// current postcard blob this never fires on missing fields (see the
+/// module docs - old blobs fail wholesale and reset to defaults);
+/// it exists for a future versioned/self-describing format, where a
+/// bare `serde(default)` would give `false` and silently mute
+/// upgraded installs.
 #[cfg(feature = "serde")]
 fn default_true() -> bool {
     true

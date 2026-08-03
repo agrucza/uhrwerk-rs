@@ -1,13 +1,14 @@
-//! GPS dispatch - MIA-M10Q behind a command channel.
+//! GPS dispatch - MIA-M10Q behind the shared GPS command signal.
 //!
-//! Same shape as haptics: the task owns the hardware (UART1 on
-//! GPS_TX/GPS_RX plus the BLDO1 rail via the shared I2C bus) and
-//! everything else talks to it through [`GPS_COMMAND`]. The receiver
-//! is rail-gated: BLDO1 comes up only for the duration of a sync
-//! session and goes straight back down after - between sessions the
-//! module sits in u-blox hardware backup mode (~28 uA from the
-//! always-on VRTC via V_BCKP), keeping RTC time and ephemeris for
-//! warm starts.
+//! The task owns the hardware (UART1 on GPS_TX/GPS_RX plus the
+//! BLDO1 rail via the shared I2C bus); the UI reaches it through
+//! `Effect::GpsCommand` -> `bus::GPS_COMMAND` (the settings GPS
+//! view, gated on the gps capability this bin declares). The
+//! receiver is rail-gated: BLDO1 comes up only for the duration of
+//! a sync session and goes straight back down after - between
+//! sessions the module sits in u-blox hardware backup mode (~28 uA
+//! from the always-on VRTC via V_BCKP), keeping RTC time and
+//! ephemeris for warm starts.
 //!
 //! A session powers the rail, configures the receiver over UBX
 //! (NMEA chatter off, NAV-PVT once per epoch at 1 Hz, wrist dynamic
@@ -15,51 +16,36 @@
 //! reads NAV-PVT until it has both a trustworthy UTC time and a
 //! usable position fix, or the session budget runs out. The first
 //! trustworthy time is pushed into the PCF85063 through the shared
-//! RTC task (`RtcCommand::SetTime`).
+//! RTC task (`RtcCommand::SetTime`), shifted by the timezone offset
+//! the command carries (a persisted user setting - the task stays
+//! config-blind).
 //!
-//! Caveats, both known and deliberate for bring-up:
-//!  - Timezone: NAV-PVT time is UTC, the watch RTC runs local time.
-//!    There is no timezone setting yet, so [`TZ_OFFSET_MINUTES`] is
-//!    an interim constant - a real setting arrives with the GPS UI
-//!    effort.
-//!  - Keep the watch awake during a session (tap the screen now and
-//!    then): heartbeat light sleep pauses the executor and drops
-//!    UART bytes. Gating sleep on an active session is the same
-//!    policy decision already pending for audio playback at Dim.
+//! The whole session runs under a [`bus::WakeHold`]: the manager
+//! idles across heartbeats instead of entering hardware light sleep
+//! (which gates the UART clock and drops bytes), so a session
+//! survives the display going dark. Progress is published as
+//! `SystemEvent::GpsSyncUpdated` for the settings GPS view.
 
+use app_core::data::GpsSyncState;
+use app_core::events::SystemEvent;
 use drivers::pmu::{Config as PmuConfig, Pmu};
 use drivers::ublox::{self, cfg, frame, nav};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
 use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::peripherals as p;
 use esp_hal::uart::{Config as UartConfig, Uart};
 use esp_hal::Async;
-use system_core::bus::{RtcCommand, SharedI2c, RTC_COMMAND};
-
-/// Interim local-time offset applied to the GPS UTC time before it
-/// is written into the RTC. +120 = CEST. Replaced by a proper
-/// timezone setting in the GPS UI effort.
-const TZ_OFFSET_MINUTES: i32 = 120;
+use system_core::bus::{
+    self, GpsCommand, RtcCommand, SharedI2c, EVENTS, GPS_COMMAND, RTC_COMMAND,
+};
 
 /// How long a sync session may hunt before giving up and powering
 /// the receiver back down. Cold start under open sky needs ~30 s;
 /// indoors it may never fix - this bounds the battery cost.
 const SESSION_BUDGET_SECS: u64 = 120;
 
-/// Cadence of the session's progress log line.
+/// Cadence of the session's progress log line and status event.
 const STATUS_LOG_SECS: u64 = 5;
-
-#[derive(Clone, Copy)]
-pub enum GpsCommand {
-    /// Power the receiver, sync time (and log a fix if one arrives)
-    /// once, power it back down.
-    SyncOnce,
-}
-
-pub static GPS_COMMAND: Channel<CriticalSectionRawMutex, GpsCommand, 2> =
-    Channel::new();
 
 #[embassy_executor::task]
 pub async fn gps_task(
@@ -69,9 +55,23 @@ pub async fn gps_task(
     mut rx: p::GPIO44<'static>,
 ) {
     loop {
-        let GpsCommand::SyncOnce = GPS_COMMAND.receive().await;
-        run_sync_session(i2c_bus, uart.reborrow(), tx.reborrow(), rx.reborrow()).await;
+        let GpsCommand::SyncOnce { tz_offset_minutes } = GPS_COMMAND.wait().await;
+        run_sync_session(
+            i2c_bus,
+            uart.reborrow(),
+            tx.reborrow(),
+            rx.reborrow(),
+            tz_offset_minutes,
+        )
+        .await;
     }
+}
+
+/// Publish session progress for the settings GPS view. Best-effort:
+/// a full event channel drops the update (the next cadence tick
+/// re-publishes fresher state anyway).
+fn publish(state: GpsSyncState) {
+    let _ = EVENTS.try_send(SystemEvent::GpsSyncUpdated { state });
 }
 
 /// Switch the GPS main rail. The PMU driver handle is stateless -
@@ -94,8 +94,15 @@ async fn run_sync_session(
     uart: p::UART1<'_>,
     tx: p::GPIO43<'_>,
     rx: p::GPIO44<'_>,
+    tz_offset_minutes: i16,
 ) {
+    // Held for the whole session (any exit path drops it): the
+    // manager idles across heartbeats instead of hardware-sleeping,
+    // keeping the UART clocked while the display sleeps normally.
+    let _wake = bus::WakeHold::new();
+    publish(GpsSyncState::Syncing { sats: 0, fix_ok: false });
     if !set_rail(i2c_bus, true).await {
+        publish(GpsSyncState::NoSignal);
         return;
     }
     log::info!("GPS: rail on - sync session starts");
@@ -111,6 +118,7 @@ async fn run_sync_session(
         Err(_) => {
             log::error!("GPS: UART init failed");
             set_rail(i2c_bus, false).await;
+            publish(GpsSyncState::NoSignal);
             return;
         }
     };
@@ -120,6 +128,7 @@ async fn run_sync_session(
         log::warn!("GPS: receiver not acknowledging configuration - aborting");
         drop(port);
         set_rail(i2c_bus, false).await;
+        publish(GpsSyncState::NoSignal);
         return;
     }
 
@@ -129,6 +138,7 @@ async fn run_sync_session(
     let deadline = started + Duration::from_secs(SESSION_BUDGET_SECS);
     let mut next_status = started + Duration::from_secs(STATUS_LOG_SECS);
     let mut time_synced = false;
+    let mut synced_local: Option<(u8, u8)> = None;
     let mut got_fix = false;
     let mut buf = [0u8; 64];
     // Latest solution, session-persistent - the status tick reports
@@ -176,7 +186,7 @@ async fn run_sync_session(
             last_pvt = Some(pvt);
             if pvt.time_trustworthy() && !time_synced {
                 time_synced = true;
-                sync_rtc(&pvt);
+                synced_local = Some(sync_rtc(&pvt, tz_offset_minutes));
             }
             if pvt.position_usable() && !got_fix {
                 got_fix = true;
@@ -194,12 +204,18 @@ async fn run_sync_session(
         if Instant::now() >= next_status {
             next_status += Duration::from_secs(STATUS_LOG_SECS);
             match &last_pvt {
-                Some(pvt) => log::info!(
-                    "GPS: fix {:?}, {} sats, hAcc {} m",
-                    pvt.fix_type,
-                    pvt.num_sv,
-                    pvt.h_acc_mm / 1000,
-                ),
+                Some(pvt) => {
+                    log::info!(
+                        "GPS: fix {:?}, {} sats, hAcc {} m",
+                        pvt.fix_type,
+                        pvt.num_sv,
+                        pvt.h_acc_mm / 1000,
+                    );
+                    publish(GpsSyncState::Syncing {
+                        sats: pvt.num_sv,
+                        fix_ok: pvt.position_usable(),
+                    });
+                }
                 // NAV-PVT flows at 1 Hz from the moment config is
                 // accepted, fix or not - persistent absence means
                 // the receiver went quiet, not "no fix yet".
@@ -210,6 +226,10 @@ async fn run_sync_session(
 
     drop(port);
     set_rail(i2c_bus, false).await;
+    publish(match synced_local {
+        Some((hour, minute)) => GpsSyncState::Synced { hour, minute },
+        None => GpsSyncState::NoSignal,
+    });
     log::info!(
         "GPS: session done in {} s - time {}, fix {}",
         started.elapsed().as_secs(),
@@ -316,15 +336,16 @@ async fn wait_valset_ack(port: &mut Uart<'_, Async>, parser: &mut frame::Parser)
 }
 
 /// Convert the receiver's UTC to watch-local time and hand it to the
-/// shared RTC task.
-fn sync_rtc(pvt: &nav::NavPvt) {
+/// shared RTC task. Returns the local (hour, minute) that was set,
+/// for the session's terminal status event.
+fn sync_rtc(pvt: &nav::NavPvt, tz_offset_minutes: i16) -> (u8, u8) {
     let (year, month, day, hour, minute) = add_minutes(
         pvt.year,
         pvt.month,
         pvt.day,
         pvt.hour,
         pvt.min,
-        TZ_OFFSET_MINUTES,
+        tz_offset_minutes as i32,
     );
     log::info!(
         "GPS: UTC {:04}-{:02}-{:02} {:02}:{:02}:{:02} (tAcc {} ns) -> local {:04}-{:02}-{:02} {:02}:{:02}",
@@ -340,6 +361,7 @@ fn sync_rtc(pvt: &nav::NavPvt) {
         minute,
         second: pvt.sec,
     });
+    (hour, minute)
 }
 
 /// Calendar-correct minute-offset shift of a UTC date/time,

@@ -353,12 +353,6 @@ impl Bringup for TwatchUltraBringup {
             )
             .unwrap(),
         );
-        // BRING-UP: kick one sync session at boot so the GPS pipeline
-        // can be validated over serial before any UI exists. The real
-        // trigger (UI action / model policy) replaces this - remove it
-        // once that lands, or every boot pays a 2-minute GPS hunt.
-        let _ = crate::system::gps::GPS_COMMAND
-            .try_send(crate::system::gps::GpsCommand::SyncOnce);
         let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) =
             esp_hal::dma_circular_buffers!(32768, 4096);
         spawner.spawn(
@@ -377,6 +371,12 @@ impl Bringup for TwatchUltraBringup {
             )
             .unwrap(),
         );
+    }
+
+    /// This board carries a GNSS receiver with a live sync task -
+    /// the settings GPS view shows up because of this flag.
+    fn capabilities(&self) -> app_core::data::Capabilities {
+        app_core::data::Capabilities { gps: true }
     }
 }
 
