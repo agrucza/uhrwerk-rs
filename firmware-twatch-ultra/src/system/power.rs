@@ -151,8 +151,7 @@ impl TwatchUltraBoard {
 
         // Boot rails (see the rail table in board.rs). Not
         // `Pmu::init()` - that helper bakes in another board's
-        // voltages. DLDO1 (NFC) stays off until the NFC effort;
-        // VBACKUP coin-cell charging is the RTC effort's call.
+        // voltages. DLDO1 (NFC) stays off until the NFC effort.
         pmu.set_aldo1_voltage(i2c, 3300).map_err(|_| ())?; // SD card
         pmu.set_aldo2_voltage(i2c, 3300).map_err(|_| ())?; // Display VCI
         pmu.set_aldo3_voltage(i2c, 3300).map_err(|_| ())?; // LoRa
@@ -171,6 +170,16 @@ impl TwatchUltraBoard {
         // only re-enables (its UART runs 38400 baud).
         pmu.set_bldo1_enable(i2c, false).map_err(|_| ())?;
         log::info!("GPS: rail off (hardware backup mode)");
+        // Charge the VBACKUP button cell (rail table: "RTC button
+        // battery") so a PWR-button power-off no longer stops the
+        // PCF85063 oscillator - synced time then survives power
+        // cycles and the boot-time "oscillator stopped, setting
+        // default" reset becomes a rare deep-discharge event.
+        // Matches the vendor firmware. The cell starts empty: the
+        // first benefit shows on the next power-off after it has
+        // had some hours of charge.
+        pmu.set_button_battery_voltage(i2c, 3300).map_err(|_| ())?;
+        pmu.set_button_battery_charge(i2c, true).map_err(|_| ())?;
         pmu.enable_all_adc(i2c).map_err(|_| ())?;
         pmu.enable_battery_monitor(i2c).map_err(|_| ())?;
 
