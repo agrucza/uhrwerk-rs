@@ -44,6 +44,9 @@ pub mod drv2605;
 #[cfg(feature = "bhi260")]
 pub mod bhi260;
 
+#[cfg(feature = "ublox")]
+pub mod ublox;
+
 pub use embedded_hal;
 
 #[cfg(feature = "defmt")]

@@ -83,6 +83,10 @@ struct TwatchUltraBringup {
     spk_dout: Option<p::GPIO11<'static>>,
     mic_clk: Option<p::GPIO17<'static>>,
     mic_din: Option<p::GPIO18<'static>>,
+    // GPS (MIA-M10Q) - rail-gated UART sessions, see system/gps.rs.
+    uart1: Option<p::UART1<'static>>,
+    gps_tx: Option<p::GPIO43<'static>>,
+    gps_rx: Option<p::GPIO44<'static>>,
     lcd_te: Option<p::GPIO6<'static>>,
     touch_int: Option<p::GPIO12<'static>>,
     btn_boot: Option<p::GPIO0<'static>>,
@@ -340,6 +344,21 @@ impl Bringup for TwatchUltraBringup {
         i2c_bus: &'static system_core::bus::SharedI2c,
     ) {
         spawner.spawn(crate::system::haptics::haptics_task(i2c_bus).unwrap());
+        spawner.spawn(
+            crate::system::gps::gps_task(
+                i2c_bus,
+                self.uart1.take().unwrap(),
+                self.gps_tx.take().unwrap(),
+                self.gps_rx.take().unwrap(),
+            )
+            .unwrap(),
+        );
+        // BRING-UP: kick one sync session at boot so the GPS pipeline
+        // can be validated over serial before any UI exists. The real
+        // trigger (UI action / model policy) replaces this - remove it
+        // once that lands, or every boot pays a 2-minute GPS hunt.
+        let _ = crate::system::gps::GPS_COMMAND
+            .try_send(crate::system::gps::GpsCommand::SyncOnce);
         let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) =
             esp_hal::dma_circular_buffers!(32768, 4096);
         spawner.spawn(
@@ -611,6 +630,9 @@ async fn main(spawner: embassy_executor::Spawner) {
         spk_dout: Some(peripherals.GPIO11),
         mic_clk: Some(peripherals.GPIO17),
         mic_din: Some(peripherals.GPIO18),
+        uart1: Some(peripherals.UART1),
+        gps_tx: Some(peripherals.GPIO43),
+        gps_rx: Some(peripherals.GPIO44),
         lcd_te: Some(peripherals.GPIO6),
         touch_int: Some(peripherals.GPIO12),
         btn_boot: Some(peripherals.GPIO0),

@@ -43,6 +43,7 @@ esp-println = { version = "0.17.0", features = [
 # --- Embassy async runtime ---
 embassy-executor = { version = "0.10" }
 embassy-sync     = { version = "0.8" }
+embassy-futures  = { version = "0.1" }
 embassy-time     = { version = "0.5.1" }
 
 # --- Logging ---
@@ -68,6 +69,6 @@ esp32s3 = { version = "0.35", features = ["critical-section"] }
 # --- Local crates ---
 # `display` is for the smoke bin; the main bin reaches the display
 # through system-core/firmware-hal.
-drivers      = { path = "../drivers", features = ["display", "pmu", "xl9555", "cst9217", "drv2605", "imu", "bhi260"] }
+drivers      = { path = "../drivers", features = ["display", "pmu", "xl9555", "cst9217", "drv2605", "imu", "bhi260", "ublox"] }
 firmware-hal = { path = "../firmware-hal" }
 system-core  = { path = "../system-core" }
