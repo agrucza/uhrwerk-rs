@@ -197,18 +197,6 @@ impl PowerTaskState {
         // Power button interrupts
         if let Ok(irq) = self.pmu.read_interrupts(i2c) {
             if !irq.is_empty() {
-                // Diagnostic probe: print every latched IRQ source,
-                // not just the PKEY bits handled below. On boards
-                // that arm the PMU IRQ line as a wake source, an
-                // unexpected latch is a spurious sleep wake - the
-                // raw bytes attribute it. Strip once the wake
-                // attribution question is settled.
-                log::info!(
-                    "PMU: irq latched reg48={:#04x} reg49={:#04x} reg4a={:#04x}",
-                    irq.reg48_byte(),
-                    irq.reg49_byte(),
-                    irq.reg4a_byte(),
-                );
                 if irq.is_active(InterruptSource::PowerOnShortPress) {
                     let _ = events.push(SystemEvent::PowerButtonShort);
                 }
