@@ -941,6 +941,15 @@ pub async fn run_session<'d>(
     init_hw: impl core::future::Future<Output = ()>,
 ) -> Option<AudioCommand> {
     log::info!("Audio: session {:?}", mode);
+    // The whole session holds the wake lock: hardware light sleep
+    // gates the I2S clocks and DMA, so a heartbeat sleeping through
+    // an active session audibly stutters playback and starves
+    // capture (hardware-observed during mic validation - the reason
+    // the audio-at-Dim decision existed). It also protected against
+    // sleep freezing a session mid-teardown, which could wedge the
+    // circular DMA in `Late`. Cost is bounded: the hold dies with
+    // the session when the mode's Stop arrives.
+    let _wake = crate::bus::WakeHold::new();
     // Full-duplex bring-up - both sides share one I2S0 + clocks.
     let (i2s_tx, i2s_rx) = audio_hal::build_i2s(
         i2s, dma_ch, mclk, bclk, ws, dout, din, tx_desc, rx_desc,
@@ -1081,6 +1090,8 @@ pub async fn run_session_tx<'d>(
     tune_i2s: fn(),
 ) -> Option<AudioCommand> {
     log::info!("Audio: TX session {:?}", mode);
+    // Session-scoped wake hold - see run_session on why.
+    let _wake = crate::bus::WakeHold::new();
     let i2s_tx = audio_hal::build_i2s_tx(i2s, dma_ch, bclk, ws, dout, tx_desc);
     // Chip-specific I2S register fixups, same seam as run_session.
     tune_i2s();
@@ -1170,6 +1181,8 @@ pub async fn run_session_pdm_mic<'d>(
     tune_i2s: fn(),
 ) -> Option<AudioCommand> {
     log::info!("Audio: PDM-mic session {:?}", mode);
+    // Session-scoped wake hold - see run_session on why.
+    let _wake = crate::bus::WakeHold::new();
     let (i2s_tx, i2s_rx) = audio_hal::build_i2s_tx_pdm_rx(
         i2s, dma_ch, bclk, ws, dout, pdm_clk, pdm_din, tx_desc, rx_desc,
     );
