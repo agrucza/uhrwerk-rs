@@ -572,6 +572,26 @@ impl Model {
                 // all (needs_redraw is harmless then - render is
                 // display-state gated).
                 if self.cached_data.gps_sync != *state {
+                    use crate::data::GpsSyncState;
+                    // Tactile milestones for sessions run at arm's
+                    // length outdoors (screen dark or unreadable):
+                    // short pulse when the first position fix lands,
+                    // longer one when the session ends time-synced.
+                    // The manager gates MotorPulse on
+                    // haptics_enabled like every other buzz.
+                    let had_fix = matches!(
+                        self.cached_data.gps_sync,
+                        GpsSyncState::Syncing { fix_ok: true, .. },
+                    );
+                    match state {
+                        GpsSyncState::Syncing { fix_ok: true, .. } if !had_fix => {
+                            let _ = out.push(Effect::MotorPulse { duration_ms: 120 });
+                        }
+                        GpsSyncState::Synced { .. } => {
+                            let _ = out.push(Effect::MotorPulse { duration_ms: 350 });
+                        }
+                        _ => {}
+                    }
                     self.cached_data.gps_sync = *state;
                     self.needs_redraw = true;
                 }

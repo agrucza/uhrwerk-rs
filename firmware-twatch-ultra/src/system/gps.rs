@@ -198,6 +198,14 @@ async fn run_sync_session(
                     pvt.h_acc_mm / 1000,
                     pvt.num_sv,
                 );
+                // Publish the fix immediately rather than waiting
+                // for the status cadence - the model pulses the
+                // motor on this transition, and a haptic that lands
+                // seconds late reads as unrelated.
+                publish(GpsSyncState::Syncing {
+                    sats: pvt.num_sv,
+                    fix_ok: true,
+                });
             }
         }
 

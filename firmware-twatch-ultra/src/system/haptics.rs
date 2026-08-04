@@ -44,6 +44,14 @@ pub async fn haptics_task(i2c_bus: &'static SharedI2c) {
         }
     };
 
+    // Held while the motor is on: the DRV2605 drives autonomously,
+    // so if hardware light sleep freezes the executor between an
+    // enqueued Off and this task delivering it, the motor runs on
+    // until the next heartbeat (hardware-observed: a 350 ms pulse at
+    // GPS-session end - wake lock just released - buzzed 3-5 s).
+    // The hold keeps the manager idling until Off has actually
+    // reached the chip.
+    let mut motor_hold: Option<system_core::bus::WakeHold> = None;
     loop {
         let cmd = HAPTIC_COMMAND.receive().await;
         if !online {
@@ -51,8 +59,17 @@ pub async fn haptics_task(i2c_bus: &'static SharedI2c) {
         }
         let mut i2c = i2c_bus.lock().await;
         let res = match cmd {
-            HapticCommand::On => drv.buzz_on(&mut *i2c, RTP_MAX),
-            HapticCommand::Off => drv.buzz_off(&mut *i2c),
+            HapticCommand::On => {
+                if motor_hold.is_none() {
+                    motor_hold = Some(system_core::bus::WakeHold::new());
+                }
+                drv.buzz_on(&mut *i2c, RTP_MAX)
+            }
+            HapticCommand::Off => {
+                let res = drv.buzz_off(&mut *i2c);
+                motor_hold = None;
+                res
+            }
         };
         if res.is_err() {
             log::warn!("Haptics: DRV2605 I2C write failed");
