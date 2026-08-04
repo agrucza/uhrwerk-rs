@@ -109,32 +109,62 @@ impl Rtc {
 
     /// Initialise the PCF85063A.
     ///
-    /// Performs a software reset, then configures 24h mode with the clock
-    /// running and the internal 7 pF quartz capacitor selected.
+    /// Reads the oscillator-stop (OS) flag FIRST and only performs
+    /// the software reset when it is set - i.e. when the chip
+    /// genuinely lost power and its registers are untrustworthy. A
+    /// chip found running on backup power keeps its time: the
+    /// software reset wipes the time registers and sets OS itself,
+    /// so resetting unconditionally destroyed battery-backed time
+    /// on every boot (hardware-observed as the oscillator-stop
+    /// warning appearing even on reflash boots where RTC power
+    /// never dropped).
     ///
-    /// Returns `Ok(true)` if the oscillator-stop (OS) flag was set - meaning
-    /// the clock lost power and the stored time is invalid. Call `set()` with
-    /// a known time in that case.
+    /// Either way the volatile machinery is left in a known state:
+    /// Control_1 gets 24h mode, clock running, 7 pF quartz
+    /// capacitor; alarm/timer interrupt enables and latched flags
+    /// are cleared (the blanket reset used to provide that hygiene
+    /// - without it a stale alarm armed by a previous run could
+    /// fire into a fresh boot; the owning task re-arms what should
+    /// be armed from persisted state).
+    ///
+    /// Returns `Ok(true)` if the stored time was invalid (power was
+    /// lost). Call `set()` with a known time then - the seconds
+    /// write also clears OS.
     pub fn init<I2C, E>(&self, i2c: &mut I2C) -> Result<bool, Error<E>>
     where
         I2C: I2cTrait<Error = E>,
     {
-        // Software reset (SR bit = 1). Resets all registers to power-on defaults.
-        self.write_register(i2c, REG_CTRL1, 0x58)?;
+        // OS flag is bit 7 of the Seconds register. Read it before
+        // touching anything - the reset below would set it. This
+        // read doubles as the device-responding probe.
+        let os_was_set = (self.read_register(i2c, REG_SECONDS)? & 0x80) != 0;
 
-        // Read back to verify the device is responding.
-        let ctrl1 = self.read_register(i2c, REG_CTRL1)?;
+        if os_was_set {
+            // Power was lost: register contents are undefined per
+            // the datasheet, and the documented recovery is the
+            // software reset (magic 0x58 to Control_1), followed by
+            // the caller writing a known time.
+            self.write_register(i2c, REG_CTRL1, 0x58)?;
+        }
 
         // Ensure 24h mode (12_24 bit 1 = 0), clock running (STOP bit 5 = 0),
         // and 7 pF capacitor selected (CAP_SEL bit 0 = 1). Preserve other bits.
+        let ctrl1 = self.read_register(i2c, REG_CTRL1)?;
         let ctrl1_new = (ctrl1 & !(1 << 5) & !(1 << 1)) | (1 << 0);
         if ctrl1_new != ctrl1 {
             self.write_register(i2c, REG_CTRL1, ctrl1_new)?;
         }
 
-        // OS flag is bit 7 of the Seconds register.
-        let seconds_raw = self.read_register(i2c, REG_SECONDS)?;
-        Ok((seconds_raw & 0x80) != 0)
+        // Boot hygiene on the volatile side, non-destructive to the
+        // time: drop alarm/timer interrupt enables + latched flags,
+        // and stop a still-running countdown timer.
+        self.write_register(i2c, REG_CTRL2, 0x00)?;
+        let timer_mode = self.read_register(i2c, REG_TIMER_MODE)?;
+        if timer_mode & TIMER_TE != 0 {
+            self.write_register(i2c, REG_TIMER_MODE, timer_mode & !TIMER_TE)?;
+        }
+
+        Ok(os_was_set)
     }
 
     // ---- Time read / write ------------------------------------------------------

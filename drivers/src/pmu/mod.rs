@@ -754,6 +754,24 @@ impl Pmu {
         self.write_register(i2c, registers::REG_BTN_BAT_VTERM, (reg & !0x07) | (n & 0x07))
     }
 
+    /// Read back the button battery termination voltage (REG 6Ah
+    /// bits 2:0), in millivolts.
+    pub fn button_battery_voltage<I2C, E>(&self, i2c: &mut I2C) -> Result<u16, Error<E>>
+    where
+        I2C: I2cTrait<Error = E>,
+    {
+        let n = self.read_register(i2c, registers::REG_BTN_BAT_VTERM)? & 0x07;
+        Ok(2600 + n as u16 * 100)
+    }
+
+    /// Read back the button battery charger enable (REG 18h bit 2).
+    pub fn button_battery_charge_enabled<I2C, E>(&self, i2c: &mut I2C) -> Result<bool, Error<E>>
+    where
+        I2C: I2cTrait<Error = E>,
+    {
+        Ok(self.read_register(i2c, registers::REG_CHARGER_GAUGE_WDT_EN)? & (1 << 2) != 0)
+    }
+
     /// Enable or disable button battery charging (REG 18h bit 2).
     pub fn set_button_battery_charge<I2C, E>(&self, i2c: &mut I2C, enable: bool) -> Result<(), Error<E>>
     where

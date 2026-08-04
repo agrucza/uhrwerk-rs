@@ -180,6 +180,16 @@ impl TwatchUltraBoard {
         // had some hours of charge.
         pmu.set_button_battery_voltage(i2c, 3300).map_err(|_| ())?;
         pmu.set_button_battery_charge(i2c, true).map_err(|_| ())?;
+        // Diagnostic probe (VBACKUP retention failed a >20h charge
+        // test): read the charger config back out of silicon to
+        // separate "writes didn't stick" from "the backup cell
+        // doesn't feed the RTC at all". Strip once the backup-cell
+        // story is settled.
+        log::info!(
+            "PMU: button battery charge enabled={:?} vterm={:?} mV",
+            pmu.button_battery_charge_enabled(i2c),
+            pmu.button_battery_voltage(i2c),
+        );
         pmu.enable_all_adc(i2c).map_err(|_| ())?;
         pmu.enable_battery_monitor(i2c).map_err(|_| ())?;
 
