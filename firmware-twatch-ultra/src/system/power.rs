@@ -339,6 +339,22 @@ impl Board for TwatchUltraBoard {
     ) {
     }
 
+    /// SD detect is XL9555 P12 (input, LOW = card inserted) - the
+    /// first board with a real detect line, which is what enables
+    /// both-direction SD hotplug in the shared manager. A failed
+    /// expander read reports "no detect line" for this round rather
+    /// than guessing a presence state.
+    fn sd_detect(
+        &mut self,
+        i2c: &mut esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>,
+    ) -> Option<bool> {
+        let expander = Xl9555::new(ExpanderConfig::default());
+        expander
+            .read_pin(i2c, crate::board::EXP_SD_DET)
+            .ok()
+            .map(|level| !level)
+    }
+
     /// The light-sleep recipe validated on the other S3 board (same
     /// chip family): RTC regulator kept powered, main XTAL allowed to
     /// power down, sleep-reject off so a latched INT can't silently

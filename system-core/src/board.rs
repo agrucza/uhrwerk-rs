@@ -110,6 +110,23 @@ pub trait Board {
         let _ = i2c;
     }
 
+    /// Read the SD card-detect line, where the board has one:
+    /// `Some(true)` = card physically present, `Some(false)` = slot
+    /// empty, `None` = no detect line (the manager then falls back
+    /// to blind throttled probing when the mirror is offline). The
+    /// line is what makes hotplug cheap: an empty slot is one bus
+    /// read instead of a seconds-long failed probe, and a yanked
+    /// card is noticed without waiting for a write to fail. Called
+    /// with the bus lock held - keep it to a single cheap
+    /// transaction.
+    fn sd_detect(
+        &mut self,
+        i2c: &mut esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>,
+    ) -> Option<bool> {
+        let _ = i2c;
+        None
+    }
+
     /// Switch the CPU clock to `freq`. The chip's clock registers
     /// differ per family, so the sequence lives here. A board may
     /// clamp a level it can't reach (e.g. `Mhz240` -> its max). The

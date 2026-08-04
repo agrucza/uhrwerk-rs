@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use app_core::log::{LogEntry, parse_log_line};
 use core::ops::ControlFlow;
 use drivers::sdcard::{
-    DirEntry, FileMode, RawDirectory, RawFile, RawVolume, SdCardError, SdmmcError, VolumeIdx,
+    DirEntry, FileMode, RawDirectory, RawFile, SdCardError, SdmmcError, VolumeIdx,
 };
 
 /// Directories under `/system/` that [`SdFs::reset_user_data`]
@@ -64,22 +64,33 @@ const READ_LINE_CAP: usize = 96;
 ///   geometry),
 /// * `SdFs` being dropped.
 pub struct SdFs<'d> {
-    vol: EspVolumeManager<'d>,
+    /// Always `Some` between public calls; the `Option` exists only
+    /// so [`Self::abandon_session`] can take ownership for the
+    /// rebuild (`VolumeManager::free` consumes self).
+    vol: Option<EspVolumeManager<'d>>,
     session: Option<OpenSession>,
 }
 
-/// Cached pair of long-lived `open_raw_volume` / `open_root_dir`
-/// handles. Held inside [`SdFs::session`] so file ops don't re-do
-/// the volume + root walk on every call.
+/// Cached long-lived root-dir handle from `open_root_dir`. Held
+/// inside [`SdFs::session`] so file ops don't re-do the volume +
+/// root walk on every call. The `RawVolume` handle behind it is
+/// deliberately NOT kept: sessions end only through
+/// [`SdFs::abandon_session`] (never `close_volume` - see there),
+/// so nothing would ever read it.
 #[derive(Clone, Copy)]
 struct OpenSession {
-    vol_handle: RawVolume,
     root: RawDirectory,
 }
 
 impl<'d> SdFs<'d> {
     pub fn new(vol: EspVolumeManager<'d>) -> Self {
-        Self { vol, session: None }
+        Self { vol: Some(vol), session: None }
+    }
+
+    /// The wrapped manager. Infallible outside the rebuild inside
+    /// [`Self::abandon_session`].
+    fn vol(&mut self) -> &mut EspVolumeManager<'d> {
+        self.vol.as_mut().expect("VolumeManager is rebuilt in place")
     }
 
     /// Re-probe the card from a known-clean state. Drops any cached
@@ -92,8 +103,8 @@ impl<'d> SdFs<'d> {
     /// different card work without rebooting: the cached `card_type`
     /// inside `SdCard` would otherwise stick at the old card's value.
     pub fn probe(&mut self) -> bool {
-        self.invalidate_session();
-        self.vol.device().mark_card_uninit();
+        self.abandon_session();
+        self.vol().device().mark_card_uninit();
         match self.ensure_session() {
             Ok(_) => {
                 log::info!("SD card: present (volume 0 readable)");
@@ -106,12 +117,37 @@ impl<'d> SdFs<'d> {
         }
     }
 
-    /// Drop cached handles. Safe to call when no session is open.
-    fn invalidate_session(&mut self) {
-        if let Some(s) = self.session.take() {
-            let _ = self.vol.close_dir(s.root);
-            let _ = self.vol.close_volume(s.vol_handle);
-        }
+    /// Drop the cached handles AND rebuild the `VolumeManager` from
+    /// its parts. Deliberately never closes them through the
+    /// manager: `close_volume` flushes the FAT info sector - a card
+    /// WRITE - before freeing its table slot (embedded-sdmmc 0.8.2,
+    /// volume_mgr.rs `update_info_sector` ahead of `swap_remove`),
+    /// so against a removed or stale card the write fails and the
+    /// slot leaks; at the default MAX_VOLUMES=1 every later open
+    /// then fails `TooManyOpenVolumes` until reboot
+    /// (hardware-observed on a remove/reinsert hotplug cycle). And
+    /// a close that *succeeds* after a card swap would write the
+    /// old card's info sector onto the new card. Rebuilding resets
+    /// every handle table with zero I/O; the only cost is a stale
+    /// advisory free-cluster count on cleanly-removed cards, which
+    /// every FAT implementation treats as a hint and recomputes.
+    fn abandon_session(&mut self) {
+        self.session = None;
+        let (dev, ts) = self
+            .vol
+            .take()
+            .expect("VolumeManager is rebuilt in place")
+            .free();
+        self.vol = Some(drivers::sdcard::VolumeManager::new(dev, ts));
+    }
+
+    /// Public face of [`Self::abandon_session`], for the store's
+    /// card-removed path: the cached handles reference a card that
+    /// is physically gone, and keeping them would let a later op
+    /// run the old card's cluster chains against whatever card is
+    /// inserted next.
+    pub fn abandon(&mut self) {
+        self.abandon_session();
     }
 
     /// Return the cached session, opening + caching one on first use.
@@ -119,15 +155,22 @@ impl<'d> SdFs<'d> {
         if let Some(s) = self.session {
             return Ok(s);
         }
-        let vol_handle = self.vol.open_raw_volume(VolumeIdx(0))?;
-        let root = match self.vol.open_root_dir(vol_handle) {
+        // The volume handle is dropped after opening the root: the
+        // volume stays open in the manager's table until the next
+        // abandon-and-rebuild, and no code path closes it (see
+        // abandon_session).
+        let vol_handle = self.vol().open_raw_volume(VolumeIdx(0))?;
+        let root = match self.vol().open_root_dir(vol_handle) {
             Ok(d) => d,
             Err(e) => {
-                let _ = self.vol.close_volume(vol_handle);
+                // Failing this early is card-level trouble; abandon
+                // rather than close (see abandon_session on why a
+                // close can leak the volume slot).
+                self.abandon_session();
                 return Err(e);
             }
         };
-        let session = OpenSession { vol_handle, root };
+        let session = OpenSession { root };
         self.session = Some(session);
         Ok(session)
     }
@@ -138,7 +181,7 @@ impl<'d> SdFs<'d> {
     /// card itself is gone.
     fn invalidate_on_card_error(&mut self, e: &SdmmcError<SdCardError>) {
         if is_card_error(e) {
-            self.invalidate_session();
+            self.abandon_session();
         }
     }
 
@@ -352,32 +395,32 @@ impl<'d> SdFs<'d> {
         let mut dirs: heapless::Vec<RawDirectory, MAX_DEPTH> = heapless::Vec::new();
         let mut parent = session.root;
         for name in &components {
-            match open_or_create_dir(&mut self.vol, parent, name, create_dirs) {
+            match open_or_create_dir(self.vol(), parent, name, create_dirs) {
                 Ok(d) => {
                     parent = d;
                     let _ = dirs.push(d);
                 }
                 Err(e) => {
-                    close_dirs(&mut self.vol, &dirs);
+                    close_dirs(self.vol(), &dirs);
                     self.invalidate_on_card_error(&e);
                     return Err(e);
                 }
             }
         }
 
-        let file = match self.vol.open_file_in_dir(parent, filename, mode) {
+        let file = match self.vol().open_file_in_dir(parent, filename, mode) {
             Ok(f) => f,
             Err(e) => {
-                close_dirs(&mut self.vol, &dirs);
+                close_dirs(self.vol(), &dirs);
                 self.invalidate_on_card_error(&e);
                 return Err(e);
             }
         };
 
-        let result = f(&mut self.vol, file);
+        let result = f(self.vol(), file);
 
-        let _ = self.vol.close_file(file);
-        close_dirs(&mut self.vol, &dirs);
+        let _ = self.vol().close_file(file);
+        close_dirs(self.vol(), &dirs);
         if let Err(ref e) = result {
             self.invalidate_on_card_error(e);
         }
@@ -392,7 +435,7 @@ impl<'d> SdFs<'d> {
                 return Err(e);
             }
         };
-        let sysdir = match self.vol.open_dir(session.root, SYSTEM_DIR) {
+        let sysdir = match self.vol().open_dir(session.root, SYSTEM_DIR) {
             Ok(d) => d,
             Err(SdmmcError::NotFound) => {
                 // Card has no /system/ - nothing to wipe.
@@ -406,7 +449,7 @@ impl<'d> SdFs<'d> {
 
         let mut removed = 0u32;
         for child in RESET_CHILDREN {
-            let child_dir = match self.vol.open_dir(sysdir, *child) {
+            let child_dir = match self.vol().open_dir(sysdir, *child) {
                 Ok(d) => d,
                 Err(SdmmcError::NotFound) => continue,
                 Err(e) => {
@@ -417,13 +460,13 @@ impl<'d> SdFs<'d> {
 
             // Collect names first - can't delete during iterate_dir.
             let mut to_delete: heapless::Vec<DirEntry, 32> = heapless::Vec::new();
-            let _ = self.vol.iterate_dir(child_dir, |entry: &DirEntry| {
+            let _ = self.vol().iterate_dir(child_dir, |entry: &DirEntry| {
                 if entry.attributes.is_directory() { return; }
                 let _ = to_delete.push(entry.clone());
             });
 
             for entry in &to_delete {
-                match self.vol.delete_file_in_dir(child_dir, entry.name.clone()) {
+                match self.vol().delete_file_in_dir(child_dir, entry.name.clone()) {
                     Ok(()) => removed += 1,
                     Err(e) => log::warn!(
                         "SD reset: delete /system/{}/{:?} failed: {:?}",
@@ -432,17 +475,21 @@ impl<'d> SdFs<'d> {
                 }
             }
 
-            let _ = self.vol.close_dir(child_dir);
+            let _ = self.vol().close_dir(child_dir);
         }
 
-        let _ = self.vol.close_dir(sysdir);
+        let _ = self.vol().close_dir(sysdir);
         Ok(removed)
     }
 }
 
 impl<'d> Drop for SdFs<'d> {
     fn drop(&mut self) {
-        self.invalidate_session();
+        // Nothing worth closing: the handle tables die with the
+        // manager, and a close would only risk the info-sector
+        // write against an unknown card state (see abandon_session).
+        // In practice `SdFs` lives for the whole run anyway.
+        self.session = None;
     }
 }
 

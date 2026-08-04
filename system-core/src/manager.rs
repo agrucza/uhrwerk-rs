@@ -228,6 +228,10 @@ pub struct SystemManager<'d, B: Board> {
     // every tick when the card is genuinely absent. `None` until
     // the first attempt fires.
     last_sd_recover_attempt: Option<Instant>,
+    /// Throttle for [`Self::service_sd_slot`]'s detect-line read
+    /// (ticks fire per event; the expander read must not run at
+    /// touch-drag rate).
+    last_sd_detect_check: Option<Instant>,
 }
 
 /// How often the tick loop will retry an SD probe when the mirror
@@ -253,7 +257,7 @@ impl<B: Board> SystemManager<'static, B> {
     pub fn new(parts: SystemParts<B>) -> (Self, TaskBundle) {
         let SystemParts {
             i2c_bus,
-            board,
+            mut board,
             display,
             lcd_te,
             rtc,
@@ -290,7 +294,22 @@ impl<B: Board> SystemManager<'static, B> {
         crate::event_log::init_seq_from_flash(&mut store);
 
         // Probe SD; on success the store backfills the event log.
-        let sd_online = store.probe_sd();
+        // Boards with a card-detect line skip the probe when the
+        // slot is empty - a cardless probe costs seconds of
+        // embedded-sdmmc retries. Pre-task-spawn, so the bus
+        // try_lock cannot be contended; if it somehow fails anyway,
+        // fall through to the probe (the old behavior).
+        let slot_empty = i2c_bus
+            .try_lock()
+            .ok()
+            .and_then(|mut i2c| board.sd_detect(&mut i2c))
+            == Some(false);
+        let sd_online = if slot_empty {
+            log::info!("SD: slot empty - boot probe skipped");
+            false
+        } else {
+            store.probe_sd()
+        };
 
         crate::event_log::log_boot(&mut store, &initial_time);
 
@@ -344,6 +363,7 @@ impl<B: Board> SystemManager<'static, B> {
             store,
             last_storage_usage: initial_usage,
             last_sd_recover_attempt: None,
+            last_sd_detect_check: None,
         };
 
         let bundle = TaskBundle {
@@ -514,11 +534,53 @@ impl<B: Board> SystemManager<'static, B> {
         }
     }
 
-    /// Periodic SD-recovery: when the mirror is currently offline,
-    /// re-probe the slot at most once per `SD_RECOVER_INTERVAL`. On
-    /// a successful recovery, push a `StorageUsageUpdated` event so
-    /// the UI's "SD online" indicator updates without waiting for
-    /// the next save.
+    /// Periodic SD slot service - the hotplug driver. Two modes,
+    /// picked by whether the board has a card-detect line:
+    ///
+    /// * `Board::sd_detect` = `Some(_)`: the line is the truth.
+    ///   Card gone while the mirror is online -> flip offline
+    ///   immediately and tell the UI (no probe, no waiting for a
+    ///   write to fail). Card present while offline -> throttled
+    ///   probe + backfill below. Both directions of hotplug, no
+    ///   user action, and an empty slot costs one bus read per
+    ///   tick instead of a seconds-long failed probe.
+    /// * `None` (no detect line): blind throttled re-probe when
+    ///   offline - the pre-hotplug behavior, unchanged.
+    ///
+    /// Runs from the awake tick only; a card swapped during sleep
+    /// is picked up on the first tick after wake. The detect read
+    /// is throttled to once per `SD_RECOVER_INTERVAL`: ticks fire
+    /// per event, and an unthrottled read would hit the expander at
+    /// touch-drag rate, contending with the touch task for the bus.
+    async fn service_sd_slot(&mut self) {
+        let now = Instant::now();
+        if let Some(last) = self.last_sd_detect_check {
+            if now.duration_since(last) < SD_RECOVER_INTERVAL {
+                return;
+            }
+        }
+        self.last_sd_detect_check = Some(now);
+        let detect = {
+            let mut i2c = self.i2c_bus.lock().await;
+            self.board.sd_detect(&mut i2c)
+        };
+        match detect {
+            Some(false) => {
+                if self.store.sd_online() {
+                    log::info!("SD: card removed - mirror offline");
+                    self.store.on_sd_removed();
+                    self.refresh_storage_usage().await;
+                }
+            }
+            Some(true) | None => self.try_sd_auto_recovery().await,
+        }
+    }
+
+    /// Throttled probe half of [`Self::service_sd_slot`]: when the
+    /// mirror is currently offline, re-probe the slot at most once
+    /// per `SD_RECOVER_INTERVAL`. On a successful recovery, push a
+    /// `StorageUsageUpdated` event so the UI's "SD online"
+    /// indicator updates without waiting for the next save.
     async fn try_sd_auto_recovery(&mut self) {
         if self.store.sd_online() {
             return;
@@ -897,12 +959,12 @@ impl<B: Board> SystemManager<'static, B> {
         self.model.set_sleep_telemetry(self.sleep_cycles);
         self.execute_effects(effects).await;
 
-        // Auto-recovery for SD: when the mirror is offline, re-probe
-        // every SD_RECOVER_INTERVAL so a hot-replug or different-card
-        // swap comes back online without the user pressing the
-        // Settings button. Throttled because a probe involves a full
-        // CMD0/CMD8/ACMD41 sequence + MBR read.
-        self.try_sd_auto_recovery().await;
+        // SD hotplug / recovery: detect-line boards notice inserts
+        // AND removals here; detect-less boards fall back to the
+        // throttled blind re-probe (a probe involves a full
+        // CMD0/CMD8/ACMD41 sequence + MBR read - hence the
+        // SD_RECOVER_INTERVAL throttle on that path).
+        self.service_sd_slot().await;
 
         if !self.model.sleeping() && self.model.needs_redraw() {
             self.board.set_cpu_freq(CpuFreq::Mhz160);

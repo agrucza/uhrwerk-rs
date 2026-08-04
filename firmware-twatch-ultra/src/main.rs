@@ -99,9 +99,6 @@ struct TwatchUltraBringup {
     sd_miso: Option<p::GPIO33<'static>>,
     sd_cs: Option<p::GPIO21<'static>>,
     lpwr: Option<p::LPWR<'static>>,
-    /// Card-detect state read from the XL9555 in `make_power`
-    /// (LOW = inserted), consumed by `make_store`.
-    sd_present: bool,
 }
 
 impl Bringup for TwatchUltraBringup {
@@ -165,18 +162,6 @@ impl Bringup for TwatchUltraBringup {
 
         let (board, pmu) = TwatchUltraBoard::init(i2c, pmu_irq, lora_cs, nfc_cs, lora)
             .expect("PMU init failed - halting");
-
-        // Card detect (XL9555 P12, active low). Read once at boot;
-        // make_store uses it to skip the SD probe on an empty slot.
-        let expander = Xl9555::new(ExpanderConfig::default());
-        self.sd_present = expander
-            .read_pin(i2c, board::EXP_SD_DET)
-            .map(|level| !level)
-            .unwrap_or(false);
-        log::info!(
-            "SD slot: card {}",
-            if self.sd_present { "inserted" } else { "not inserted" },
-        );
 
         (board, PowerTaskState::new(pmu))
     }
@@ -244,16 +229,13 @@ impl Bringup for TwatchUltraBringup {
     }
 
     fn make_store(&mut self) -> Store<'static> {
-        // This board has card detect (read in make_power) - an empty
-        // slot skips the SD bus entirely. Probing a cardless bus
-        // costs ~50 bounded-retry rounds inside embedded-sdmmc's
-        // acquire (tens of seconds of boot stall). A card inserted
-        // later needs a reboot to be picked up; runtime hotplug via
-        // SD_DET is a possible follow-up.
+        // The Store always owns the SD hardware; card presence is
+        // the manager's business (Board::sd_detect gates every
+        // probe, so an empty slot never pays the embedded-sdmmc
+        // retry stall). Unconditional ownership is what makes
+        // hotplug work from a cardless boot - the old flash-only
+        // path left the SPI pins behind for good.
         let region = FlashRegion::new(board::FLASH_FS_START, board::FLASH_FS_SIZE);
-        if !self.sd_present {
-            return Store::init_flash_only(self.flash.take().unwrap(), region);
-        }
         Store::init(
             self.flash.take().unwrap(),
             region,
@@ -645,7 +627,6 @@ async fn main(spawner: embassy_executor::Spawner) {
         sd_miso: Some(peripherals.GPIO33),
         sd_cs: Some(peripherals.GPIO21),
         lpwr: Some(peripherals.LPWR),
-        sd_present: false,
     };
 
     run(bringup, spawner).await

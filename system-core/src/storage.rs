@@ -115,9 +115,24 @@ impl<'d> Store<'d> {
     }
 
     /// Mark the SD mirror offline. Called on the first write
-    /// failure so warn-spam stops; user re-arms via `probe_sd()`.
+    /// failure so warn-spam stops; re-armed via `probe_sd()` (auto
+    /// on detect-line boards, the Settings button otherwise).
     fn mark_sd_offline(&self) {
         self.sd_online.store(false, Ordering::Relaxed);
+    }
+
+    /// The card-detect line reported the card gone: flip the mirror
+    /// offline and abandon the cached SD session. The abandon
+    /// matters as much as the flag - the cached volume/dir handles
+    /// reference a card that no longer exists, and both closing
+    /// them later (leaks the volume slot on the failed info-sector
+    /// flush - see `SdFs::abandon`) and reusing them (old card's
+    /// cluster chains against whatever card comes next) are wrong.
+    pub fn on_sd_removed(&mut self) {
+        self.mark_sd_offline();
+        if let Some(sd) = self.sd.as_mut() {
+            sd.abandon();
+        }
     }
 
     // -- Probe + backfill ---------------------------------------------------
