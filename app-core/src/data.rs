@@ -52,6 +52,16 @@ pub enum GpsSyncState {
     NoSignal,
 }
 
+/// Last usable position fix from a GPS sync session, in the
+/// receiver's native 1e-7-degree units (positive = north / east).
+/// A snapshot of wherever the last outdoor sync happened - the
+/// receiver is rail-gated between sessions, so this is not live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpsFix {
+    pub lat_e7: i32,
+    pub lon_e7: i32,
+}
+
 // ============================================================================
 // TimeData - calendar time of day, consumed by clock-style screens.
 // ============================================================================

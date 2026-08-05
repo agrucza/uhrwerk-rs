@@ -8,9 +8,12 @@
 //!    Model into Quick Access).
 //! 3. Stacked numerals: HH in signal red, MM directly below in bone.
 //!    Both rendered in the geometric `Mega` (logisoso78) face, digits
-//!    only. Meta row beneath: `:SS` in cyan + today's step count in
-//!    chrome on step-capable boards (the spec's `LAT .. LON ..`
-//!    filler elsewhere - static, no real telemetry behind it).
+//!    only. Meta row beneath: `:SS` in cyan + a chrome readout -
+//!    today's step count on step-capable boards, else the last GPS
+//!    fix on GPS boards, else the spec's static `LAT .. LON ..`
+//!    filler. Boards with steps AND GPS get the fix coordinates on
+//!    their own line below the meta row (last outdoor sync, not
+//!    live - the receiver is rail-gated between sessions).
 //! 4. Two chamfered info tiles at the bottom (via `info_tile` +
 //!    `layout::bottom_tile_row::<2>()`):
 //!    - left: yellow border, bell glyph, next enabled alarm time
@@ -67,8 +70,12 @@ const HERO_HH_TOP: i32 = 120;
 /// stacked block.
 const HERO_STACK_GAP: i32 = 72;
 const HERO_MM_TOP: i32 = HERO_HH_TOP + HERO_STACK_GAP;
-/// Y of the meta row (:SS + LAT/LON) under the MM glyphs.
+/// Y of the meta row (:SS + steps/coords readout) under the MM
+/// glyphs.
 const META_Y: i32 = HERO_MM_TOP + 84;
+/// Y of the last-fix coordinates line, rendered only on boards
+/// where steps occupy the meta row's right-hand slot.
+const GPS_Y: i32 = META_Y + 28;
 
 // -- Dirty-region rectangles -------------------------------------------------
 //
@@ -94,9 +101,14 @@ const HERO_MM_RECT: Rectangle = Rectangle::new(
     Point::new(0, HERO_MM_TOP - 10),
     Size::new(theme::SCREEN_W as u32, 88),
 );
-/// Meta row: `:SS` and the LAT/LON readout.
+/// Meta row: `:SS` and the steps/coords readout.
 const META_RECT: Rectangle = Rectangle::new(
     Point::new(0, META_Y - 8),
+    Size::new(theme::SCREEN_W as u32, 36),
+);
+/// Last-fix coordinates line below the meta row.
+const GPS_RECT: Rectangle = Rectangle::new(
+    Point::new(0, GPS_Y - 8),
     Size::new(theme::SCREEN_W as u32, 36),
 );
 /// Bottom tile row (alarm + timer info tiles).
@@ -126,6 +138,9 @@ struct RenderedSnapshot {
     /// Daily step count at last render (always 0 on boards without
     /// the steps capability, so the compare stays inert there).
     steps: u32,
+    /// Last GPS fix at last render (`None` forever on boards
+    /// without GPS, so the compare stays inert there).
+    fix: Option<crate::data::GpsFix>,
 }
 
 pub struct ClockScreen {
@@ -162,6 +177,7 @@ impl Screen for ClockScreen {
         draw_swipe_hint(display);
         draw_hero_numerals(display, data);
         draw_meta_row(display, data);
+        draw_gps_row(display, data);
         draw_bottom_tiles(display, data);
     }
 
@@ -194,6 +210,9 @@ impl Screen for ClockScreen {
         if prev.steps != data.steps_today {
             region.add(META_RECT);
         }
+        if prev.fix != data.gps_fix {
+            region.add(GPS_RECT);
+        }
         region
     }
 
@@ -206,6 +225,7 @@ impl Screen for ClockScreen {
             month: data.time.month,
             timer_secs: data.timer.remaining().as_secs(),
             steps: data.steps_today,
+            fix: data.gps_fix,
         });
         self.force_full_next = false;
     }
@@ -334,13 +354,17 @@ fn draw_meta_row<D: DrawTarget<Color = Rgb565>>(
 
     // Measure the seconds glyph width so we can place it and the
     // right-hand string side-by-side, separated by a fixed gap.
-    // Steps on step-capable boards; the spec's static LAT/LON
-    // filler elsewhere.
+    // Steps on step-capable boards (the last fix then gets its own
+    // line - see draw_gps_row), else the last GPS fix, else the
+    // spec's static LAT/LON filler.
     let ss_w = fonts::measure_width(&font, ss.as_str());
-    let mut steps_buf: String<16> = String::new();
+    let mut right_buf: String<32> = String::new();
     let coords: &str = if data.capabilities.steps {
-        let _ = write!(steps_buf, "{} STEPS", data.steps_today);
-        steps_buf.as_str()
+        let _ = write!(right_buf, "{} STEPS", data.steps_today);
+        right_buf.as_str()
+    } else if data.capabilities.gps {
+        write_coords(&mut right_buf, data.gps_fix);
+        right_buf.as_str()
     } else {
         "LAT 0.8314  LON 2.6"
     };
@@ -355,6 +379,50 @@ fn draw_meta_row<D: DrawTarget<Color = Rgb565>>(
         left_x, META_Y, theme::CYAN);
     fonts::draw_at(display, &font, coords,
         left_x + ss_w + gap, META_Y, theme::FG_MUTED);
+}
+
+/// Last-fix coordinates on their own line below the meta row - only
+/// on boards where steps occupy the meta row's right-hand slot AND
+/// a GPS exists. Chrome like the meta readout it descends from.
+fn draw_gps_row<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D, data: &SystemData,
+) {
+    if !(data.capabilities.steps && data.capabilities.gps) {
+        return;
+    }
+    let font = fonts::caption();
+    let mut buf: String<32> = String::new();
+    write_coords(&mut buf, data.gps_fix);
+    let cx = theme::SCREEN_W as i32 / 2;
+    fonts::draw_centered(display, &font, buf.as_str(), cx, GPS_Y, theme::FG_MUTED);
+}
+
+/// `LAT 51.2334  LON 6.7832` from the last fix, dashes before the
+/// first one. Four decimals is ~11 m - a glance readout, not
+/// navigation.
+fn write_coords(buf: &mut String<32>, fix: Option<crate::data::GpsFix>) {
+    let Some(f) = fix else {
+        let _ = buf.push_str("LAT --.----  LON --.----");
+        return;
+    };
+    write_coord(buf, "LAT ", f.lat_e7);
+    let _ = buf.push_str("  ");
+    write_coord(buf, "LON ", f.lon_e7);
+}
+
+/// One 1e-7-degree value as `[-]D.DDDD`. The sign is emitted
+/// separately because integer division toward zero would silently
+/// drop it for values between -1 and 0 degrees.
+fn write_coord(buf: &mut String<32>, label: &str, v_e7: i32) {
+    let _ = buf.push_str(label);
+    let a = v_e7.unsigned_abs();
+    let _ = write!(
+        buf,
+        "{}{}.{:04}",
+        if v_e7 < 0 { "-" } else { "" },
+        a / 10_000_000,
+        (a % 10_000_000) / 1_000,
+    );
 }
 
 fn draw_bottom_tiles<D: DrawTarget<Color = Rgb565>>(

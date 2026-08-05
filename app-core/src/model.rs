@@ -511,6 +511,11 @@ impl Model {
             SystemEvent::ImuIdentified { name } => {
                 self.cached_data.imu_name = name;
             }
+            SystemEvent::GpsFixUpdated { fix } => {
+                // No redraw: the clock face picks the new value up
+                // on the 1 Hz TimeUpdated tick, same as steps.
+                self.cached_data.gps_fix = Some(*fix);
+            }
             SystemEvent::MicLevel { level } => {
                 // Drop stale MicLevel events that arrive after capture
                 // has already been stopped. There's an inherent race

@@ -799,6 +799,12 @@ pub struct SystemData {
     /// midnight day rollover. RAM-only: a reboot loses the day so
     /// far. Stays 0 on boards without the steps capability.
     pub steps_today: u32,
+
+    /// Position from the last GPS sync session that got a usable
+    /// fix, from `SystemEvent::GpsFixUpdated`; `None` until then
+    /// (and always on boards without GPS). Not live - see
+    /// [`crate::data::GpsFix`].
+    pub gps_fix: Option<crate::data::GpsFix>,
 }
 
 // -- Screen trait -------------------------------------------------------------
@@ -808,8 +814,8 @@ pub struct SystemData {
 /// Maximum number of explicit dirty rectangles a screen can declare
 /// per frame before the renderer falls back to a full redraw. Sized
 /// for the worst case in the current UI (clock face: telemetry,
-/// hour digits, minute digits, meta row, bottom tiles) without
-/// burning stack for a wider list.
+/// hour digits, minute digits, meta row, GPS coords row, bottom
+/// tiles) without burning stack for a wider list.
 pub const MAX_DIRTY_RECTS: usize = 6;
 
 /// What part of the screen needs to be re-rendered this frame.

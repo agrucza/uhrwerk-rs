@@ -26,7 +26,7 @@
 //! survives the display going dark. Progress is published as
 //! `SystemEvent::GpsSyncUpdated` for the settings GPS view.
 
-use app_core::data::GpsSyncState;
+use app_core::data::{GpsFix, GpsSyncState};
 use app_core::events::SystemEvent;
 use drivers::pmu::{Config as PmuConfig, Pmu};
 use drivers::ublox::{self, cfg, frame, nav};
@@ -72,6 +72,14 @@ pub async fn gps_task(
 /// re-publishes fresher state anyway).
 fn publish(state: GpsSyncState) {
     let _ = EVENTS.try_send(SystemEvent::GpsSyncUpdated { state });
+}
+
+/// Publish a usable position for the clock face's coordinates line.
+/// Best-effort like `publish`.
+fn publish_fix(pvt: &nav::NavPvt) {
+    let _ = EVENTS.try_send(SystemEvent::GpsFixUpdated {
+        fix: GpsFix { lat_e7: pvt.lat_1e7, lon_e7: pvt.lon_1e7 },
+    });
 }
 
 /// Switch the GPS main rail. The PMU driver handle is stateless -
@@ -206,6 +214,7 @@ async fn run_sync_session(
                     sats: pvt.num_sv,
                     fix_ok: true,
                 });
+                publish_fix(&pvt);
             }
         }
 
@@ -234,6 +243,14 @@ async fn run_sync_session(
 
     drop(port);
     set_rail(i2c_bus, false).await;
+    // The session usually runs on past the first fix (waiting for
+    // trustworthy time); the final solution has had time to refine,
+    // so it supersedes the first-fix publication.
+    if let Some(pvt) = &last_pvt {
+        if pvt.position_usable() {
+            publish_fix(pvt);
+        }
+    }
     publish(match synced_local {
         Some((hour, minute)) => GpsSyncState::Synced { hour, minute },
         None => GpsSyncState::NoSignal,

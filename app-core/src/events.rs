@@ -163,6 +163,14 @@ pub enum SystemEvent {
         state: crate::data::GpsSyncState,
     },
 
+    /// A GPS sync session obtained (or refined) a usable position
+    /// fix. Cached in `cached_data.gps_fix` for the clock face's
+    /// coordinates line. Same activity/wake rules as
+    /// `GpsSyncUpdated`.
+    GpsFixUpdated {
+        fix: crate::data::GpsFix,
+    },
+
     // -- Flash-backed storage --
     /// Fresh flash-filesystem usage snapshot. Emitted by the
     /// manager once at boot (after the initial load), and after
