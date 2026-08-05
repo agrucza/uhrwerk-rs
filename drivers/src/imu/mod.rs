@@ -57,6 +57,11 @@ pub struct ImuData {
     pub gyro_z: i16,
     /// Raw temperature. Divide by 256 for degrees Celsius.
     pub temp_raw: i16,
+    /// Step-counter running total, cumulative since the chip's
+    /// pedometer engine last started; `None` on chips whose engine
+    /// isn't wired up. Consumers own the daily/rollover semantics -
+    /// the total resets to zero whenever the chip reboots.
+    pub steps: Option<u32>,
 }
 
 // ---- QMI8658 wake-on-motion tunables (datasheet section 9.4) -----

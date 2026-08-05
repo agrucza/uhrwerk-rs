@@ -202,6 +202,9 @@ impl Qmi8658 {
             gyro_x:   i16::from_le_bytes([buf[8],  buf[9]]).saturating_sub(self.gyro_bias.0),
             gyro_y:   i16::from_le_bytes([buf[10], buf[11]]).saturating_sub(self.gyro_bias.1),
             gyro_z:   i16::from_le_bytes([buf[12], buf[13]]).saturating_sub(self.gyro_bias.2),
+            // The QMI8658 has a pedometer engine, but it isn't wired
+            // up yet - see the seam docs on `ImuData::steps`.
+            steps: None,
         })
     }
 

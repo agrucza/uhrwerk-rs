@@ -24,6 +24,10 @@ pub struct Capabilities {
     /// A GNSS receiver with a sync task listening on the GPS command
     /// channel (currently the T-Watch Ultra's MIA-M10Q).
     pub gps: bool,
+    /// An IMU whose step-counter engine is wired through the motion
+    /// pipeline (currently the T-Watch Ultra's BHI260AP). Gates the
+    /// clock-face steps readout and the MOTION view's STEPS panel.
+    pub steps: bool,
 }
 
 // ============================================================================
@@ -154,6 +158,10 @@ pub struct MotionData {
     pub gyro_y: i16,
     pub gyro_z: i16,
     pub temp_raw: i16,
+    /// Step-counter running total (cumulative since the chip's
+    /// engine last started); `None` on boards without a wired
+    /// pedometer. Daily semantics live in the Model, not here.
+    pub steps: Option<u32>,
 }
 
 impl From<&ImuData> for MotionData {
@@ -166,6 +174,7 @@ impl From<&ImuData> for MotionData {
             gyro_y: d.gyro_y,
             gyro_z: d.gyro_z,
             temp_raw: d.temp_raw,
+            steps: d.steps,
         }
     }
 }

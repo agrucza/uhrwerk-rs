@@ -171,6 +171,12 @@ pub struct Model {
     /// Cleared by any user activity; expiry in `tick` re-enters
     /// sleep.
     motion_wake_grace: Option<Instant>,
+    /// Last step-counter running total seen from the IMU. The first
+    /// observation after boot is the baseline (no steps credited);
+    /// afterwards each increase is added to `steps_today`. A total
+    /// BELOW the previous one means the chip's engine restarted from
+    /// zero - the new total then counts in full.
+    last_step_total: Option<u32>,
 }
 
 /// Audio mode of the mic-test diagnostic, mirrored by the model so its
@@ -226,6 +232,7 @@ impl Model {
             mic_test: MicTestMode::Off,
             mic_resume_on_wake: None,
             motion_wake_grace: None,
+            last_step_total: None,
         }
     }
 
@@ -471,6 +478,12 @@ impl Model {
     fn apply_snapshot(&mut self, event: &SystemEvent, out: &mut Effects) {
         match event {
             SystemEvent::TimeUpdated { data } => {
+                // Day rollover zeroes the daily step count. Covers
+                // midnight and any time-set that lands on another
+                // day (GPS sync, manual set).
+                if data.day != self.cached_data.time.day {
+                    self.cached_data.steps_today = 0;
+                }
                 self.cached_data.time = *data;
                 // Re-evaluate the next-firing alarm against the
                 // new time. Catches alarms whose fire-time the
@@ -482,6 +495,18 @@ impl Model {
             }
             SystemEvent::MotionUpdated { data } => {
                 self.cached_data.motion = *data;
+                if let Some(total) = data.steps {
+                    // See `last_step_total` for the baseline /
+                    // restart semantics. No redraw here: the clock
+                    // face repaints on the 1 Hz TimeUpdated tick and
+                    // picks the new value up within a second.
+                    if let Some(prev) = self.last_step_total {
+                        let delta = if total >= prev { total - prev } else { total };
+                        self.cached_data.steps_today =
+                            self.cached_data.steps_today.saturating_add(delta);
+                    }
+                    self.last_step_total = Some(total);
+                }
             }
             SystemEvent::ImuIdentified { name } => {
                 self.cached_data.imu_name = name;
@@ -1177,6 +1202,48 @@ mod tests {
             Config::default(),
             Instant::from_millis(0),
         )
+    }
+
+    /// A MotionUpdated event carrying only a step-counter total.
+    fn step_event(total: u32) -> SystemEvent {
+        SystemEvent::MotionUpdated {
+            data: crate::data::MotionData {
+                steps: Some(total),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn steps_accumulate_from_hub_total_deltas() {
+        let mut m = fresh();
+        // First total is the baseline - nothing credited yet.
+        m.handle_event(&step_event(120), Instant::from_millis(0));
+        assert_eq!(m.cached_data().steps_today, 0);
+        // Increases count as their delta.
+        m.handle_event(&step_event(150), Instant::from_millis(1_000));
+        assert_eq!(m.cached_data().steps_today, 30);
+        // A total below the previous one means the hub restarted at
+        // zero - the new total counts in full on top of the bank.
+        m.handle_event(&step_event(7), Instant::from_millis(2_000));
+        assert_eq!(m.cached_data().steps_today, 37);
+    }
+
+    #[test]
+    fn steps_reset_on_day_rollover_but_keep_hub_baseline() {
+        let mut m = fresh();
+        m.handle_event(&step_event(0), Instant::from_millis(0));
+        m.handle_event(&step_event(500), Instant::from_millis(1_000));
+        assert_eq!(m.cached_data().steps_today, 500);
+        // Midnight: a TimeUpdated on a new day zeroes the count...
+        let mut t = m.cached_data().time;
+        t.day = t.day % 28 + 1;
+        m.handle_event(&SystemEvent::TimeUpdated { data: t }, Instant::from_millis(2_000));
+        assert_eq!(m.cached_data().steps_today, 0);
+        // ...without disturbing the hub baseline: the next total
+        // still credits only its delta.
+        m.handle_event(&step_event(510), Instant::from_millis(3_000));
+        assert_eq!(m.cached_data().steps_today, 10);
     }
 
     #[test]

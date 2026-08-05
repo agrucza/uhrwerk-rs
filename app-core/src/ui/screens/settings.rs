@@ -1064,12 +1064,14 @@ impl SettingsScreen {
 // Live IMU + temperature readouts at the top, self-test panels with
 // RUN buttons below. Stacked tall enough to need smooth scrolling.
 
-/// Tag-labels for the 7 live readout panels (3 accel axes, 3 gyro
-/// axes, 1 environment temperature).
-const MOTION_LABELS: [&str; 7] = [
+/// Tag-labels for the live readout panels (3 accel axes, 3 gyro
+/// axes, 1 environment temperature, plus the raw step-counter total
+/// on boards with the steps capability - the layout drops the last
+/// entry elsewhere).
+const MOTION_LABELS: [&str; 8] = [
     "ACCEL X", "ACCEL Y", "ACCEL Z",
     "GYRO X",  "GYRO Y",  "GYRO Z",
-    "TEMP",
+    "TEMP",    "STEPS",
 ];
 
 /// Height of one live readout panel.
@@ -1100,15 +1102,18 @@ const MOTION_TEST_BUTTON_H: i32 = 36;
 const MOTION_INTER_TEST_GAP: i32 = 16;
 
 struct MotionLayout {
-    /// One rect per `MOTION_LABELS` entry.
-    readouts: [Rectangle; 7],
+    /// One rect per `MOTION_LABELS` entry; the STEPS slot is a
+    /// zero-size placeholder when the board lacks the capability.
+    readouts: [Rectangle; 8],
+    /// How many leading `readouts` entries are real (7 or 8).
+    readout_count: usize,
     /// `(panel, button)` pairs in `IMU_TESTS` order.
     tests: [(Rectangle, Rectangle); 2],
     /// Total content height; passed to the smooth-scroll helpers.
     content_h: i32,
 }
 
-fn motion_layout(scroll: i32) -> MotionLayout {
+fn motion_layout(scroll: i32, has_steps: bool) -> MotionLayout {
     let mut s = layout::VStack::new(LEAF_TOP_Y - scroll);
 
     let r0 = s.slot(MOTION_READOUT_H); s.gap(MOTION_READOUT_GAP);
@@ -1118,6 +1123,12 @@ fn motion_layout(scroll: i32) -> MotionLayout {
     let r4 = s.slot(MOTION_READOUT_H); s.gap(MOTION_READOUT_GAP);
     let r5 = s.slot(MOTION_READOUT_H); s.gap(MOTION_READOUT_GAP);
     let r6 = s.slot(MOTION_READOUT_H);
+    let r7 = if has_steps {
+        s.gap(MOTION_READOUT_GAP);
+        s.slot(MOTION_READOUT_H)
+    } else {
+        Rectangle::zero()
+    };
     s.gap(MOTION_SECTION_GAP);
 
     let p0 = s.slot(MOTION_TEST_PANEL_H);
@@ -1130,7 +1141,8 @@ fn motion_layout(scroll: i32) -> MotionLayout {
 
     let content_h = s.cursor_y() + scroll - LEAF_TOP_Y;
     MotionLayout {
-        readouts: [r0, r1, r2, r3, r4, r5, r6],
+        readouts: [r0, r1, r2, r3, r4, r5, r6, r7],
+        readout_count: if has_steps { 8 } else { 7 },
         tests: [(p0, b0), (p1, b1)],
         content_h,
     }
@@ -1161,6 +1173,7 @@ fn motion_changed(prev: &crate::data::MotionData, curr: &crate::data::MotionData
         (prev.temp_raw, curr.temp_raw, MOTION_TEMP_THRESHOLD),
     ];
     pairs.iter().any(|(p, c, t)| ((*p as i32) - (*c as i32)).abs() >= *t)
+        || prev.steps != curr.steps
 }
 
 /// Format the live value for the readout at `idx`, into `buf`.
@@ -1175,6 +1188,12 @@ fn motion_value(idx: usize, data: &SystemData, buf: &mut heapless::String<12>) {
         4 => write!(buf, "{}", m.gyro_y),
         5 => write!(buf, "{}", m.gyro_z),
         6 => write!(buf, "{} C", m.temp_raw / 256),
+        // Raw hub total (diagnostic) - the daily figure lives on the
+        // clock face. "--" until the first step event arrives.
+        7 => match m.steps {
+            Some(s) => write!(buf, "{}", s),
+            None => write!(buf, "--"),
+        },
         _ => Ok(()),
     };
 }
@@ -1205,14 +1224,14 @@ impl SettingsScreen {
         draw_header(display, data, "MOTION", theme::SIGNAL, ctx);
 
         let scroll = self.imu_scroll.offset();
-        let layout = motion_layout(scroll);
+        let layout = motion_layout(scroll, data.capabilities.steps);
 
         render_scrolled(
             display, scroll, motion_viewport_rect(), layout.content_h, theme::SIGNAL, ctx,
             |clipped, _| {
                 // Live readouts.
                 let mut value_buf: heapless::String<12> = heapless::String::new();
-                for i in 0..MOTION_LABELS.len() {
+                for i in 0..layout.readout_count {
                     value_buf.clear();
                     motion_value(i, data, &mut value_buf);
                     draw_motion_panel(
@@ -1293,7 +1312,7 @@ impl SettingsScreen {
 
             // Drag scroll for the live + self-tests stack.
             SystemEvent::TouchPressed { .. } | SystemEvent::TouchReleased => {
-                let layout = motion_layout(0);
+                let layout = motion_layout(0, data.capabilities.steps);
                 let viewport_h = motion_viewport_rect().size.height as i32;
                 if handle_scroll_drag(
                     &mut self.imu_scroll, event, viewport_h, layout.content_h,
@@ -1306,7 +1325,7 @@ impl SettingsScreen {
             // Self-test button tap.
             SystemEvent::Tap { x, y } => {
                 let scroll = self.imu_scroll.offset();
-                let layout = motion_layout(scroll);
+                let layout = motion_layout(scroll, data.capabilities.steps);
                 let pt = Point::new(*x as i32, *y as i32);
                 for (i, test) in IMU_TESTS.iter().enumerate() {
                     let (_, button_rect) = layout.tests[i];

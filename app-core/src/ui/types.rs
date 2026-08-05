@@ -793,6 +793,12 @@ pub struct SystemData {
     /// `SystemEvent::GpsSyncUpdated`. Only ever leaves `Idle` on
     /// boards whose capabilities include GPS.
     pub gps_sync: crate::data::GpsSyncState,
+
+    /// Steps taken today, accumulated by the Model from the IMU's
+    /// running total (`MotionData::steps`) and zeroed at the local-
+    /// midnight day rollover. RAM-only: a reboot loses the day so
+    /// far. Stays 0 on boards without the steps capability.
+    pub steps_today: u32,
 }
 
 // -- Screen trait -------------------------------------------------------------

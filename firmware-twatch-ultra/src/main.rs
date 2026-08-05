@@ -355,10 +355,11 @@ impl Bringup for TwatchUltraBringup {
         );
     }
 
-    /// This board carries a GNSS receiver with a live sync task -
-    /// the settings GPS view shows up because of this flag.
+    /// This board carries a GNSS receiver with a live sync task (the
+    /// settings GPS view) and a BHI260AP whose step counter feeds the
+    /// motion pipeline (clock-face steps + MOTION STEPS panel).
     fn capabilities(&self) -> app_core::data::Capabilities {
-        app_core::data::Capabilities { gps: true }
+        app_core::data::Capabilities { gps: true, steps: true }
     }
 }
 

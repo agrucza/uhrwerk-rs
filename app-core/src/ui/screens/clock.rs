@@ -8,8 +8,9 @@
 //!    Model into Quick Access).
 //! 3. Stacked numerals: HH in signal red, MM directly below in bone.
 //!    Both rendered in the geometric `Mega` (logisoso78) face, digits
-//!    only. Meta row beneath: `:SS` in cyan + `LAT .. LON ..` in
-//!    chrome.
+//!    only. Meta row beneath: `:SS` in cyan + today's step count in
+//!    chrome on step-capable boards (the spec's `LAT .. LON ..`
+//!    filler elsewhere - static, no real telemetry behind it).
 //! 4. Two chamfered info tiles at the bottom (via `info_tile` +
 //!    `layout::bottom_tile_row::<2>()`):
 //!    - left: yellow border, bell glyph, next enabled alarm time
@@ -122,6 +123,9 @@ struct RenderedSnapshot {
     /// dirty_rects only fires the bottom rect when the visible string
     /// would change.
     timer_secs: u64,
+    /// Daily step count at last render (always 0 on boards without
+    /// the steps capability, so the compare stays inert there).
+    steps: u32,
 }
 
 pub struct ClockScreen {
@@ -187,6 +191,9 @@ impl Screen for ClockScreen {
         if prev.timer_secs != data.timer.remaining().as_secs() {
             region.add(BOTTOM_RECT);
         }
+        if prev.steps != data.steps_today {
+            region.add(META_RECT);
+        }
         region
     }
 
@@ -198,6 +205,7 @@ impl Screen for ClockScreen {
             day: data.time.day,
             month: data.time.month,
             timer_secs: data.timer.remaining().as_secs(),
+            steps: data.steps_today,
         });
         self.force_full_next = false;
     }
@@ -325,9 +333,17 @@ fn draw_meta_row<D: DrawTarget<Color = Rgb565>>(
     let _ = write!(ss, ":{:02}", data.time.second);
 
     // Measure the seconds glyph width so we can place it and the
-    // LAT/LON string side-by-side, separated by a fixed gap.
+    // right-hand string side-by-side, separated by a fixed gap.
+    // Steps on step-capable boards; the spec's static LAT/LON
+    // filler elsewhere.
     let ss_w = fonts::measure_width(&font, ss.as_str());
-    let coords = "LAT 0.8314  LON 2.6";
+    let mut steps_buf: String<16> = String::new();
+    let coords: &str = if data.capabilities.steps {
+        let _ = write!(steps_buf, "{} STEPS", data.steps_today);
+        steps_buf.as_str()
+    } else {
+        "LAT 0.8314  LON 2.6"
+    };
     let coords_w = fonts::measure_width(&font, coords);
     let gap = 14i32;
     let group_w = ss_w + gap + coords_w;

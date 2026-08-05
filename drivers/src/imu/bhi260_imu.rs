@@ -2,8 +2,9 @@
 //!
 //! Bridges the hub's virtual-sensor world onto the IMU task's simple
 //! needs: continuous accel+gyro snapshots while awake, a wake-up
-//! motion sensor while the system sleeps, and the two boot
-//! self-tests. Chip specifics stay here; the task sees only the seam.
+//! motion sensor while the system sleeps, an always-on step counter,
+//! and the two boot self-tests. Chip specifics stay here; the task
+//! sees only the seam.
 //!
 //! Bring-up is a state machine driven by [`Bhi260Imu::boot_step`] -
 //! one short bus transaction per call - because the mandatory
@@ -56,6 +57,18 @@ const AWAKE_RATE_HZ: f32 = 25.0;
 /// (gesture/motion sensors are on-change or one-shot - the rate
 /// mainly gates their underlying accel).
 const WOM_RATE_HZ: f32 = 25.0;
+
+/// Step-counter candidates in preference order: the BSX step counter
+/// (52), else the auxiliary variant (136). Non-wake-up on purpose:
+/// the total accumulates hub-side straight through host sleep
+/// without ever asserting the wake line - the host reads the newest
+/// total from the non-wake FIFO whenever it is next awake. The
+/// sensor is on-change, so the rate only gates its underlying accel.
+const STEP_PREFERRED: [u8; 2] = [
+    fifo::event_id::STEP_COUNTER,
+    fifo::event_id::AUX_STEP_COUNTER,
+];
+const STEP_RATE_HZ: f32 = 25.0;
 
 /// Requested dynamic ranges (SI units). Accel matches the
 /// normalization target exactly; 250 dps is the closest supported
@@ -190,6 +203,10 @@ pub struct Bhi260Imu {
     /// GPIO wake sources still apply).
     wake_sensors: [u8; 8],
     wake_count: usize,
+    /// Step-counter virtual sensor picked at discovery (first present
+    /// member of [`STEP_PREFERRED`]); `None` if the firmware offers
+    /// none - `ImuData::steps` then stays `None`.
+    step_sensor: Option<u8>,
     /// Wake attribution deferred out of the USB-JTAG mangle zone:
     /// the sensor id drained at wake, announced by the first awake
     /// `read` (whose log line survives, unlike lines printed at the
@@ -237,6 +254,7 @@ impl Bhi260Imu {
             gyro_range_si: 2000, // chip default until read back
             wake_sensors: [0; 8],
             wake_count: 0,
+            step_sensor: None,
             announce_wake: None,
             last: ImuData::default(),
             st: None,
@@ -427,6 +445,13 @@ impl Bhi260Imu {
                         &self.wake_sensors[..self.wake_count],
                     );
                 }
+                self.step_sensor = STEP_PREFERRED
+                    .into_iter()
+                    .find(|&id| Bhi260::sensor_present(&map, id));
+                match self.step_sensor {
+                    Some(id) => log::info!("IMU: step counter available (sensor {})", id),
+                    None => log::warn!("IMU: firmware offers no step counter"),
+                }
                 self.phase = Phase::Enable;
                 BootStep::Pending { delay_ms: 1 }
             }
@@ -491,6 +516,12 @@ impl Bhi260Imu {
                     let _ = self
                         .drv
                         .configure_sensor(i2c, self.wake_sensors[i], WOM_RATE_HZ, 0);
+                }
+                // Step counter joins the always-on set (it survives
+                // sleep entry untouched - see STEP_PREFERRED). Non-
+                // fatal like the gestures; the watchdog re-arms it.
+                if let Some(id) = self.step_sensor {
+                    let _ = self.drv.configure_sensor(i2c, id, STEP_RATE_HZ, 0);
                 }
                 // The gesture enables may latch a benign rate
                 // complaint (0x55 - the framework grumbles about the
@@ -737,8 +768,8 @@ impl Bhi260Imu {
         }
         let mut p = fifo::Parser::new(&buf[..n]);
         while let Some(ev) = p.next_event() {
-            if let fifo::Event::Vector3 { id, x, y, z } = ev {
-                match id {
+            match ev {
+                fifo::Event::Vector3 { id, x, y, z } => match id {
                     STREAM_ACCEL => {
                         self.last.accel_x = rescale(x, self.accel_range_si, NORM_ACCEL_RANGE_G);
                         self.last.accel_y = rescale(y, self.accel_range_si, NORM_ACCEL_RANGE_G);
@@ -751,7 +782,13 @@ impl Bhi260Imu {
                         self.last.gyro_z = rescale(z, self.gyro_range_si, NORM_GYRO_RANGE_DPS);
                     }
                     _ => {}
+                },
+                // On-change total from the step counter; the newest
+                // event wins within a drain.
+                fifo::Event::StepCount { steps, .. } => {
+                    self.last.steps = Some(steps);
                 }
+                _ => {}
             }
         }
         if let Some(id) = p.lost_sync {
@@ -769,9 +806,11 @@ impl Bhi260Imu {
         Ok(self.last.clone())
     }
 
-    /// Sleep mode: continuous sensors off, wake-up motion sensor on,
-    /// hub told the host is suspending (only wake-up sensors then
-    /// assert the interrupt - Section 16.3).
+    /// Sleep mode: continuous sensors off (the step counter stays
+    /// running - it is non-wake-up and counts through host sleep),
+    /// wake-up motion sensor on, hub told the host is suspending
+    /// (only wake-up sensors then assert the interrupt -
+    /// Section 16.3).
     pub fn enter_wom<I: I2cTrait>(&mut self, i2c: &mut I) {
         if !self.is_ready() {
             return;
@@ -920,6 +959,11 @@ impl Bhi260Imu {
         for i in 0..self.wake_count {
             off = off
                 .and_then(|_| self.drv.configure_sensor(i2c, self.wake_sensors[i], 0.0, 0));
+        }
+        // The step counter holds the physical accel Active too - it
+        // must quiesce with the rest or the test never starts.
+        if let Some(id) = self.step_sensor {
+            off = off.and_then(|_| self.drv.configure_sensor(i2c, id, 0.0, 0));
         }
         if off.is_err() {
             self.restore_running(i2c);
@@ -1117,6 +1161,9 @@ impl Bhi260Imu {
             r = r.and_then(|_| {
                 self.drv.configure_sensor(i2c, self.wake_sensors[i], WOM_RATE_HZ, 0)
             });
+        }
+        if let Some(id) = self.step_sensor {
+            r = r.and_then(|_| self.drv.configure_sensor(i2c, id, STEP_RATE_HZ, 0));
         }
         r = r
             .and_then(|_| {
