@@ -39,9 +39,10 @@ use system_core::bus::{
     self, GpsCommand, RtcCommand, SharedI2c, EVENTS, GPS_COMMAND, RTC_COMMAND,
 };
 
-/// How long a sync session may hunt before giving up and powering
-/// the receiver back down. Cold start under open sky needs ~30 s;
-/// indoors it may never fix - this bounds the battery cost.
+/// How long a manual (`SyncOnce`) session may hunt before giving up
+/// and powering the receiver back down. Cold start under open sky
+/// needs ~30 s; indoors it may never fix - this bounds the battery
+/// cost. Tracking sessions carry their own budget in the command.
 const SESSION_BUDGET_SECS: u64 = 120;
 
 /// Cadence of the session's progress log line and status event.
@@ -55,13 +56,24 @@ pub async fn gps_task(
     mut rx: p::GPIO44<'static>,
 ) {
     loop {
-        let GpsCommand::SyncOnce { tz_offset_minutes } = GPS_COMMAND.wait().await;
+        let (tz_offset_minutes, budget_secs) = match GPS_COMMAND.wait().await {
+            GpsCommand::SyncOnce { tz_offset_minutes } => {
+                (tz_offset_minutes, SESSION_BUDGET_SECS)
+            }
+            GpsCommand::TrackOnce { tz_offset_minutes, budget_secs } => {
+                (tz_offset_minutes, budget_secs as u64)
+            }
+            // Nothing running to abort - the toggle-off raced a
+            // session that already ended.
+            GpsCommand::Abort => continue,
+        };
         run_sync_session(
             i2c_bus,
             uart.reborrow(),
             tx.reborrow(),
             rx.reborrow(),
             tz_offset_minutes,
+            budget_secs,
         )
         .await;
     }
@@ -103,6 +115,7 @@ async fn run_sync_session(
     tx: p::GPIO43<'_>,
     rx: p::GPIO44<'_>,
     tz_offset_minutes: i16,
+    budget_secs: u64,
 ) {
     // Held for the whole session (any exit path drops it): the
     // manager idles across heartbeats instead of hardware-sleeping,
@@ -143,11 +156,12 @@ async fn run_sync_session(
     // Read NAV-PVT until time + fix are in hand or the budget runs
     // out.
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(SESSION_BUDGET_SECS);
+    let deadline = started + Duration::from_secs(budget_secs);
     let mut next_status = started + Duration::from_secs(STATUS_LOG_SECS);
     let mut time_synced = false;
     let mut synced_local: Option<(u8, u8)> = None;
     let mut got_fix = false;
+    let mut aborted = false;
     let mut buf = [0u8; 64];
     // Latest solution, session-persistent - the status tick reports
     // from this, never from the current read batch (the tick almost
@@ -156,6 +170,15 @@ async fn run_sync_session(
     let mut rx_errors: u32 = 0;
 
     while Instant::now() < deadline && !(time_synced && got_fix) {
+        // Abort lands here mid-session (tracking toggled off). Any
+        // other command surfacing now is stale by definition - the
+        // model never kicks while a session is running and the
+        // SYNC button is tap-blocked - so consuming it is safe.
+        if let Some(GpsCommand::Abort) = GPS_COMMAND.try_take() {
+            log::info!("GPS: session aborted");
+            aborted = true;
+            break;
+        }
         let n = match select(
             port.read_async(&mut buf),
             Timer::at(deadline.min(next_status)),
@@ -251,9 +274,14 @@ async fn run_sync_session(
             publish_fix(pvt);
         }
     }
-    publish(match synced_local {
-        Some((hour, minute)) => GpsSyncState::Synced { hour, minute },
-        None => GpsSyncState::NoSignal,
+    publish(if aborted {
+        // Back to READY, not NO SIGNAL - the user ended this one.
+        GpsSyncState::Idle
+    } else {
+        match synced_local {
+            Some((hour, minute)) => GpsSyncState::Synced { hour, minute },
+            None => GpsSyncState::NoSignal,
+        }
     });
     log::info!(
         "GPS: session done in {} s - time {}, fix {}",

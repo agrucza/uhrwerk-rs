@@ -259,6 +259,16 @@ pub enum Action {
     /// real-world UTC offset range and marks config dirty; the next
     /// `TouchReleased` persists it.
     AdjustTimezone { delta_min: i16 },
+
+    /// Flip `config.gps_tracking_enabled` (the settings GPS view's
+    /// TRACKING toggle). Enabling kicks the first session
+    /// immediately; disabling aborts one in flight.
+    ToggleGpsTracking,
+
+    /// Select the tracking cadence (the settings GPS view's
+    /// CONT/15S/30S/60S buttons). A remembered preference - takes
+    /// effect from the next kick when tracking is enabled.
+    SetGpsCadence { cadence: crate::config::GpsTrackingCadence },
 }
 
 // -- Persistent app state ----------------------------------------------------
@@ -805,6 +815,15 @@ pub struct SystemData {
     /// (and always on boards without GPS). Not live - see
     /// [`crate::data::GpsFix`].
     pub gps_fix: Option<crate::data::GpsFix>,
+
+    /// Seconds until the tracking scheduler kicks the next GPS
+    /// session; `None` while a session is running (or kicked), when
+    /// tracking is off, or on boards without GPS. Recomputed by the
+    /// Model on every `TimeUpdated` - lets the settings STATUS
+    /// panel say what the receiver is doing between sessions
+    /// (powered down, waiting) instead of parroting the previous
+    /// session's outcome.
+    pub gps_next_session_secs: Option<u32>,
 }
 
 // -- Screen trait -------------------------------------------------------------

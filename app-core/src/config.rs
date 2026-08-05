@@ -99,6 +99,48 @@ pub struct Config {
     /// -12 h .. +14 h (the real-world UTC offset span).
     #[cfg_attr(feature = "serde", serde(default = "default_tz_offset"))]
     pub tz_offset_minutes: i16,
+    /// GPS tracking on/off - the switch the settings toggle and the
+    /// no-fix auto-off flip. The cadence below is a separate,
+    /// remembered preference. The model schedules the sessions (the
+    /// GPS task can't self-time: embassy timers pause during
+    /// hardware light sleep) and auto-disables after consecutive
+    /// fixless sessions so an indoor evening doesn't drain the
+    /// battery.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub gps_tracking_enabled: bool,
+    /// Session cadence used while tracking is enabled. Kept when
+    /// tracking is off (including auto-off) so re-enabling resumes
+    /// the user's pick.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub gps_tracking_cadence: GpsTrackingCadence,
+}
+
+/// Cadence of GPS tracking sessions. `Continuous` re-kicks a
+/// full-budget session the moment the last one ends (receiver
+/// effectively always on - a deliberate navigation-style mode,
+/// hours of battery, not days); the interval modes run short
+/// hot-start sessions with the rail off in between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GpsTrackingCadence {
+    Continuous,
+    Every15s,
+    Every30s,
+    #[default]
+    Every60s,
+}
+
+impl GpsTrackingCadence {
+    /// Seconds between session kicks; 0 = continuous (re-kick as
+    /// soon as the previous session reports a terminal state).
+    pub fn interval_secs(self) -> u32 {
+        match self {
+            GpsTrackingCadence::Continuous => 0,
+            GpsTrackingCadence::Every15s => 15,
+            GpsTrackingCadence::Every30s => 30,
+            GpsTrackingCadence::Every60s => 60,
+        }
+    }
 }
 
 impl Config {
@@ -120,6 +162,8 @@ impl Config {
         sound_enabled: true,
         dnd: false,
         tz_offset_minutes: 120,
+        gps_tracking_enabled: false,
+        gps_tracking_cadence: GpsTrackingCadence::Every60s,
     };
 
     /// Clamp bounds for `tz_offset_minutes`: UTC-12:00 (Baker

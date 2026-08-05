@@ -177,7 +177,36 @@ pub struct Model {
     /// BELOW the previous one means the chip's engine restarted from
     /// zero - the new total then counts in full.
     last_step_total: Option<u32>,
+    /// `uptime_secs` at the last tracking-session kick; `None` means
+    /// the next due-check kicks immediately. Uptime (RTC slow clock)
+    /// rather than an embassy Instant because the cadence must keep
+    /// counting through light sleep.
+    last_track_kick: Option<u32>,
+    /// Consecutive tracking sessions that ended `NoSignal`. At
+    /// [`TRACK_AUTO_OFF_FAILURES`] the model flips
+    /// `gps_tracking_enabled` off - fixless sessions mean indoors,
+    /// where the receiver burns acquisition current forever.
+    track_failures: u8,
+    /// A tracking kick is in flight but the task hasn't reported
+    /// yet. Scheduler bookkeeping ONLY - `gps_sync` stays the
+    /// task's reported truth. Cleared by the next `GpsSyncUpdated`
+    /// (or by toggling tracking off, where a queued kick may have
+    /// been overwritten by the Abort).
+    track_pending: bool,
 }
+
+/// Consecutive fixless tracking sessions before tracking turns
+/// itself off.
+const TRACK_AUTO_OFF_FAILURES: u8 = 3;
+
+/// Session budget handed to interval-mode tracking kicks. Outdoors
+/// the receiver hot-starts from BBR in a few seconds; 30 s covers a
+/// warm start without approaching the 120 s manual-sync hunt.
+const TRACK_BUDGET_INTERVAL_SECS: u16 = 30;
+
+/// Session budget for continuous-mode kicks - the full manual-sync
+/// hunt; the model re-kicks the moment a session ends.
+const TRACK_BUDGET_CONTINUOUS_SECS: u16 = 120;
 
 /// Audio mode of the mic-test diagnostic, mirrored by the model so its
 /// safety nets know which stop command ends the active session.
@@ -233,6 +262,9 @@ impl Model {
             mic_resume_on_wake: None,
             motion_wake_grace: None,
             last_step_total: None,
+            last_track_kick: None,
+            track_failures: 0,
+            track_pending: false,
         }
     }
 
@@ -489,6 +521,7 @@ impl Model {
                 // new time. Catches alarms whose fire-time the
                 // clock just crossed.
                 self.replan_alarms(out, false);
+                self.maybe_kick_tracking(out);
             }
             SystemEvent::PowerUpdated { data } => {
                 self.cached_data.power = *data;
@@ -596,6 +629,10 @@ impl Model {
                 self.needs_redraw = true;
             }
             SystemEvent::GpsSyncUpdated { state } => {
+                // The task has spoken for the kicked session (any
+                // event counts - even an unchanged one proves it is
+                // alive and reporting).
+                self.track_pending = false;
                 // Cache + repaint only on change: the task re-emits
                 // Syncing on a fixed cadence even when nothing moved,
                 // and a dark sleeping display doesn't need frames at
@@ -603,24 +640,53 @@ impl Model {
                 // display-state gated).
                 if self.cached_data.gps_sync != *state {
                     use crate::data::GpsSyncState;
+                    let tracking = self.config.gps_tracking_enabled;
                     // Tactile milestones for sessions run at arm's
                     // length outdoors (screen dark or unreadable):
                     // short pulse when the first position fix lands,
                     // longer one when the session ends time-synced.
                     // The manager gates MotorPulse on
                     // haptics_enabled like every other buzz.
+                    // Suppressed while tracking - a buzz per session
+                    // at 15-60 s cadence would be a nuisance, and
+                    // tracking sessions are nobody's milestone.
                     let had_fix = matches!(
                         self.cached_data.gps_sync,
                         GpsSyncState::Syncing { fix_ok: true, .. },
                     );
                     match state {
-                        GpsSyncState::Syncing { fix_ok: true, .. } if !had_fix => {
+                        GpsSyncState::Syncing { fix_ok: true, .. }
+                            if !had_fix && !tracking =>
+                        {
                             let _ = out.push(Effect::MotorPulse { duration_ms: 120 });
                         }
-                        GpsSyncState::Synced { .. } => {
+                        GpsSyncState::Synced { .. } if !tracking => {
                             let _ = out.push(Effect::MotorPulse { duration_ms: 350 });
                         }
                         _ => {}
+                    }
+                    // Tracking auto-off: consecutive fixless
+                    // sessions mean indoors, where each session
+                    // burns the full budget in acquisition. The
+                    // cadence preference survives; only the enable
+                    // flips.
+                    if tracking {
+                        match state {
+                            GpsSyncState::NoSignal => {
+                                self.track_failures += 1;
+                                if self.track_failures >= TRACK_AUTO_OFF_FAILURES {
+                                    self.config.gps_tracking_enabled = false;
+                                    self.cached_data.config = self.config;
+                                    self.config_dirty = true;
+                                    self.track_failures = 0;
+                                }
+                            }
+                            GpsSyncState::Syncing { fix_ok: true, .. }
+                            | GpsSyncState::Synced { .. } => {
+                                self.track_failures = 0;
+                            }
+                            _ => {}
+                        }
                     }
                     self.cached_data.gps_sync = *state;
                     self.needs_redraw = true;
@@ -906,12 +972,10 @@ impl Model {
                 let _ = out.push(Effect::GpsCommand(GpsCommand::SyncOnce {
                     tz_offset_minutes: self.config.tz_offset_minutes,
                 }));
-                // Optimistic transition so the SYNC button disables
-                // on the very tap; the task's first real Syncing
-                // event overwrites the placeholder counts.
-                self.cached_data.gps_sync =
-                    crate::data::GpsSyncState::Syncing { sats: 0, fix_ok: false };
-                self.needs_redraw = true;
+                // No optimistic status write: `gps_sync` is the
+                // task's reported state, and the task publishes
+                // Syncing as its first act of the session -
+                // milliseconds behind the tap.
             }
             Action::AdjustTimezone { delta_min } => {
                 self.config.tz_offset_minutes = (self.config.tz_offset_minutes
@@ -921,6 +985,101 @@ impl Model {
                 self.config_dirty = true;
                 self.needs_redraw = true;
             }
+            Action::ToggleGpsTracking => {
+                self.config.gps_tracking_enabled = !self.config.gps_tracking_enabled;
+                self.cached_data.config = self.config;
+                self.config_dirty = true;
+                self.track_failures = 0;
+                self.last_track_kick = None;
+                if self.config.gps_tracking_enabled {
+                    // First session right away - the toggle should
+                    // answer with visible activity, not after one
+                    // full interval.
+                    self.kick_track_session(out);
+                } else {
+                    // Abort whatever may be running or queued. A
+                    // fast on-off can overwrite the still-queued
+                    // kick (single-slot signal) - the task then
+                    // consumes the Abort as a no-op and no state is
+                    // left dangling, because the status cache only
+                    // ever holds what the task actually reported.
+                    if self.track_pending
+                        || matches!(
+                            self.cached_data.gps_sync,
+                            crate::data::GpsSyncState::Syncing { .. },
+                        )
+                    {
+                        let _ = out.push(Effect::GpsCommand(GpsCommand::Abort));
+                    }
+                    self.track_pending = false;
+                    self.cached_data.gps_next_session_secs = None;
+                }
+                self.needs_redraw = true;
+            }
+            Action::SetGpsCadence { cadence } => {
+                if self.config.gps_tracking_cadence != cadence {
+                    self.config.gps_tracking_cadence = cadence;
+                    self.cached_data.config = self.config;
+                    self.config_dirty = true;
+                    self.needs_redraw = true;
+                }
+            }
+        }
+    }
+
+    /// Emit one tracking-session kick and stamp the schedule.
+    /// `gps_sync` is deliberately NOT touched - it holds only what
+    /// the task reports; `track_pending` bridges the gap until the
+    /// task's first event lands.
+    fn kick_track_session(&mut self, out: &mut Effects) {
+        let continuous = self.config.gps_tracking_cadence
+            == crate::config::GpsTrackingCadence::Continuous;
+        let _ = out.push(Effect::GpsCommand(GpsCommand::TrackOnce {
+            tz_offset_minutes: self.config.tz_offset_minutes,
+            budget_secs: if continuous {
+                TRACK_BUDGET_CONTINUOUS_SECS
+            } else {
+                TRACK_BUDGET_INTERVAL_SECS
+            },
+        }));
+        self.track_pending = true;
+        self.last_track_kick = Some(self.cached_data.uptime_secs);
+    }
+
+    /// Kick the next tracking session when one is due. Runs on every
+    /// `TimeUpdated` (1 Hz awake, heartbeat cadence asleep - so
+    /// intervals quantize to ~5 s while sleeping). Uptime-based:
+    /// embassy time pauses during light sleep, the RTC slow clock
+    /// doesn't.
+    fn maybe_kick_tracking(&mut self, out: &mut Effects) {
+        if !self.config.gps_tracking_enabled || !self.cached_data.capabilities.gps {
+            self.cached_data.gps_next_session_secs = None;
+            return;
+        }
+        // A session is running (task-reported) or kicked-but-not-
+        // yet-reported - either way, don't stack another.
+        if self.track_pending
+            || matches!(
+                self.cached_data.gps_sync,
+                crate::data::GpsSyncState::Syncing { .. },
+            )
+        {
+            self.cached_data.gps_next_session_secs = None;
+            return;
+        }
+        let remaining = match self.last_track_kick {
+            None => 0,
+            Some(at) => self
+                .config
+                .gps_tracking_cadence
+                .interval_secs()
+                .saturating_sub(self.cached_data.uptime_secs.wrapping_sub(at)),
+        };
+        if remaining == 0 {
+            self.kick_track_session(out);
+            self.cached_data.gps_next_session_secs = None;
+        } else {
+            self.cached_data.gps_next_session_secs = Some(remaining);
         }
     }
 
@@ -1249,6 +1408,54 @@ mod tests {
         // still credits only its delta.
         m.handle_event(&step_event(510), Instant::from_millis(3_000));
         assert_eq!(m.cached_data().steps_today, 10);
+    }
+
+    #[test]
+    fn gps_tracking_kicks_and_auto_offs() {
+        let mut d = SystemData::default();
+        d.capabilities.gps = true;
+        let mut c = Config::default();
+        c.gps_tracking_enabled = true;
+        c.gps_tracking_cadence = crate::config::GpsTrackingCadence::Continuous;
+        let mut m = Model::new(d, c, Instant::from_millis(0));
+        let tick = SystemEvent::TimeUpdated { data: m.cached_data().time };
+
+        // Three kick -> session rounds: continuous cadence is due on
+        // every TimeUpdated once the previous session ended. Each
+        // simulated session follows the task's real protocol -
+        // Syncing first, then the terminal state - because both the
+        // change-gate and the failure counter assume that sequence.
+        for _ in 0..3 {
+            let fx = m.handle_event(&tick, Instant::from_millis(0));
+            assert!(fx.iter().any(|e| matches!(
+                e,
+                Effect::GpsCommand(GpsCommand::TrackOnce { .. })
+            )));
+            m.handle_event(
+                &SystemEvent::GpsSyncUpdated {
+                    state: crate::data::GpsSyncState::Syncing { sats: 0, fix_ok: false },
+                },
+                Instant::from_millis(0),
+            );
+            m.handle_event(
+                &SystemEvent::GpsSyncUpdated {
+                    state: crate::data::GpsSyncState::NoSignal,
+                },
+                Instant::from_millis(0),
+            );
+        }
+        // The third failure flips tracking off (cadence preference
+        // survives); the scheduler stays quiet from here.
+        assert!(!m.cached_data().config.gps_tracking_enabled);
+        assert_eq!(
+            m.cached_data().config.gps_tracking_cadence,
+            crate::config::GpsTrackingCadence::Continuous,
+        );
+        let fx = m.handle_event(&tick, Instant::from_millis(0));
+        assert!(!fx.iter().any(|e| matches!(
+            e,
+            Effect::GpsCommand(GpsCommand::TrackOnce { .. })
+        )));
     }
 
     #[test]

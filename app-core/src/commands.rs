@@ -80,6 +80,16 @@ pub enum GpsCommand {
     /// `SystemEvent::GpsSyncUpdated`. Carries the configured
     /// local-time offset so the task stays config-blind.
     SyncOnce { tz_offset_minutes: i16 },
+    /// One tracking session: same pipeline as `SyncOnce` but with a
+    /// caller-chosen budget (short for interval tracking - the
+    /// receiver hot-starts from BBR in a few seconds outdoors; full
+    /// length for continuous mode). The model owns the cadence and
+    /// re-kicks; the task stays schedule-blind.
+    TrackOnce { tz_offset_minutes: i16, budget_secs: u16 },
+    /// Abort the session in flight (tracking switched off mid-
+    /// session): rail down, publish `Idle`. Ignored when no session
+    /// is running.
+    Abort,
 }
 
 /// Main-loop -> IMU task commands.

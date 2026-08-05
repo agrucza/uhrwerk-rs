@@ -26,6 +26,7 @@ use embedded_graphics::{
 use heapless::String;
 use core::fmt::Write;
 
+use crate::config::GpsTrackingCadence;
 use crate::data::GpsSyncState;
 use crate::ui::{fonts, glyphs, layout, theme};
 use crate::ui::types::{
@@ -34,9 +35,9 @@ use crate::ui::types::{
 use crate::ui::widgets::{
     action_row_rects, chamfered_button, chamfered_panel, fmt_2digit, handle_scroll_drag,
     header, header_icon_hit, home_indicator, render_action_row, render_scrolled, row,
-    slider, slider_value_from_x, status_bar, tag_label, ButtonVariant, Picker, RowControl,
-    Wheel, NOTCH, ROW_H, SCROLLBAR_GUTTER, SLIDER_BAR_H, STATUS_BAR_H, TAG_LABEL_H,
-    WHEEL_TOTAL_H,
+    slider, slider_value_from_x, status_bar, tag_label, toggle, ButtonVariant, Picker,
+    RowControl, Wheel, NOTCH, ROW_H, SCROLLBAR_GUTTER, SLIDER_BAR_H, STATUS_BAR_H,
+    TAG_LABEL_H, TOGGLE_H, TOGGLE_W, WHEEL_TOTAL_H,
 };
 
 /// Slider lower bound for brightness in the Display sub-view -
@@ -2170,13 +2171,26 @@ impl SettingsScreen {
             slots.status_panel.top_left.x, slots.status_panel.top_left.y,
             "STATUS", theme::STEEL, NOTCH,
         );
+        // What the receiver is doing NOW. A running session reports
+        // itself; between tracking sessions the receiver is powered
+        // down waiting on the scheduler, and saying so beats
+        // parroting the previous session's outcome. The historical
+        // states only show while nothing is scheduled.
         let mut line: String<24> = String::new();
         match data.gps_sync {
-            GpsSyncState::Idle => { let _ = line.push_str("READY"); }
             GpsSyncState::Syncing { sats, fix_ok } => {
                 let _ = write!(line, "SYNCING - {} SATS", sats);
                 if fix_ok { let _ = line.push_str(" FIX"); }
             }
+            _ if data.config.gps_tracking_enabled => {
+                match data.gps_next_session_secs {
+                    Some(s) => { let _ = write!(line, "NEXT IN {}s", s); }
+                    // Kick in flight (the task reports within
+                    // milliseconds) or first tick pending.
+                    None => { let _ = line.push_str("STARTING..."); }
+                }
+            }
+            GpsSyncState::Idle => { let _ = line.push_str("READY"); }
             GpsSyncState::Synced { hour, minute } => {
                 let _ = write!(line, "SYNCED {:02}:{:02}", hour, minute);
             }
@@ -2247,6 +2261,35 @@ impl SettingsScreen {
         fonts::draw_centered_in_rect(
             display, &fonts::value(), tz.as_str(), tz_rect, theme::FG,
         );
+
+        // Tracking: enable toggle in the tag row, cadence radio row
+        // below. The cadence buttons stay live while tracking is
+        // off - they set a remembered preference, they don't act.
+        chamfered_panel(display, slots.tracking_panel, NOTCH, theme::STEEL, 1);
+        tag_label(
+            display,
+            slots.tracking_panel.top_left.x, slots.tracking_panel.top_left.y,
+            "TRACKING", theme::STEEL, NOTCH,
+        );
+        let t = slots.tracking_toggle;
+        toggle(
+            display,
+            Point::new(
+                t.top_left.x + (t.size.width as i32 - TOGGLE_W) / 2,
+                t.top_left.y + (t.size.height as i32 - TOGGLE_H) / 2,
+            ),
+            data.config.gps_tracking_enabled,
+        );
+        for (i, &(label, cadence)) in TRACKING_CADENCES.iter().enumerate() {
+            let variant = if cadence == data.config.gps_tracking_cadence {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Ghost
+            };
+            chamfered_button(
+                display, slots.tracking_buttons[i], label, variant, theme::SIGNAL,
+            );
+        }
     }
 
     fn gps_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
@@ -2271,6 +2314,17 @@ impl SettingsScreen {
                 if rect_hit(slots.tz_plus, *x, *y) {
                     return Action::AdjustTimezone { delta_min: 15 };
                 }
+                if rect_hit(slots.tracking_toggle, *x, *y) {
+                    return Action::ToggleGpsTracking;
+                }
+                for (i, &(_, cadence)) in TRACKING_CADENCES.iter().enumerate() {
+                    if rect_hit(slots.tracking_buttons[i], *x, *y) {
+                        if cadence == data.config.gps_tracking_cadence {
+                            return Action::None; // already selected
+                        }
+                        return Action::SetGpsCadence { cadence };
+                    }
+                }
                 Action::None
             }
             SystemEvent::Swipe {
@@ -2279,6 +2333,11 @@ impl SettingsScreen {
                 ..
             } => {
                 self.view = SettingsView::Index;
+                Action::Redraw
+            }
+            // The NEXT IN countdown ticks on wall time - repaint per
+            // second, but only while tracking makes it visible.
+            SystemEvent::TimeUpdated { .. } if data.config.gps_tracking_enabled => {
                 Action::Redraw
             }
             _ => Action::None,
@@ -2466,7 +2525,23 @@ struct GpsSlots {
     tz_minus: Rectangle,
     /// +15 min stepper inside `tz_panel`.
     tz_plus: Rectangle,
+    /// Outer chamfered panel for the tracking section.
+    tracking_panel: Rectangle,
+    /// Hit area of the enable toggle in the panel's tag row (the
+    /// drawn toggle is centered inside it).
+    tracking_toggle: Rectangle,
+    /// One rect per [`TRACKING_CADENCES`] entry, in order.
+    tracking_buttons: [Rectangle; 4],
 }
+
+/// Cadence options for the TRACKING panel, in button order. A
+/// remembered preference, selectable while tracking is off.
+const TRACKING_CADENCES: [(&str, GpsTrackingCadence); 4] = [
+    ("CONT", GpsTrackingCadence::Continuous),
+    ("15S", GpsTrackingCadence::Every15s),
+    ("30S", GpsTrackingCadence::Every30s),
+    ("60S", GpsTrackingCadence::Every60s),
+];
 
 fn gps_slots() -> GpsSlots {
     let mut s = layout::VStack::new(LEAF_TOP_Y);
@@ -2493,7 +2568,29 @@ fn gps_slots() -> GpsSlots {
         ),
         Size::new(btn as u32, btn as u32),
     );
-    GpsSlots { status_panel, sync_btn, tz_panel, tz_minus, tz_plus }
+
+    // Tracking panel: enable toggle in the tag row, cadence buttons
+    // hugging the bottom (auto-lock layout idiom).
+    s.gap(14);
+    let tracking_panel = s.slot(76);
+    let tracking_toggle = Rectangle::new(
+        Point::new(
+            tracking_panel.top_left.x + tracking_panel.size.width as i32
+                - inset - TOGGLE_W - 12,
+            tracking_panel.top_left.y,
+        ),
+        Size::new((TOGGLE_W + inset + 12) as u32, (TAG_LABEL_H + 8) as u32),
+    );
+    let btn_h = 30i32;
+    let row_y = tracking_panel.top_left.y
+        + tracking_panel.size.height as i32 - btn_h - 12;
+    let mut tracking_inner = layout::VStack::inside(tracking_panel, 10, row_y);
+    let tracking_buttons = tracking_inner.row::<4>(btn_h, 8);
+
+    GpsSlots {
+        status_panel, sync_btn, tz_panel, tz_minus, tz_plus,
+        tracking_panel, tracking_toggle, tracking_buttons,
+    }
 }
 
 // -- Display sub-view layout ----------------------------------------------
