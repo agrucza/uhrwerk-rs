@@ -43,6 +43,8 @@ use esp_backtrace as _;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull, WakeEvent};
 use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::peripherals as p;
+use esp_hal::spi::master::{Config as SpiConfig, Spi};
+use esp_hal::spi::Mode as SpiMode;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::Blocking;
@@ -98,6 +100,10 @@ struct TwatchUltraBringup {
     sd_mosi: Option<p::GPIO34<'static>>,
     sd_miso: Option<p::GPIO33<'static>>,
     sd_cs: Option<p::GPIO21<'static>>,
+    /// The shared SPI3 bus (SD + SX1262 + NFC behind their own chip
+    /// selects), parked in the spi_bus static by make_store. Kept
+    /// here so the LoRa effort can mint its own device handle.
+    spi_bus: Option<&'static system_core::spi_bus::SharedSpiBus>,
     lpwr: Option<p::LPWR<'static>>,
 }
 
@@ -229,21 +235,42 @@ impl Bringup for TwatchUltraBringup {
     }
 
     fn make_store(&mut self) -> Store<'static> {
-        // The Store always owns the SD hardware; card presence is
-        // the manager's business (Board::sd_detect gates every
-        // probe, so an empty slot never pays the embedded-sdmmc
-        // retry stall). Unconditional ownership is what makes
-        // hotplug work from a cardless boot - the old flash-only
-        // path left the SPI pins behind for good.
+        // The Store always holds the SD's seat on the bus; card
+        // presence is the manager's business (Board::sd_detect gates
+        // every probe, so an empty slot never pays the
+        // embedded-sdmmc retry stall). Unconditional ownership is
+        // what makes hotplug work from a cardless boot.
+        //
+        // The bus itself is SHARED: SD, SX1262 and NFC hang off the
+        // same SPI3 pins behind their own chip selects, so the bus
+        // driver goes into the spi_bus static and each consumer
+        // gets a CS-scoped SharedSpiDevice. Built here (after
+        // make_power - the radio park bit-bangs these pins first).
+        // 400 kHz mode 0: SD-identification-safe, and well within
+        // the SX1262's SPI range.
+        let spi = Spi::new(
+            self.spi3.take().unwrap(),
+            SpiConfig::default()
+                .with_frequency(Rate::from_khz(400))
+                .with_mode(SpiMode::_0),
+        )
+        .unwrap()
+        .with_sck(self.sd_sck.take().unwrap())
+        .with_mosi(self.sd_mosi.take().unwrap())
+        .with_miso(self.sd_miso.take().unwrap());
+        let bus = system_core::spi_bus::init_shared_bus(spi);
+        // Kept for the LoRa effort: its task gets its own device on
+        // the same bus.
+        self.spi_bus = Some(bus);
+
         let region = FlashRegion::new(board::FLASH_FS_START, board::FLASH_FS_SIZE);
         Store::init(
             self.flash.take().unwrap(),
             region,
-            self.spi3.take().unwrap(),
-            self.sd_sck.take().unwrap(),
-            self.sd_mosi.take().unwrap(),
-            self.sd_miso.take().unwrap(),
-            Output::new(self.sd_cs.take().unwrap(), Level::High, OutputConfig::default()),
+            system_core::spi_bus::SharedSpiDevice::new(
+                bus,
+                Output::new(self.sd_cs.take().unwrap(), Level::High, OutputConfig::default()),
+            ),
         )
     }
 
@@ -627,6 +654,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         sd_mosi: Some(peripherals.GPIO34),
         sd_miso: Some(peripherals.GPIO33),
         sd_cs: Some(peripherals.GPIO21),
+        spi_bus: None,
         lpwr: Some(peripherals.LPWR),
     };
 

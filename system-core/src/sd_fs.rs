@@ -63,11 +63,11 @@ const READ_LINE_CAP: usize = 96;
 ///   from CMD0 instead of being talked to with the old card's
 ///   geometry),
 /// * `SdFs` being dropped.
-pub struct SdFs<'d> {
+pub struct SdFs {
     /// Always `Some` between public calls; the `Option` exists only
     /// so [`Self::abandon_session`] can take ownership for the
     /// rebuild (`VolumeManager::free` consumes self).
-    vol: Option<EspVolumeManager<'d>>,
+    vol: Option<EspVolumeManager>,
     session: Option<OpenSession>,
 }
 
@@ -82,14 +82,14 @@ struct OpenSession {
     root: RawDirectory,
 }
 
-impl<'d> SdFs<'d> {
-    pub fn new(vol: EspVolumeManager<'d>) -> Self {
+impl SdFs {
+    pub fn new(vol: EspVolumeManager) -> Self {
         Self { vol: Some(vol), session: None }
     }
 
     /// The wrapped manager. Infallible outside the rebuild inside
     /// [`Self::abandon_session`].
-    fn vol(&mut self) -> &mut EspVolumeManager<'d> {
+    fn vol(&mut self) -> &mut EspVolumeManager {
         self.vol.as_mut().expect("VolumeManager is rebuilt in place")
     }
 
@@ -366,7 +366,7 @@ impl<'d> SdFs<'d> {
         f: F,
     ) -> Result<T, SdmmcError<SdCardError>>
     where
-        F: FnOnce(&mut EspVolumeManager<'d>, RawFile) -> Result<T, SdmmcError<SdCardError>>,
+        F: FnOnce(&mut EspVolumeManager, RawFile) -> Result<T, SdmmcError<SdCardError>>,
     {
         // Split "/system/logs/events.log" into dir components +
         // filename. Leading slash → first component is empty, skip.
@@ -483,7 +483,7 @@ impl<'d> SdFs<'d> {
     }
 }
 
-impl<'d> Drop for SdFs<'d> {
+impl Drop for SdFs {
     fn drop(&mut self) {
         // Nothing worth closing: the handle tables die with the
         // manager, and a close would only risk the info-sector
@@ -534,7 +534,7 @@ fn close_dirs(
 
 // -- Storage trait impl -----------------------------------------------------
 
-impl<'d> crate::fs::Storage for SdFs<'d> {
+impl crate::fs::Storage for SdFs {
     type Error = SdmmcError<SdCardError>;
 
     fn append_line(&mut self, path: &str, bytes: &[u8]) -> Result<(), Self::Error> {

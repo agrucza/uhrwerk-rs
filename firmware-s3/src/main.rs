@@ -35,6 +35,8 @@ use esp_backtrace as _;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull, WakeEvent};
 use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::peripherals as p;
+use esp_hal::spi::master::{Config as SpiConfig, Spi};
+use esp_hal::spi::Mode as SpiMode;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::Blocking;
@@ -159,14 +161,28 @@ impl Bringup for S3Bringup {
     }
 
     fn make_store(&mut self) -> Store<'static> {
+        // The SD card is this board's only SPI3 device, but it rides
+        // the shared-bus seam anyway - one code shape across boards.
+        // 400 kHz mode 0, the SD-identification-safe rate the old
+        // exclusive path used.
+        let spi = Spi::new(
+            self.spi3.take().unwrap(),
+            SpiConfig::default()
+                .with_frequency(Rate::from_khz(400))
+                .with_mode(SpiMode::_0),
+        )
+        .unwrap()
+        .with_sck(self.sd_sck.take().unwrap())
+        .with_mosi(self.sd_mosi.take().unwrap())
+        .with_miso(self.sd_miso.take().unwrap());
+        let bus = system_core::spi_bus::init_shared_bus(spi);
         Store::init(
             self.flash.take().unwrap(),
             FlashRegion::new(board::FLASH_FS_START, board::FLASH_FS_SIZE),
-            self.spi3.take().unwrap(),
-            self.sd_sck.take().unwrap(),
-            self.sd_mosi.take().unwrap(),
-            self.sd_miso.take().unwrap(),
-            Output::new(self.sd_cs.take().unwrap(), Level::High, OutputConfig::default()),
+            system_core::spi_bus::SharedSpiDevice::new(
+                bus,
+                Output::new(self.sd_cs.take().unwrap(), Level::High, OutputConfig::default()),
+            ),
         )
     }
 

@@ -28,7 +28,6 @@
 
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicBool, Ordering};
-use esp_hal::gpio::{Output, interconnect::{PeripheralInput, PeripheralOutput}};
 use esp_hal::peripherals::FLASH;
 use serde::{Deserialize, Serialize};
 
@@ -60,7 +59,7 @@ const BLOB_SCRATCH: usize = 512;
 /// `false`; the manager never sees the difference.
 pub struct Store<'d> {
     flash: FlashFs<'d>,
-    sd: Option<SdFs<'d>>,
+    sd: Option<SdFs>,
     /// Whether the SD mirror is currently usable for writes.
     ///
     /// * Flipped `true` when `probe_sd()` succeeds.
@@ -84,15 +83,11 @@ impl<'d> Store<'d> {
     pub fn init(
         flash: FLASH<'d>,
         region: FlashRegion,
-        spi: impl esp_hal::spi::master::Instance + 'd,
-        sck: impl PeripheralOutput<'d>,
-        mosi: impl PeripheralOutput<'d>,
-        miso: impl PeripheralInput<'d>,
-        cs: Output<'d>,
+        sd_dev: crate::spi_bus::SharedSpiDevice,
     ) -> Self {
         let flash = FlashFs::mount_or_format(flash, region);
         log::info!("SD card: building volume manager (card access deferred)");
-        let sd_card = sdcard_hal::build_sdcard(spi, sck, mosi, miso, cs);
+        let sd_card = sdcard_hal::build_sdcard(sd_dev);
         let sd = SdFs::new(drivers::sdcard::VolumeManager::new(
             sd_card, drivers::sdcard::RtcTimeSource,
         ));
@@ -290,7 +285,7 @@ impl<'d> Store<'d> {
     /// Use for SD-only operations (user content on `/user/...`,
     /// back-fill scans, anything that shouldn't touch flash).
     #[allow(dead_code)] // escape hatch for future SD-only callers (user data, sounds, backups)
-    pub fn sd_mut(&mut self) -> Option<&mut SdFs<'d>> {
+    pub fn sd_mut(&mut self) -> Option<&mut SdFs> {
         self.sd.as_mut()
     }
 
@@ -299,7 +294,7 @@ impl<'d> Store<'d> {
     /// into SD in one pass. No invariant couples the two sides,
     /// so handing out both mutable refs is safe - the Store is
     /// just a bundle plus an atomic flag.
-    pub fn parts_mut(&mut self) -> (&mut FlashFs<'d>, Option<&mut SdFs<'d>>) {
+    pub fn parts_mut(&mut self) -> (&mut FlashFs<'d>, Option<&mut SdFs>) {
         (&mut self.flash, self.sd.as_mut())
     }
 

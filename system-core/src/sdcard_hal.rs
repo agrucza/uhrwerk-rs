@@ -1,77 +1,29 @@
-//! ESP32-S3 HAL glue for the SD card SPI interface.
+//! HAL glue for the SD card's seat on the shared SPI bus.
 //!
-//! Combines the SPI3 bus and the chip-select output pin into a single
-//! `SpiDevice` (via `embedded-hal-bus::ExclusiveDevice`) and hands it to
-//! `embedded-sdmmc::SdCard`.
-//!
-//! ## Pin assignments
-//!
-//! | Signal | GPIO |
-//! |--------|------|
-//! | MOSI   |  1   |
-//! | SCK    |  2   |
-//! | MISO   |  3   |
-//! | CS     |  17  |
-//!
-//! SPI2 is reserved for the display; always use SPI3 here.
+//! The SD card is one chip-selected device among possibly several
+//! (radios share the bus on some boards), so it rides a
+//! [`SharedSpiDevice`](crate::spi_bus::SharedSpiDevice) instead of
+//! owning the bus. The bin builds the bus driver (frequency, mode,
+//! pins - hardware init is bin-owned), parks it via
+//! [`crate::spi_bus::init_shared_bus`], and hands `Store::init` the
+//! SD's device handle; this module only assembles the
+//! `embedded-sdmmc` stack on top.
 
 use drivers::sdcard::{RtcTimeSource, SdCard, VolumeManager};
-use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
-use esp_hal::{
-    Blocking,
-    delay::Delay,
-    gpio::{Output, interconnect::{PeripheralInput, PeripheralOutput}},
-    spi::master::{Config, Spi},
-    spi::Mode,
-    time::Rate,
-};
+use esp_hal::delay::Delay;
 
-/// Concrete SdCard type returned by [`build_sdcard`].
-pub type EspSdCard<'d> = SdCard<
-    ExclusiveDevice<Spi<'d, Blocking>, Output<'d>, NoDelay>,
-    Delay,
->;
+use crate::spi_bus::SharedSpiDevice;
 
-/// Convenience alias: VolumeManager backed by the ESP SdCard + RtcTimeSource.
+/// Concrete SdCard type over the shared-bus device.
+pub type EspSdCard = SdCard<SharedSpiDevice, Delay>;
+
+/// VolumeManager backed by [`EspSdCard`] + `RtcTimeSource`.
 /// `RtcTimeSource` is zero-sized and reads a shared wall clock that
-/// firmware updates from the PCF85063 (see `drivers::sdcard::update_wall_clock`).
-pub type EspVolumeManager<'d> = VolumeManager<EspSdCard<'d>, RtcTimeSource>;
+/// firmware updates from the RTC (see `drivers::sdcard::update_wall_clock`).
+pub type EspVolumeManager = VolumeManager<EspSdCard, RtcTimeSource>;
 
-/// Build an [`EspSdCard`] from raw esp-hal peripherals.
-///
-/// The SPI bus is initialised at 400 kHz (safe for card identification).
-/// After init, call `SdCard::get_card_type()` to confirm detection, then
-/// raise the frequency via the underlying bus if needed.
-///
-/// # Parameters
-/// - `spi`  - SPI peripheral (use `p.SPI3`; SPI2 is taken by the display)
-/// - `sck`  - clock pin (GPIO2)
-/// - `mosi` - data out to card (GPIO1)
-/// - `miso` - data in from card (GPIO3)
-/// - `cs`   - chip select output, already initialised high (GPIO17)
-pub fn build_sdcard<'d>(
-    spi:  impl esp_hal::spi::master::Instance + 'd,
-    sck:  impl PeripheralOutput<'d>,
-    mosi: impl PeripheralOutput<'d>,
-    miso: impl PeripheralInput<'d>,
-    cs:   Output<'d>,
-) -> EspSdCard<'d> {
-    let spi_bus = Spi::new(
-        spi,
-        Config::default()
-            .with_frequency(Rate::from_khz(400))
-            .with_mode(Mode::_0),
-    )
-    .unwrap()
-    .with_sck(sck)
-    .with_mosi(mosi)
-    .with_miso(miso);
-
-    // ExclusiveDevice wraps the bus + CS into a SpiDevice.
-    // new_no_delay: no inter-transaction CS gap needed on a dedicated bus.
-    // new_no_delay: stores NoDelay sentinel - no inter-transaction gap needed
-    // on a dedicated bus. The SdCard itself gets a separate Delay for protocol timing.
-    let spi_device = ExclusiveDevice::new_no_delay(spi_bus, cs).unwrap();
-
-    SdCard::new(spi_device, Delay::new())
+/// Wrap the SD card's shared-bus seat into an [`EspSdCard`]. The
+/// `Delay` covers the card's protocol timing needs.
+pub fn build_sdcard(dev: SharedSpiDevice) -> EspSdCard {
+    SdCard::new(dev, Delay::new())
 }

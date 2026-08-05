@@ -23,6 +23,7 @@ extern crate alloc;
 pub mod fs;
 pub mod flash_fs;
 pub mod sdcard_hal;
+pub mod spi_bus;
 pub mod sd_fs;
 pub mod storage;
 pub mod event_log;
