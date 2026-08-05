@@ -47,6 +47,9 @@ pub mod bhi260;
 #[cfg(feature = "ublox")]
 pub mod ublox;
 
+#[cfg(feature = "sx1262")]
+pub mod sx1262;
+
 pub use embedded_hal;
 
 #[cfg(feature = "defmt")]
