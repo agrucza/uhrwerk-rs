@@ -38,10 +38,6 @@ pub struct TwatchUltraBoard {
     /// input so `arm_wake_sources` can make a PWR-button press wake
     /// the watch from light sleep.
     _pmu_irq: Input<'static>,
-    /// SX1262 chip select, held HIGH: deselected on the shared SPI
-    /// bus AND keeping the chip in the cold sleep commanded at init
-    /// (a falling edge on this line is the chip's wake-up).
-    _lora_cs: Output<'static>,
     /// ST25R3916 chip select, held LOW: its rail (DLDO1) is off, and
     /// a driven-high line would back-feed the unpowered chip through
     /// its input-protection diodes. The future NFC effort must raise
@@ -51,9 +47,8 @@ pub struct TwatchUltraBoard {
 
 /// Bit-bang pins for the one-shot SX1262 sleep command in
 /// [`TwatchUltraBoard::init`]. Short-lived: the bin reborrows the
-/// shared-bus SCK/MOSI so the SD SPI can still be built from the
-/// same pins later; RST/BUSY stay in the bringup struct for a
-/// future LoRa effort.
+/// shared-bus SCK/MOSI so the shared SPI bus can still be built
+/// from the same pins later; RST/BUSY go to the LoRa task.
 pub struct LoraSleepPins<'a> {
     pub rst: Output<'a>,
     pub busy: Input<'a>,
@@ -128,10 +123,15 @@ impl TwatchUltraBoard {
     /// any peripheral that hangs off the gated rails (display, touch,
     /// SD). Returns `(TwatchUltraBoard, Pmu)`; the caller wraps the `Pmu`
     /// in a `PowerTaskState` for the polling task.
+    /// `lora_cs` is borrowed only for the cold-sleep park; the bin
+    /// keeps ownership - the LoRa task's shared-bus device seat
+    /// needs it later. It must stay driven HIGH from here on:
+    /// deselected on the shared bus AND keeping the chip asleep (a
+    /// falling edge on this line is the chip's wake-up).
     pub fn init(
         i2c: &mut impl I2c,
         pmu_irq: Input<'static>,
-        mut lora_cs: Output<'static>,
+        lora_cs: &mut Output<'static>,
         nfc_cs: Output<'static>,
         mut lora: LoraSleepPins<'_>,
     ) -> Result<(Self, Pmu), ()> {
@@ -244,12 +244,11 @@ impl TwatchUltraBoard {
 
         // Park the LoRa radio last: its rail (ALDO3) is guaranteed up
         // by now, and the sequence needs no I2C.
-        sx1262_cold_sleep(&mut lora_cs, &mut lora);
+        sx1262_cold_sleep(lora_cs, &mut lora);
 
         Ok((
             Self {
                 _pmu_irq: pmu_irq,
-                _lora_cs: lora_cs,
                 _nfc_cs: nfc_cs,
             },
             pmu,

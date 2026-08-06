@@ -63,8 +63,8 @@ struct TwatchUltraBringup {
     // Shared-SPI chip selects held deselected (see TwatchUltraBoard).
     lora_cs: Option<p::GPIO36<'static>>,
     nfc_cs: Option<p::GPIO4<'static>>,
-    // SX1262 reset/busy - used once at boot for the cold-sleep park,
-    // kept in the struct for the future LoRa effort.
+    // SX1262 reset/busy - reborrowed once at boot for the cold-sleep
+    // park, then consumed by the LoRa task at spawn.
     lora_rst: Option<p::GPIO47<'static>>,
     lora_busy: Option<p::GPIO48<'static>>,
     spi2: Option<p::SPI2<'static>>,
@@ -102,8 +102,11 @@ struct TwatchUltraBringup {
     sd_cs: Option<p::GPIO21<'static>>,
     /// The shared SPI3 bus (SD + SX1262 + NFC behind their own chip
     /// selects), parked in the spi_bus static by make_store. Kept
-    /// here so the LoRa effort can mint its own device handle.
+    /// here so the LoRa task can mint its own device handle.
     spi_bus: Option<&'static system_core::spi_bus::SharedSpiBus>,
+    /// SX1262 chip select after the cold-sleep park (held HIGH),
+    /// waiting for the LoRa task's device seat.
+    lora_cs_out: Option<Output<'static>>,
     lpwr: Option<p::LPWR<'static>>,
 }
 
@@ -132,7 +135,11 @@ impl Bringup for TwatchUltraBringup {
         );
         let _ = pmu_irq.wakeup_enable(true, WakeEvent::LowLevel);
 
-        let lora_cs =
+        // Constructed here for the cold-sleep park, then kept in the
+        // bringup struct: the LoRa task's shared-bus device seat
+        // takes it over. Held HIGH throughout - deselected AND
+        // keeping the parked chip asleep.
+        let mut lora_cs =
             Output::new(self.lora_cs.take().unwrap(), Level::High, OutputConfig::default());
         // NFC CS idles LOW: the ST25R3916's rail (DLDO1) is off, and
         // a driven-high line would back-feed the unpowered chip
@@ -141,9 +148,8 @@ impl Bringup for TwatchUltraBringup {
             Output::new(self.nfc_cs.take().unwrap(), Level::Low, OutputConfig::default());
 
         // One-shot SX1262 cold-sleep pins. SCK/MOSI are reborrowed -
-        // make_store still builds the SD SPI from the same pins
-        // later; RST/BUSY stay in the bringup struct for a future
-        // LoRa effort.
+        // make_store still builds the shared SPI bus from the same
+        // pins later; RST/BUSY go to the LoRa task at spawn.
         let lora = LoraSleepPins {
             rst: Output::new(
                 self.lora_rst.as_mut().unwrap().reborrow(),
@@ -166,8 +172,9 @@ impl Bringup for TwatchUltraBringup {
             ),
         };
 
-        let (board, pmu) = TwatchUltraBoard::init(i2c, pmu_irq, lora_cs, nfc_cs, lora)
+        let (board, pmu) = TwatchUltraBoard::init(i2c, pmu_irq, &mut lora_cs, nfc_cs, lora)
             .expect("PMU init failed - halting");
+        self.lora_cs_out = Some(lora_cs);
 
         (board, PowerTaskState::new(pmu))
     }
@@ -359,6 +366,27 @@ impl Bringup for TwatchUltraBringup {
                 self.uart1.take().unwrap(),
                 self.gps_tx.take().unwrap(),
                 self.gps_rx.take().unwrap(),
+            )
+            .unwrap(),
+        );
+        // LoRa bring-up: its device seat on the shared bus (built by
+        // make_store, which ran before this hook) + the park-era
+        // RST/BUSY pins.
+        spawner.spawn(
+            crate::system::lora::lora_task(
+                system_core::spi_bus::SharedSpiDevice::new(
+                    self.spi_bus.expect("spi_bus built in make_store"),
+                    self.lora_cs_out.take().unwrap(),
+                ),
+                Output::new(
+                    self.lora_rst.take().unwrap(),
+                    Level::High,
+                    OutputConfig::default(),
+                ),
+                Input::new(
+                    self.lora_busy.take().unwrap(),
+                    InputConfig::default().with_pull(Pull::None),
+                ),
             )
             .unwrap(),
         );
@@ -655,6 +683,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         sd_miso: Some(peripherals.GPIO33),
         sd_cs: Some(peripherals.GPIO21),
         spi_bus: None,
+        lora_cs_out: None,
         lpwr: Some(peripherals.LPWR),
     };
 

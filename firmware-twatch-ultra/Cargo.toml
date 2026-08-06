@@ -70,6 +70,6 @@ esp32s3 = { version = "0.35", features = ["critical-section"] }
 # `display` is for the smoke bin; the main bin reaches the display
 # through system-core/firmware-hal.
 app-core     = { path = "../app-core", features = ["serde"] }
-drivers      = { path = "../drivers", features = ["display", "pmu", "xl9555", "cst9217", "drv2605", "imu", "bhi260", "ublox"] }
+drivers      = { path = "../drivers", features = ["display", "pmu", "xl9555", "cst9217", "drv2605", "imu", "bhi260", "ublox", "sx1262"] }
 firmware-hal = { path = "../firmware-hal" }
 system-core  = { path = "../system-core" }
