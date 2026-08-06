@@ -38,11 +38,6 @@ pub struct TwatchUltraBoard {
     /// input so `arm_wake_sources` can make a PWR-button press wake
     /// the watch from light sleep.
     _pmu_irq: Input<'static>,
-    /// ST25R3916 chip select, held LOW: its rail (DLDO1) is off, and
-    /// a driven-high line would back-feed the unpowered chip through
-    /// its input-protection diodes. The future NFC effort must raise
-    /// CS before enabling DLDO1.
-    _nfc_cs: Output<'static>,
 }
 
 /// Bit-bang pins for the one-shot SX1262 sleep command in
@@ -132,7 +127,6 @@ impl TwatchUltraBoard {
         i2c: &mut impl I2c,
         pmu_irq: Input<'static>,
         lora_cs: &mut Output<'static>,
-        nfc_cs: Output<'static>,
         mut lora: LoraSleepPins<'_>,
     ) -> Result<(Self, Pmu), ()> {
         let pmu = Pmu::new(PmuConfig::default());
@@ -246,13 +240,7 @@ impl TwatchUltraBoard {
         // by now, and the sequence needs no I2C.
         sx1262_cold_sleep(lora_cs, &mut lora);
 
-        Ok((
-            Self {
-                _pmu_irq: pmu_irq,
-                _nfc_cs: nfc_cs,
-            },
-            pmu,
-        ))
+        Ok((Self { _pmu_irq: pmu_irq }, pmu))
     }
 }
 

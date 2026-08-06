@@ -40,15 +40,42 @@ pub fn init_shared_bus(spi: Spi<'static, Blocking>) -> &'static SharedSpiBus {
 /// One chip-selected device on the shared bus. Owns its CS output;
 /// every `SpiDevice` transaction locks the bus, frames the
 /// operations with CS, and releases.
+///
+/// Devices may run different SPI configurations (the NFC reader is
+/// mode 1 while SD and LoRa are mode 0): a device built with
+/// [`SharedSpiDevice::with_config`] re-applies its configuration
+/// under the lock before every transaction. Give EVERY device on a
+/// mixed-mode bus an explicit config - correctness must not depend
+/// on which device happened to transact last.
 pub struct SharedSpiDevice {
     bus: &'static SharedSpiBus,
     cs: Output<'static>,
+    config: Option<esp_hal::spi::master::Config>,
 }
 
 impl SharedSpiDevice {
-    /// `cs` must already idle in its deselected (high) state.
+    /// `cs` must already idle in its deselected (high) state. The
+    /// device inherits whatever configuration the bus is left in -
+    /// only safe while every device on the bus shares one config.
     pub fn new(bus: &'static SharedSpiBus, cs: Output<'static>) -> Self {
-        Self { bus, cs }
+        Self { bus, cs, config: None }
+    }
+
+    /// Device with its own bus configuration, re-applied per
+    /// transaction.
+    pub fn with_config(
+        bus: &'static SharedSpiBus,
+        cs: Output<'static>,
+        config: esp_hal::spi::master::Config,
+    ) -> Self {
+        Self { bus, cs, config: Some(config) }
+    }
+
+    /// Dissolve the device and hand the CS pin back - for rail-gated
+    /// chips whose park state needs the line driven to a specific
+    /// level while unpowered (the NFC reader parks CS LOW).
+    pub fn release(self) -> Output<'static> {
+        self.cs
     }
 }
 
@@ -70,6 +97,15 @@ impl SpiDevice<u8> for SharedSpiDevice {
             core::hint::spin_loop();
         };
         let bus: &mut Spi<'static, Blocking> = &mut guard;
+
+        if let Some(cfg) = &self.config {
+            // Static per-device configs are accepted or rejected
+            // deterministically - a rejection would fail the very
+            // first transaction on a dev boot, so a panic beats
+            // widening the error type for an impossible runtime
+            // case.
+            bus.apply_config(cfg).expect("per-device SPI config rejected");
+        }
 
         self.cs.set_low();
         let mut res = Ok(());

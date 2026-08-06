@@ -5,4 +5,5 @@
 pub mod gps;
 pub mod haptics;
 pub mod lora;
+pub mod nfc;
 pub mod power;

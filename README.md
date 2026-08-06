@@ -33,7 +33,7 @@ Home Assistant voice assistant (Wyoming over TCP).
 | Wrist-wear detection (raise/lower) | n/a | n/a | working |
 | Haptics | no motor populated | no motor | working (DRV2605) |
 | GPIO expander (XL9555) | n/a | n/a | working |
-| LoRa (SX1262) | n/a | n/a | parked in cold sleep (driver not started) |
+| LoRa (SX1262) | n/a | n/a | working (RX + TX proven over the air vs a Meshtastic node; boot probe, session UI pending) |
 | GPS (MIA-M10Q) | n/a | n/a | working (rail-gated time sync, settings UI) |
-| NFC (ST25R3916) | n/a | n/a | parked, rail off (driver not started) |
+| NFC (ST25R3916) | n/a | n/a | working (ISO14443A card detect proven; rail-gated boot probe, session UI pending) |
 | WiFi / networking | not started | not started | not started |

@@ -107,6 +107,10 @@ struct TwatchUltraBringup {
     /// SX1262 chip select after the cold-sleep park (held HIGH),
     /// waiting for the LoRa task's device seat.
     lora_cs_out: Option<Output<'static>>,
+    /// ST25R3916 chip select (held LOW against the unpowered chip),
+    /// waiting for the NFC task - which must raise it BEFORE
+    /// enabling DLDO1.
+    nfc_cs_out: Option<Output<'static>>,
     lpwr: Option<p::LPWR<'static>>,
 }
 
@@ -143,9 +147,13 @@ impl Bringup for TwatchUltraBringup {
             Output::new(self.lora_cs.take().unwrap(), Level::High, OutputConfig::default());
         // NFC CS idles LOW: the ST25R3916's rail (DLDO1) is off, and
         // a driven-high line would back-feed the unpowered chip
-        // through its input-protection diodes (see TwatchUltraBoard).
-        let nfc_cs =
-            Output::new(self.nfc_cs.take().unwrap(), Level::Low, OutputConfig::default());
+        // through its input-protection diodes. Kept in the bringup
+        // struct; the NFC task raises it BEFORE powering the rail.
+        self.nfc_cs_out = Some(Output::new(
+            self.nfc_cs.take().unwrap(),
+            Level::Low,
+            OutputConfig::default(),
+        ));
 
         // One-shot SX1262 cold-sleep pins. SCK/MOSI are reborrowed -
         // make_store still builds the shared SPI bus from the same
@@ -172,7 +180,7 @@ impl Bringup for TwatchUltraBringup {
             ),
         };
 
-        let (board, pmu) = TwatchUltraBoard::init(i2c, pmu_irq, &mut lora_cs, nfc_cs, lora)
+        let (board, pmu) = TwatchUltraBoard::init(i2c, pmu_irq, &mut lora_cs, lora)
             .expect("PMU init failed - halting");
         self.lora_cs_out = Some(lora_cs);
 
@@ -255,28 +263,26 @@ impl Bringup for TwatchUltraBringup {
         // make_power - the radio park bit-bangs these pins first).
         // 400 kHz mode 0: SD-identification-safe, and well within
         // the SX1262's SPI range.
-        let spi = Spi::new(
-            self.spi3.take().unwrap(),
-            SpiConfig::default()
-                .with_frequency(Rate::from_khz(400))
-                .with_mode(SpiMode::_0),
-        )
-        .unwrap()
+        let spi = Spi::new(self.spi3.take().unwrap(), spi3_mode0_config())
+            .unwrap()
         .with_sck(self.sd_sck.take().unwrap())
         .with_mosi(self.sd_mosi.take().unwrap())
         .with_miso(self.sd_miso.take().unwrap());
         let bus = system_core::spi_bus::init_shared_bus(spi);
-        // Kept for the LoRa effort: its task gets its own device on
+        // Kept for the radio tasks: each gets its own device seat on
         // the same bus.
         self.spi_bus = Some(bus);
 
+        // Mixed-mode bus (NFC is SPI mode 1), so every device
+        // carries its explicit config - see SharedSpiDevice docs.
         let region = FlashRegion::new(board::FLASH_FS_START, board::FLASH_FS_SIZE);
         Store::init(
             self.flash.take().unwrap(),
             region,
-            system_core::spi_bus::SharedSpiDevice::new(
+            system_core::spi_bus::SharedSpiDevice::with_config(
                 bus,
                 Output::new(self.sd_cs.take().unwrap(), Level::High, OutputConfig::default()),
+                spi3_mode0_config(),
             ),
         )
     }
@@ -374,9 +380,10 @@ impl Bringup for TwatchUltraBringup {
         // RST/BUSY pins.
         spawner.spawn(
             crate::system::lora::lora_task(
-                system_core::spi_bus::SharedSpiDevice::new(
+                system_core::spi_bus::SharedSpiDevice::with_config(
                     self.spi_bus.expect("spi_bus built in make_store"),
                     self.lora_cs_out.take().unwrap(),
+                    spi3_mode0_config(),
                 ),
                 Output::new(
                     self.lora_rst.take().unwrap(),
@@ -387,6 +394,17 @@ impl Bringup for TwatchUltraBringup {
                     self.lora_busy.take().unwrap(),
                     InputConfig::default().with_pull(Pull::None),
                 ),
+            )
+            .unwrap(),
+        );
+        // NFC bring-up probe: raw CS handed over (still parked LOW);
+        // the task raises it before powering DLDO1 and builds its
+        // own mode-1 device seat.
+        spawner.spawn(
+            crate::system::nfc::nfc_task(
+                i2c_bus,
+                self.spi_bus.expect("spi_bus built in make_store"),
+                self.nfc_cs_out.take().unwrap(),
             )
             .unwrap(),
         );
@@ -449,6 +467,16 @@ impl Bringup for TwatchUltraBringup {
 /// bit, and the HAL performs it during configuration only - i.e.
 /// before this hook ran. Without it every write here is silently
 /// ignored and the mic reads as dead.
+/// Bus configuration for the mode-0 devices on the shared SPI3 bus
+/// (SD card, SX1262). 400 kHz is SD-identification-safe and well
+/// within both chips' SPI range. The NFC reader runs its own
+/// mode-1 config - see `system::nfc`.
+fn spi3_mode0_config() -> SpiConfig {
+    SpiConfig::default()
+        .with_frequency(Rate::from_khz(400))
+        .with_mode(SpiMode::_0)
+}
+
 fn tune_pdm_rx() {
     let i2s = unsafe { &*esp32s3::I2S0::ptr() };
 
@@ -684,6 +712,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         sd_cs: Some(peripherals.GPIO21),
         spi_bus: None,
         lora_cs_out: None,
+        nfc_cs_out: None,
         lpwr: Some(peripherals.LPWR),
     };
 
