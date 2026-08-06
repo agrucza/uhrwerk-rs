@@ -385,6 +385,25 @@ impl Pmu {
         self.write_register(i2c, registers::REG_LDO_EN0, new)
     }
 
+    /// Enable or disable DLDO1. Board-specific consumer; on the
+    /// T-Watch Ultra it is the NFC reader's whole power domain,
+    /// rail-gated per session. Only DLDO1 is touched - all other
+    /// rail enables in REG 90h are preserved via a
+    /// read-modify-write.
+    pub fn set_dldo1_enable<I2C, E>(&self, i2c: &mut I2C, enable: bool) -> Result<(), Error<E>>
+    where
+        I2C: I2cTrait<Error = E>,
+    {
+        use registers::ldo_en0;
+        let cur = self.read_register(i2c, registers::REG_LDO_EN0)?;
+        let new = if enable {
+            cur | ldo_en0::DLDO1
+        } else {
+            cur & !ldo_en0::DLDO1
+        };
+        self.write_register(i2c, registers::REG_LDO_EN0, new)
+    }
+
     /// Enable or disable ALDO2 (net `DSI_PWR_EN`, the AMOLED display rail).
     ///
     /// ALDO2 is enabled at boot by [`enable_all_rails`] and powers the

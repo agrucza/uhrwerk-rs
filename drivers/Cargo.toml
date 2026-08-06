@@ -22,6 +22,7 @@ drv2605 = []
 bhi260  = []
 ublox   = []
 sx1262  = []
+st25r3916 = []
 # CST92xx touch lives under the touch module (shares TouchEvent).
 cst9217 = ["touch"]
 

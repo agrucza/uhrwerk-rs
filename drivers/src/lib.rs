@@ -50,6 +50,9 @@ pub mod ublox;
 #[cfg(feature = "sx1262")]
 pub mod sx1262;
 
+#[cfg(feature = "st25r3916")]
+pub mod st25r3916;
+
 pub use embedded_hal;
 
 #[cfg(feature = "defmt")]
