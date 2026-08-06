@@ -1,16 +1,29 @@
 //! LoRa bring-up - SX1262 behind the shared SPI bus.
 //!
-//! Phase B of the LoRa effort: prove the RF path over the air by
-//! receiving live Meshtastic traffic. One session at boot walks the
-//! radio from its cold-sleep park through reset, identity
-//! fingerprint and TCXO start-up (the Phase A sequence, hardware-
-//! verified 2026-08-06), then tunes to the Meshtastic LongFast
-//! EU868 channel and sniffs for a bounded window, logging every
-//! received packet's size, RSSI and SNR. A nearby Meshtastic node
-//! provides the transmitter - sending any message from its app puts
-//! a packet on the air. Nothing is transmitted here; TX over the
-//! air comes with the two-way session effort. Afterwards the radio
-//! re-parks into cold sleep through the driver.
+//! Phase B of the LoRa effort: prove the RF path over the air in
+//! both directions. One session at boot walks the radio from its
+//! cold-sleep park through reset, identity fingerprint and TCXO
+//! start-up (the Phase A sequence, hardware-verified 2026-08-06),
+//! tunes to the Meshtastic LongFast EU868 channel, then:
+//!
+//! 1. **RX** - sniff for a bounded window, logging every received
+//!    packet's size, RSSI and SNR (verified 2026-08-06 against live
+//!    traffic from a nearby Meshtastic node).
+//! 2. **TX** - send a few beacons shaped like Meshtastic broadcasts
+//!    and confirm TxDone. The header is real (so a listening node
+//!    demodulates and parses it); the payload is not encrypted with
+//!    the channel key, so Meshtastic firmware logs a decrypt
+//!    failure rather than showing a message. That log line on the
+//!    other node - or a spectrum analyzer - is the external proof;
+//!    TxDone alone only proves the PA ramped.
+//!
+//! Afterwards the radio re-parks into cold sleep through the
+//! driver.
+//!
+//! Duty cycle: 869.4-869.65 MHz allows 10 % in EU868 and each
+//! beacon is well under a second of airtime, so a handful of
+//! packets spaced seconds apart stays far inside the limit. Keep it
+//! that way if this probe grows.
 //!
 //! Channel facts (verified against Meshtastic firmware + docs):
 //! LongFast on EU868 has exactly one slot, centered 869.525 MHz;
@@ -28,8 +41,8 @@
 //! chip reaching STDBY_XOSC afterwards.
 
 use drivers::sx1262::{
-    regs, ChipMode, Error, LoRaBw, LoRaCr, LoRaModParams, LoRaPacketParams, LoRaSf,
-    PacketType, SleepConfig, StandbyClk, Sx1262, TcxoVoltage, ms_to_steps,
+    ms_to_steps, regs, ChipMode, Error, LoRaBw, LoRaCr, LoRaModParams, LoRaPacketParams,
+    LoRaSf, PaPreset, PacketType, RampTime, SleepConfig, StandbyClk, Sx1262, TcxoVoltage,
     RX_CONTINUOUS,
 };
 use embassy_time::{Duration, Instant, Timer};
@@ -50,13 +63,65 @@ const LONGFAST_PREAMBLE: u16 = 16;
 /// (RadioLib interleaves the 0x44 control nibbles).
 const LONGFAST_SYNC_WORD: u16 = 0x24B4;
 
-/// How long the boot sniff listens before re-parking the radio.
-const SNIFF_WINDOW_SECS: u64 = 180;
-/// IRQ poll cadence during the sniff (no DIO1 wiring yet - the
-/// two-way session effort claims the interrupt line).
+/// How long the boot sniff listens before moving on to the TX test.
+const SNIFF_WINDOW_SECS: u64 = 60;
+/// IRQ poll cadence during RX/TX (no DIO1 wiring yet - the two-way
+/// session effort claims the interrupt line).
 const SNIFF_POLL_MS: u64 = 100;
 
+/// Beacons sent in the TX test, and the gap between them.
+const TX_BEACONS: u8 = 3;
+const TX_GAP_MS: u64 = 5_000;
+/// TX power in dBm. +14 is the EU868 ERP ceiling for this band with
+/// a 0 dBi antenna, and plenty for a same-room proof.
+const TX_POWER_DBM: i8 = 14;
+/// Guard against a TxDone that never arrives (bad PA state, wedged
+/// state machine). Well past the ~600 ms airtime of these beacons
+/// at SF11/BW250.
+const TX_TIMEOUT_MS: u32 = 5_000;
+
+/// Node id this probe transmits under. Meshtastic node ids are
+/// arbitrary 32-bit values; this one is deliberately memorable so
+/// the beacons are unmistakable in another node's log.
+const BEACON_NODE_ID: u32 = 0x0057_0001;
+/// Channel hash byte of the LongFast default channel, copied from
+/// the live traffic captured 2026-08-06. A listening node only
+/// parses packets whose hash matches one of its channels.
+const LONGFAST_CHANNEL_HASH: u8 = 0x08;
+/// Header flags byte, likewise copied from live traffic: hop limit
+/// 3, hop start 3, no want-ack, no MQTT.
+const BEACON_FLAGS: u8 = 0x63;
+
 type SpiErr = esp_hal::spi::Error;
+
+/// Build one beacon frame: a real Meshtastic packet header
+/// (dest / sender / id, all little-endian, then flags, channel
+/// hash, next hop, relay node - the layout the captured traffic
+/// confirmed) followed by a short payload.
+///
+/// The payload is NOT encrypted with the channel key, so a
+/// Meshtastic node parses the header and then fails to decrypt.
+/// That failure is the point: it is logged with our sender id, and
+/// it keeps the beacons out of anyone's message history. Sending
+/// something readable would mean implementing the channel's
+/// AES-CTR and the protobuf payload - a feature, not a bring-up
+/// step.
+fn beacon_frame(seq: u8) -> [u8; 20] {
+    let mut f = [0u8; 20];
+    f[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // broadcast
+    f[4..8].copy_from_slice(&BEACON_NODE_ID.to_le_bytes());
+    // Packet id: any nonzero value, varied per beacon so a
+    // listener treats them as distinct packets rather than mesh
+    // retransmits of one.
+    f[8..12].copy_from_slice(&(0x5748_0000u32 | seq as u32).to_le_bytes());
+    f[12] = BEACON_FLAGS;
+    f[13] = LONGFAST_CHANNEL_HASH;
+    f[14] = 0x00; // next hop: unset
+    f[15] = 0x00; // relay node: unset
+    // Undecryptable-by-design payload, recognizable in a hex dump.
+    f[16..20].copy_from_slice(b"UHRW");
+    f
+}
 
 #[embassy_executor::task]
 pub async fn lora_task(
@@ -245,7 +310,69 @@ async fn bringup(
         packets,
     );
 
-    // 5. Re-park through the driver: back to standby first (SetSleep
+    // 5. TX test: a few Meshtastic-shaped beacons. The PA config
+    //    and TX-side IRQ routing only matter from here on.
+    drv.set_standby(spi, busy, StandbyClk::Rc)?;
+    drv.set_pa_preset(spi, busy, PaPreset::Dbm22)?;
+    drv.set_tx_params(spi, busy, TX_POWER_DBM, RampTime::Us200)?;
+    drv.set_dio_irq_params(
+        spi,
+        busy,
+        regs::irq::TX_DONE | regs::irq::TIMEOUT,
+        0,
+        0,
+        0,
+    )?;
+    for n in 0..TX_BEACONS {
+        let frame = beacon_frame(n);
+        drv.set_lora_packet_params(
+            spi,
+            busy,
+            LoRaPacketParams {
+                preamble_symbols: LONGFAST_PREAMBLE,
+                implicit_header: false,
+                payload_len: frame.len() as u8,
+                crc_on: true,
+                invert_iq: false,
+            },
+        )?;
+        drv.write_buffer(spi, busy, 0, &frame)?;
+        drv.clear_irq(spi, busy, regs::irq::ALL)?;
+        drv.set_tx(spi, busy, ms_to_steps(TX_TIMEOUT_MS))?;
+        // Poll for TxDone. The chip returns to STDBY_RC by itself
+        // on completion or timeout, so nothing to unwind here.
+        let tx_deadline = Instant::now() + Duration::from_millis(TX_TIMEOUT_MS as u64 + 500);
+        let mut done = false;
+        while Instant::now() < tx_deadline {
+            Timer::after(Duration::from_millis(SNIFF_POLL_MS)).await;
+            let irq = drv.irq_status(spi, busy)?;
+            if irq & regs::irq::TX_DONE != 0 {
+                log::info!("LoRa: TX {}/{} done ({} B on air)", n + 1, TX_BEACONS, frame.len());
+                done = true;
+                break;
+            }
+            if irq & regs::irq::TIMEOUT != 0 {
+                log::warn!("LoRa: TX {}/{} timed out - PA never finished", n + 1, TX_BEACONS);
+                done = true;
+                break;
+            }
+        }
+        if !done {
+            log::warn!("LoRa: TX {}/{} - no TxDone within budget", n + 1, TX_BEACONS);
+        }
+        drv.clear_irq(spi, busy, regs::irq::ALL)?;
+        let errs = drv.device_errors(spi, busy)?;
+        if errs != 0 {
+            log::warn!("LoRa: device errors after TX: {:#06X}", errs);
+        }
+        Timer::after(Duration::from_millis(TX_GAP_MS)).await;
+    }
+    log::info!(
+        "LoRa: TX test done - node id {:#010X} beaconed {} time(s) on LongFast",
+        BEACON_NODE_ID, TX_BEACONS,
+    );
+
+    // 6. Re-park through the driver: back to standby first (SetSleep
     //    is only legal from STDBY), then cold sleep - CS idles high
     //    on the shared-bus device, ~160 nA.
     drv.set_standby(spi, busy, StandbyClk::Rc)?;
