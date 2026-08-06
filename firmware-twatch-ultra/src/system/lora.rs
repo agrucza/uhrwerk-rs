@@ -1,13 +1,24 @@
 //! LoRa bring-up - SX1262 behind the shared SPI bus.
 //!
-//! Phase A of the LoRa effort: prove the host-to-chip path on real
-//! hardware. One session at boot walks the radio from its cold-sleep
-//! park through reset, identity fingerprint, TCXO start-up,
-//! calibration and a full EU868 LoRa configuration dry run, then
-//! parks it again - this time through the driver instead of the boot
-//! bit-bang. No RF is emitted (nothing enters TX). The air-link
-//! effort replaces the boot auto-run with a command-driven session
-//! loop.
+//! Phase B of the LoRa effort: prove the RF path over the air by
+//! receiving live Meshtastic traffic. One session at boot walks the
+//! radio from its cold-sleep park through reset, identity
+//! fingerprint and TCXO start-up (the Phase A sequence, hardware-
+//! verified 2026-08-06), then tunes to the Meshtastic LongFast
+//! EU868 channel and sniffs for a bounded window, logging every
+//! received packet's size, RSSI and SNR. A nearby Meshtastic node
+//! provides the transmitter - sending any message from its app puts
+//! a packet on the air. Nothing is transmitted here; TX over the
+//! air comes with the two-way session effort. Afterwards the radio
+//! re-parks into cold sleep through the driver.
+//!
+//! Channel facts (verified against Meshtastic firmware + docs):
+//! LongFast on EU868 has exactly one slot, centered 869.525 MHz;
+//! SF11 / BW250 / CR4:5, 16-symbol preamble, explicit header, CRC
+//! on. Meshtastic sets the one-byte sync word 0x2B through
+//! RadioLib, which spreads it across the SX126x register pair with
+//! 0x44 control nibbles - on the wire that is 0x24B4, and writing
+//! anything else means hearing silence.
 //!
 //! Hardware facts this leans on (schematic + vendor init, see the
 //! board docs): the radio is an HPB16B3 module with a DIO3-powered
@@ -18,10 +29,10 @@
 
 use drivers::sx1262::{
     regs, ChipMode, Error, LoRaBw, LoRaCr, LoRaModParams, LoRaPacketParams, LoRaSf,
-    PaPreset, PacketType, RampTime, SleepConfig, StandbyClk, Sx1262, TcxoVoltage,
-    ms_to_steps,
+    PacketType, SleepConfig, StandbyClk, Sx1262, TcxoVoltage, ms_to_steps,
+    RX_CONTINUOUS,
 };
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::{Input, Output};
 use system_core::bus;
 use system_core::spi_bus::SharedSpiDevice;
@@ -30,6 +41,20 @@ use system_core::spi_bus::SharedSpiDevice;
 /// wearable-size TCXO; only stretches mode entries, costs nothing
 /// in steady state.
 const TCXO_DELAY_MS: u32 = 5;
+
+/// Meshtastic LongFast on EU868 - the band's single slot.
+const LONGFAST_FREQ_HZ: u32 = 869_525_000;
+/// Meshtastic preamble length in symbols.
+const LONGFAST_PREAMBLE: u16 = 16;
+/// Meshtastic's one-byte sync word 0x2B in SX126x register form
+/// (RadioLib interleaves the 0x44 control nibbles).
+const LONGFAST_SYNC_WORD: u16 = 0x24B4;
+
+/// How long the boot sniff listens before re-parking the radio.
+const SNIFF_WINDOW_SECS: u64 = 180;
+/// IRQ poll cadence during the sniff (no DIO1 wiring yet - the
+/// two-way session effort claims the interrupt line).
+const SNIFF_POLL_MS: u64 = 100;
 
 type SpiErr = esp_hal::spi::Error;
 
@@ -58,7 +83,7 @@ pub async fn lora_task(
     Timer::after(Duration::from_millis(10)).await;
 
     match bringup(&drv, &mut spi, &mut busy).await {
-        Ok(()) => log::info!("LoRa: bring-up complete - SX1262 re-parked in cold sleep"),
+        Ok(()) => log::info!("LoRa: session complete - SX1262 re-parked in cold sleep"),
         Err(e) => {
             log::error!("LoRa: bring-up failed: {:?}", e);
             // Best effort: never leave the radio awake and burning.
@@ -128,23 +153,21 @@ async fn bringup(
         );
     }
 
-    // 3. Post-POR errata + full EU868 configuration dry run. No TX
-    //    happens; this exercises every configuration verb the
-    //    air-link effort will use, with the radio absorbing or
-    //    rejecting each one.
+    // 3. Post-POR errata, then tune to the Meshtastic LongFast
+    //    EU868 channel (module docs carry the parameter provenance).
     drv.apply_tx_clamp_workaround(spi, busy)?;
     drv.set_standby(spi, busy, StandbyClk::Rc)?;
     drv.set_packet_type(spi, busy, PacketType::LoRa)?;
     drv.calibrate_image(spi, busy, regs::image_band::MHZ_863_870)?;
-    drv.set_rf_frequency_hz(spi, busy, 868_100_000)?;
-    drv.set_pa_preset(spi, busy, PaPreset::Dbm22)?;
-    drv.set_tx_params(spi, busy, 14, RampTime::Us200)?;
+    drv.set_rf_frequency_hz(spi, busy, LONGFAST_FREQ_HZ)?;
     drv.set_lora_modulation(
         spi,
         busy,
         LoRaModParams {
-            sf: LoRaSf::Sf9,
-            bw: LoRaBw::Khz125,
+            sf: LoRaSf::Sf11,
+            bw: LoRaBw::Khz250,
+            // SF11 at BW250 is an 8.2 ms symbol - under the 16.38 ms
+            // LDRO threshold, so Meshtastic runs without it.
             cr: LoRaCr::Cr4_5,
             low_data_rate_opt: false,
         },
@@ -153,25 +176,79 @@ async fn bringup(
         spi,
         busy,
         LoRaPacketParams {
-            preamble_symbols: 8,
+            preamble_symbols: LONGFAST_PREAMBLE,
             implicit_header: false,
-            payload_len: 16,
+            // Maximum the receiver accepts; actual length comes from
+            // each packet's explicit header.
+            payload_len: 255,
             crc_on: true,
             invert_iq: false,
         },
     )?;
-    drv.set_lora_sync_word(spi, busy, regs::lora_sync_word::PRIVATE)?;
+    drv.set_lora_sync_word(spi, busy, LONGFAST_SYNC_WORD)?;
     drv.set_buffer_base(spi, busy, 0, 0)?;
-    let status = drv.status(spi, busy)?;
-    let errs = drv.device_errors(spi, busy)?;
+    drv.set_rx_gain_boosted(spi, busy, true)?;
+
+    // 4. Sniff: RX continuous, polling the latched IRQ flags (DIO1
+    //    stays unclaimed until the two-way session effort). RxDone
+    //    fires per packet; CRC/header errors are logged too - even
+    //    those prove RF reception.
+    drv.set_dio_irq_params(
+        spi,
+        busy,
+        regs::irq::RX_DONE | regs::irq::CRC_ERR | regs::irq::HEADER_ERR,
+        0,
+        0,
+        0,
+    )?;
+    drv.set_rx(spi, busy, RX_CONTINUOUS)?;
     log::info!(
-        "LoRa: EU868 config dry run done ({:?}, errors {:#06X})",
-        status.chip_mode, errs,
+        "LoRa: sniffing Meshtastic LongFast EU868 (869.525 MHz, SF11/BW250) for {} s - send a message from the app",
+        SNIFF_WINDOW_SECS,
+    );
+    let deadline = Instant::now() + Duration::from_secs(SNIFF_WINDOW_SECS);
+    let mut packets = 0u32;
+    while Instant::now() < deadline {
+        Timer::after(Duration::from_millis(SNIFF_POLL_MS)).await;
+        let irq = drv.irq_status(spi, busy)?;
+        if irq == 0 {
+            continue;
+        }
+        drv.clear_irq(spi, busy, irq)?;
+        if irq & regs::irq::RX_DONE != 0 {
+            packets += 1;
+            let (len, offset) = drv.rx_buffer_status(spi, busy)?;
+            let mut payload = [0u8; 255];
+            let head = &mut payload[..(len as usize).min(255)];
+            drv.read_buffer(spi, busy, offset, head)?;
+            let ps = drv.lora_packet_status(spi, busy)?;
+            // Meshtastic radio header: dest(4) sender(4) id(4)
+            // flags(1) chan(1)... - the first 16 bytes identify the
+            // sender without any decoding.
+            log::info!(
+                "LoRa: RX {} B, RSSI {} dBm, SNR {} dB, head {:02X?}",
+                len,
+                ps.rssi_pkt_dbm,
+                ps.snr_pkt_db_x4 as i16 / 4,
+                &head[..head.len().min(16)],
+            );
+        }
+        if irq & (regs::irq::CRC_ERR | regs::irq::HEADER_ERR) != 0 {
+            log::warn!(
+                "LoRa: damaged packet (irq {:#06X}) - RF reception happening, demod struggled",
+                irq,
+            );
+        }
+    }
+    log::info!(
+        "LoRa: sniff window over - {} packet(s) received",
+        packets,
     );
 
-    // 4. Re-park through the driver: cold sleep, CS idles high on
-    //    the shared-bus device, ~160 nA until the air-link effort
-    //    wakes it for real.
+    // 5. Re-park through the driver: back to standby first (SetSleep
+    //    is only legal from STDBY), then cold sleep - CS idles high
+    //    on the shared-bus device, ~160 nA.
+    drv.set_standby(spi, busy, StandbyClk::Rc)?;
     drv.set_sleep(spi, busy, SleepConfig { warm_start: false, rtc_wake: false })?;
     Ok(())
 }
