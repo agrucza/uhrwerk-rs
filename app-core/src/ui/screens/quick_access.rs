@@ -115,9 +115,9 @@ struct TileDef {
     kind: TileKind,
 }
 
-fn dnd_is_on(d: &SystemData) -> bool { d.config.dnd }
-fn haptics_is_on(d: &SystemData) -> bool { d.config.haptics_enabled }
-fn sound_is_on(d: &SystemData) -> bool { d.config.sound_enabled }
+fn dnd_is_on(d: &SystemData) -> bool { d.config.alerts.dnd }
+fn haptics_is_on(d: &SystemData) -> bool { d.config.alerts.haptics_enabled }
+fn sound_is_on(d: &SystemData) -> bool { d.config.alerts.sound_enabled }
 fn night_mode_is_on(d: &SystemData) -> bool { d.config.display.night_mode }
 
 const TILES: [TileDef; 8] = [

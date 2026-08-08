@@ -191,7 +191,7 @@ impl AlarmScreen {
     fn render_list<D: DrawTarget<Color = Rgb565>>(
         &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
     ) {
-        let active_count = data.alarms.entries.iter().filter(|e| e.enabled).count();
+        let active_count = data.config.alarms.entries.iter().filter(|e| e.enabled).count();
         let mut tele_buf: heapless::String<16> = heapless::String::new();
         let _ = write!(tele_buf, "x{:02} ACTIVE", active_count);
         draw_app_chrome(display, data, "ALARMS", tele_buf.as_str(), ACCENT);
@@ -218,7 +218,7 @@ impl AlarmScreen {
     fn render_row<D: DrawTarget<Color = Rgb565>>(
         &self, display: &mut D, data: &SystemData, entry_idx: usize, scroll: i32,
     ) {
-        let entry = &data.alarms.entries[entry_idx];
+        let entry = &data.config.alarms.entries[entry_idx];
         let rect = row_rect(entry_idx, scroll);
 
         let border = if entry.enabled { ACCENT } else { theme::STEEL };
@@ -239,7 +239,7 @@ impl AlarmScreen {
 
         // "NEXT" tag-label pinned to the row's TL chamfer when this
         // entry is the next one to fire.
-        if entry.enabled && data.alarms.active_hw == Some(entry_idx) {
+        if entry.enabled && data.config.alarms.active_hw == Some(entry_idx) {
             tag_label(
                 display,
                 rect.top_left.x,
@@ -326,14 +326,14 @@ impl AlarmScreen {
                     let toggle_zone_x =
                         rect.top_left.x + rect.size.width as i32 - 60;
                     if (*x as i32) >= toggle_zone_x {
-                        data.alarms.entries[idx].enabled =
-                            !data.alarms.entries[idx].enabled;
+                        data.config.alarms.entries[idx].enabled =
+                            !data.config.alarms.entries[idx].enabled;
                         return Action::PersistAlarms;
                     }
 
                     // Body tap: open Edit. Seed the picker from
                     // the entry's HH:MM.
-                    let entry = &data.alarms.entries[idx];
+                    let entry = &data.config.alarms.entries[idx];
                     self.time_picker.wheels[0].set_value(entry.hour as i32);
                     self.time_picker.wheels[1].set_value(entry.minute as i32);
                     self.edit_days = entry.days;
@@ -419,7 +419,7 @@ impl AlarmScreen {
                 if rect_hit(set, *x, *y) {
                     let h = self.time_picker.wheels[0].value() as u8;
                     let m = self.time_picker.wheels[1].value() as u8;
-                    data.alarms.entries[index] = AlarmEntry {
+                    data.config.alarms.entries[index] = AlarmEntry {
                         hour: h,
                         minute: m,
                         days: self.edit_days,

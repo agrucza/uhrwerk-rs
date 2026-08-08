@@ -196,12 +196,15 @@ impl<'fb, B: QspiWrite, RST: OutputPin> CO5300<'fb, B, RST> {
     ///   2. `init()`
     ///   3. `wake()` + 120 ms
     ///   4. `display_on()` + 70 ms
-    pub async fn init(&mut self) {
+    /// `brightness` is the initial 0..=255 backlight register value -
+    /// the caller passes the persisted setting so the first lit frame
+    /// already matches it (no hardcoded default to reconcile later).
+    pub async fn init(&mut self, brightness: u8) {
         self.write_cmd(0xC4,            &[0x80]).await; // enable QSPI opcode 0x32
         self.write_cmd(cmd::PIXFMT,     &[0x55]).await; // RGB565 (16 bpp)
         self.write_cmd(0x35,            &[0x00]).await; // tearing effect on, mode 0
         self.write_cmd(0x53,            &[0x20]).await; // BC_EN=1
-        self.write_cmd(cmd::BRIGHTNESS, &[80]  ).await; // ~31%
+        self.write_cmd(cmd::BRIGHTNESS, &[brightness]).await;
         self.write_cmd(0x63,            &[0xFF]).await; // HBM max
     }
 

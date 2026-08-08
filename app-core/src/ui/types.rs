@@ -164,10 +164,10 @@ pub enum Action {
     /// confirm tap. Requires SD to be online - the Settings row is
     /// disabled otherwise.
     RestoreFromSd,
-    /// Persist the current `AlarmState` to flash. Emitted by
-    /// screens after they mutate `data.alarms`. Subsumes Redraw -
-    /// returning this also triggers a redraw, so screens don't
-    /// need to emit both.
+    /// Persist the settings tree after an alarm edit. Emitted by
+    /// screens after they mutate `data.config.alarms`. Subsumes
+    /// Redraw - returning this also triggers a redraw, so screens
+    /// don't need to emit both.
     PersistAlarms,
     /// Persist the current `Config` to flash. Same subsumes-Redraw
     /// semantics as `PersistAlarms`. Emitted internally by the
@@ -193,11 +193,11 @@ pub enum Action {
     /// each tick so the change takes effect on the next idle window.
     ToggleAlwaysOn,
 
-    /// Flip `config.haptics_enabled`. Model marks config dirty;
+    /// Flip `config.alerts.haptics_enabled`. Model marks config dirty;
     /// the manager gates motor effects on the live value.
     ToggleHaptics,
 
-    /// Flip `config.sound_enabled`. Model marks config dirty; the
+    /// Flip `config.alerts.sound_enabled`. Model marks config dirty; the
     /// manager gates the alarm / timer alert tone on the live value.
     ToggleSound,
 
@@ -226,7 +226,7 @@ pub enum Action {
     /// switches back to meter-only capture.
     StartLoopbackTest,
 
-    /// Flip `config.dnd`. Pure config flip today - the alarm and
+    /// Flip `config.alerts.dnd`. Pure config flip today - the alarm and
     /// notification routing that should respect this lands when
     /// those screens get real backing.
     ToggleDnd,
@@ -254,13 +254,13 @@ pub enum Action {
     /// is already running).
     GpsSync,
 
-    /// Shift `config.tz_offset_minutes` by `delta_min` (the settings
+    /// Shift `config.time.tz_offset_minutes` by `delta_min` (the settings
     /// GPS view's +/- 15-minute stepper). The Model clamps to the
     /// real-world UTC offset range and marks config dirty; the next
     /// `TouchReleased` persists it.
     AdjustTimezone { delta_min: i16 },
 
-    /// Flip `config.gps_tracking_enabled` (the settings GPS view's
+    /// Flip `config.gps.tracking_enabled` (the settings GPS view's
     /// TRACKING toggle). Enabling kicks the first session
     /// immediately; disabling aborts one in flight.
     ToggleGpsTracking,
@@ -353,8 +353,10 @@ impl Default for TimerState {
 /// Maximum number of user-configurable alarms.
 pub const MAX_ALARMS: usize = 8;
 
-/// One alarm entry.
-#[derive(Debug, Clone, Copy)]
+/// One alarm entry. Persisted per slot as its own tagged config
+/// field (see the config module docs), hence the serde derive on
+/// the ENTRY while [`AlarmState`] itself is never serialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AlarmEntry {
     pub hour: u8,
@@ -379,41 +381,49 @@ impl AlarmEntry {
     }
 }
 
-/// Persistent alarm list. Screens mutate this directly.
+/// The alarm list plus its transient runtime flags. Lives in the
+/// settings tree as `config.alarms`; screens mutate it there.
 ///
-/// When serialised (via the `serde` feature) only `entries` is
-/// written - `active_hw` / `alerting` / `snoozed` are transient
-/// runtime flags that must NOT persist across a reboot, so they
-/// are `#[serde(skip)]` and reset to `Default` on load.
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// Persistence is per-entry (each slot is its own tagged config
+/// field) - this struct as a whole is never serialized, so
+/// `active_hw` / `alerting` / `snoozed` reset to defaults on every
+/// boot by construction: a mid-alarm reboot must not resume ringing,
+/// and the RTC programming is replanned from time + entries on the
+/// first 1 Hz tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AlarmState {
     pub entries: [AlarmEntry; MAX_ALARMS],
     /// Index of the alarm currently programmed into the RTC
     /// hardware, or None if no alarm is active. Recomputed on
     /// boot by `plan_reprogram` from current time + entries.
-    #[cfg_attr(feature = "serde", serde(skip))]
     pub active_hw: Option<usize>,
-    /// True when an alarm has fired and the user hasn't dismissed
-    /// it. Not persisted: a mid-alarm reboot should not resume
-    /// ringing.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    /// True when an alarm has fired and the user hasn't dismissed it.
     pub alerting: bool,
     /// True when a snooze is active. The manager skips regular
     /// reprogramming while this is set. Cleared when the snooze
-    /// alarm fires. Not persisted: mid-snooze reboot cancels it.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    /// alarm fires.
     pub snoozed: bool,
+}
+
+impl AlarmState {
+    /// Compile-time default (all slots disabled, everyday mask) -
+    /// const so `Config::DEFAULT` can embed it.
+    pub const DEFAULT: Self = Self {
+        entries: [AlarmEntry {
+            hour: 0,
+            minute: 0,
+            days: 0x7F,
+            enabled: false,
+        }; MAX_ALARMS],
+        active_hw: None,
+        alerting: false,
+        snoozed: false,
+    };
 }
 
 impl Default for AlarmState {
     fn default() -> Self {
-        Self {
-            entries: [AlarmEntry::default(); MAX_ALARMS],
-            active_hw: None,
-            alerting: false,
-            snoozed: false,
-        }
+        Self::DEFAULT
     }
 }
 
@@ -757,7 +767,6 @@ pub struct SystemData {
     pub tick_count: u32,
     pub stopwatch: StopwatchState,
     pub timer: TimerState,
-    pub alarms: AlarmState,
     /// Active notification queue surfaced in the global Notifications
     /// overlay. Producers are the alarm-fired and timer-expired
     /// hooks in [`crate::Model::apply_snapshot`]; consumers is the

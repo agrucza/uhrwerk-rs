@@ -25,8 +25,8 @@
 //! ```text
 //! /system/
 //! ├── config/
-//! │   ├── config.bin   // postcard(StoredBlob<Config>)
-//! │   └── alarms.bin   // postcard(StoredBlob<AlarmState>)
+//! │   └── config.bin   // postcard(StoredBlob<Config>) - the whole
+//! │                    // settings tree, alarms included
 //! ├── logs/
 //! │   └── events.log   // one CSV line per event
 //! └── sounds/          // reserved for future alarm audio

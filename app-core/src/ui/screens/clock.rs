@@ -437,11 +437,11 @@ fn draw_bottom_tiles<D: DrawTarget<Color = Rgb565>>(
         data.time.day as i32,
     );
     let mut alarm_buf: String<8> = String::new();
-    let alarm_value: &str = match data.alarms.next_alarm(
+    let alarm_value: &str = match data.config.alarms.next_alarm(
         data.time.hour, data.time.minute, weekday,
     ) {
         Some(idx) => {
-            let entry = &data.alarms.entries[idx];
+            let entry = &data.config.alarms.entries[idx];
             let _ = write!(alarm_buf, "{:02}:{:02}", entry.hour, entry.minute);
             alarm_buf.as_str()
         }

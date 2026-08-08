@@ -112,7 +112,10 @@ impl Bringup for S3Bringup {
         (power, PowerTaskState::new(pmu))
     }
 
-    async fn make_display(&mut self) -> Display<'static> {
+    async fn make_display(
+        &mut self,
+        config: &app_core::config::Config,
+    ) -> Display<'static> {
         let fb: &'static mut [u8] = firmware_hal::display::take_framebuffer();
         init_display(
             self.spi2.take().unwrap(),
@@ -125,6 +128,9 @@ impl Bringup for S3Bringup {
             self.dma_ch0.take().unwrap(),
             Output::new(self.lcd_reset.take().unwrap(), Level::High, OutputConfig::default()),
             fb,
+            // Config-first boot: the panel's first lit frame is
+            // already at the stored brightness.
+            config.display.brightness_active,
         )
         .await
     }

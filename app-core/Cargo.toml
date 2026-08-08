@@ -10,11 +10,15 @@ std     = []
 # Opt-in serde derives on value types the firmware persists to
 # flash via `postcard`. Off by default so pure host tests stay
 # dep-free.
-serde = ["dep:serde"]
+serde = ["dep:serde", "dep:postcard"]
 
 [dependencies]
 defmt                  = { workspace = true, optional = true }
 serde                  = { version = "1", default-features = false, features = ["derive"], optional = true }
+# Value encoder for the tagged config store (config.rs) - each leaf
+# setting is postcard-encoded inside its TLV entry. Version matches
+# system-core's so Cargo dedupes a single copy.
+postcard               = { version = "1.1.3", default-features = false, optional = true }
 embedded-graphics-core = { workspace = true }
 embedded-graphics      = "0.8.2"
 

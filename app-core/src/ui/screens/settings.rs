@@ -301,7 +301,7 @@ fn gps_value(data: &SystemData) -> String<20> {
             let _ = buf.push_str("SYNCING");
         }
         _ => {
-            let m = data.config.tz_offset_minutes;
+            let m = data.config.time.tz_offset_minutes;
             let a = m.unsigned_abs();
             let _ = write!(buf, "UTC{}{}:{:02}", if m < 0 { '-' } else { '+' }, a / 60, a % 60);
         }
@@ -369,15 +369,15 @@ fn storage_restore_value(data: &SystemData) -> String<20> {
 }
 
 fn haptics_is_on(data: &SystemData) -> bool {
-    data.config.haptics_enabled
+    data.config.alerts.haptics_enabled
 }
 
 fn sound_is_on(data: &SystemData) -> bool {
-    data.config.sound_enabled
+    data.config.alerts.sound_enabled
 }
 
 fn dnd_is_on(data: &SystemData) -> bool {
-    data.config.dnd
+    data.config.alerts.dnd
 }
 
 const STORAGE_INDEX_ROWS: &[IndexRow] = &[
@@ -2314,7 +2314,7 @@ impl SettingsScreen {
                 let _ = write!(line, "SYNCING - {} SATS", sats);
                 if fix_ok { let _ = line.push_str(" FIX"); }
             }
-            _ if data.config.gps_tracking_enabled => {
+            _ if data.config.gps.tracking_enabled => {
                 match data.gps_next_session_secs {
                     Some(s) => { let _ = write!(line, "NEXT IN {}s", s); }
                     // Kick in flight (the task reports within
@@ -2378,7 +2378,7 @@ impl SettingsScreen {
         chamfered_button(
             display, slots.tz_plus, "+", ButtonVariant::Ghost, theme::STEEL,
         );
-        let m = data.config.tz_offset_minutes;
+        let m = data.config.time.tz_offset_minutes;
         let a = m.unsigned_abs();
         let mut tz: String<12> = String::new();
         let _ = write!(tz, "UTC{}{}:{:02}", if m < 0 { '-' } else { '+' }, a / 60, a % 60);
@@ -2410,10 +2410,10 @@ impl SettingsScreen {
                 t.top_left.x + (t.size.width as i32 - TOGGLE_W) / 2,
                 t.top_left.y + (t.size.height as i32 - TOGGLE_H) / 2,
             ),
-            data.config.gps_tracking_enabled,
+            data.config.gps.tracking_enabled,
         );
         for (i, &(label, cadence)) in TRACKING_CADENCES.iter().enumerate() {
-            let variant = if cadence == data.config.gps_tracking_cadence {
+            let variant = if cadence == data.config.gps.tracking_cadence {
                 ButtonVariant::Primary
             } else {
                 ButtonVariant::Ghost
@@ -2451,7 +2451,7 @@ impl SettingsScreen {
                 }
                 for (i, &(_, cadence)) in TRACKING_CADENCES.iter().enumerate() {
                     if rect_hit(slots.tracking_buttons[i], *x, *y) {
-                        if cadence == data.config.gps_tracking_cadence {
+                        if cadence == data.config.gps.tracking_cadence {
                             return Action::None; // already selected
                         }
                         return Action::SetGpsCadence { cadence };
@@ -2469,7 +2469,7 @@ impl SettingsScreen {
             }
             // The NEXT IN countdown ticks on wall time - repaint per
             // second, but only while tracking makes it visible.
-            SystemEvent::TimeUpdated { .. } if data.config.gps_tracking_enabled => {
+            SystemEvent::TimeUpdated { .. } if data.config.gps.tracking_enabled => {
                 Action::Redraw
             }
             _ => Action::None,

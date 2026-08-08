@@ -57,6 +57,10 @@ drivers      = { path = "../drivers", default-features = false, features = [
 ] }
 firmware-hal = { path = "../firmware-hal" }
 system-core  = { path = "../system-core" }
+# Config-first boot: `make_display` receives the loaded settings
+# tree, so this bin names `app_core::config::Config` directly (its
+# siblings already declare app-core for `capabilities()`).
+app-core     = { path = "../app-core", features = ["serde"] }
 
 # Chip-feature carrier for `system-core`'s `esp-storage` (declared
 # there with no chip feature; Cargo unification carries esp32c6 in

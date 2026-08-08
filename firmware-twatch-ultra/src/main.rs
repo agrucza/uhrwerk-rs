@@ -193,7 +193,10 @@ impl Bringup for TwatchUltraBringup {
         (board, PowerTaskState::new(pmu))
     }
 
-    async fn make_display(&mut self) -> Display<'static> {
+    async fn make_display(
+        &mut self,
+        config: &app_core::config::Config,
+    ) -> Display<'static> {
         let fb: &'static mut [u8] = firmware_hal::display::take_framebuffer();
         init_display(
             self.spi2.take().unwrap(),
@@ -206,6 +209,9 @@ impl Bringup for TwatchUltraBringup {
             self.dma_ch0.take().unwrap(),
             Output::new(self.lcd_reset.take().unwrap(), Level::High, OutputConfig::default()),
             fb,
+            // Config-first boot: the panel's first lit frame is
+            // already at the stored brightness.
+            config.display.brightness_active,
         )
         .await
     }
@@ -684,9 +690,16 @@ async fn main(spawner: embassy_executor::Spawner) {
         esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()),
     );
 
-    // Internal-SRAM heap, same size and model as the other two
-    // boards. The 8 MB QSPI PSRAM stays unused (see board.rs).
-    esp_alloc::heap_allocator!(size: 128 * 1024);
+    // Internal-SRAM heap. 96 KB, deliberately SMALLER than the other
+    // boards' 128 KB: the main stack is the RAM left over after all
+    // statics, and esp-radio's ~56 KB of static buffers shrank it to
+    // 13.8 KB - which the deepest save path (tagged config serialize
+    // + SD mirror through embedded-sdmmc's FAT walker) overflowed
+    // (stack-guard panic, 2026-08-08). 96 KB frees 32 KB back to the
+    // stack (~46 KB); observed heap peak with the radio fully active
+    // is ~60 KB, leaving ~36 KB heap margin. The 8 MB QSPI PSRAM
+    // stays unused (see board.rs).
+    esp_alloc::heap_allocator!(size: 96 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_int =
@@ -694,6 +707,14 @@ async fn main(spawner: embassy_executor::Spawner) {
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
     esp_println::logger::init_logger(log::LevelFilter::Info);
     log::info!("--- LilyGo T-Watch Ultra booting ---");
+    // NOTE the main stack on this board is only what RAM remains
+    // after statics (see the heap_allocator comment below). After
+    // adding any static-heavy dependency, re-check it against the
+    // built ELF - anything under ~24 KB is a stack-overflow risk:
+    //   readelf -s target/xtensa-esp32s3-none-elf/release/firmware-twatch-ultra \
+    //     | grep -E "_stack_(start|end)_cpu0"
+    // (stack size = start - end; 2026-08-08 it had shrunk to 13.8 KB
+    // and the settings-save path overflowed it.)
 
     let bringup = TwatchUltraBringup {
         i2c0: Some(peripherals.I2C0),

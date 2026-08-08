@@ -368,6 +368,7 @@ pub async fn init_display<'d, 'fb>(
     dma: impl DmaChannelFor<AnySpi<'d>>,
     reset_pin: Output<'d>,
     fb: &'fb mut [u8],
+    brightness: u8,
 ) -> CO5300<'fb, EspQspi<'d>, Output<'d>> {
     let bus = build_spi(spi, sclk, sio0, sio1, sio2, sio3, cs, dma);
     let mut display = CO5300::new(bus, reset_pin, fb);
@@ -381,7 +382,7 @@ pub async fn init_display<'d, 'fb>(
     Timer::after(Duration::from_millis(120)).await;
 
     log::info!("Display: initializing CO5300...");
-    display.init().await;
+    display.init(brightness).await;
     display.wake().await;
     Timer::after(Duration::from_millis(120)).await; // SLPOUT settle
     display.display_on().await;

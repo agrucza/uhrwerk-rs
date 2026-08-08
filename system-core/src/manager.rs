@@ -18,17 +18,21 @@ use esp_hal::gpio::Input;
 use esp_hal::i2c::master::I2c;
 use esp_hal::Blocking;
 
-// -- Persistence paths + versions -------------------------------------------
+// -- Persistence path + version ----------------------------------------------
 //
-// Used by both the boot-time load (in `init()`) and the
-// save-on-change handlers (`Effect::SaveConfig` / `SaveAlarms`).
+// Used by the boot-time load (in `run()`) and the save-on-change
+// handler (`Effect::SaveConfig`).
 // Bump a version whenever the on-disk shape of the value type
 // changes so old records get ignored rather than silently
 // misinterpreted.
+// THE settings blob: the whole config tree, alarms included (one
+// store, tagged per leaf - see app-core config.rs).
 const CONFIG_PATH:    &str = "/system/config/config.bin";
-const ALARMS_PATH:    &str = "/system/config/alarms.bin";
-const CONFIG_VERSION: u8   = 1;
-const ALARMS_VERSION: u8   = 1;
+// v2 = the tagged field store (TLV payload, see app-core config.rs).
+// v1 was the positional postcard struct; rejecting it here is the
+// one-time settings reset that buys per-field schema tolerance -
+// with the tagged payload this version should never move again.
+const CONFIG_VERSION: u8   = 2;
 
 
 /// Framebuffer row stride in bytes. Used when sizing the per-tile
@@ -131,6 +135,10 @@ pub struct SystemParts<B: Board> {
     /// The board's optional-hardware flags (from
     /// [`Bringup::capabilities`]), cached into `SystemData`.
     pub capabilities: app_core::data::Capabilities,
+    /// The settings tree, loaded from flash by `run()` BEFORE any
+    /// hardware that consumes a persisted setting was initialized
+    /// (config-first boot).
+    pub config: Config,
 }
 
 /// The board-agnostic system brain. Generic over the [`Board`] seam;
@@ -270,6 +278,7 @@ impl<B: Board> SystemManager<'static, B> {
             imu: imu_state,
             power: power_state,
             capabilities,
+            config: loaded_config,
         } = parts;
 
         // Seed the shared wall clock so any SD writes before the
@@ -279,16 +288,6 @@ impl<B: Board> SystemManager<'static, B> {
             initial_time.year, initial_time.month, initial_time.day,
             initial_time.hour, initial_time.minute, initial_time.second,
         );
-
-        // Load Config / AlarmState from flash; fall back to defaults
-        // on missing / version-mismatch / deserialise failure.
-        let stored_config = store.load_blob::<Config>(CONFIG_PATH, CONFIG_VERSION);
-        let stored_alarms =
-            store.load_blob::<app_core::ui::types::AlarmState>(ALARMS_PATH, ALARMS_VERSION);
-        let config_source = if stored_config.is_some() { "loaded" } else { "default" };
-        let alarms_source = if stored_alarms.is_some() { "loaded" } else { "default" };
-        let loaded_config = stored_config.unwrap_or_else(Config::default);
-        let loaded_alarms = stored_alarms.unwrap_or_default();
 
         // Recover the monotonic seq counter before the first log line.
         crate::event_log::init_seq_from_flash(&mut store);
@@ -319,9 +318,11 @@ impl<B: Board> SystemManager<'static, B> {
             total_bytes: fs_usage.total_bytes,
             sd_online,
         };
+        // (Whether the config loaded or defaulted is logged by
+        // `run()` right where the load happens.)
         log::info!(
-            "store: config={} alarms={} files={} region={}KB sd={}",
-            config_source, alarms_source, fs_usage.files,
+            "store: files={} region={}KB sd={}",
+            fs_usage.files,
             fs_usage.total_bytes / 1024,
             if sd_online { "online" } else { "offline" },
         );
@@ -330,7 +331,6 @@ impl<B: Board> SystemManager<'static, B> {
         let mut cached_data = SystemData::default();
         cached_data.time = initial_time;
         cached_data.power = initial_power;
-        cached_data.alarms = loaded_alarms;
         cached_data.storage = initial_usage;
         cached_data.capabilities = capabilities;
         crate::event_log::load_battery_history(
@@ -438,17 +438,17 @@ impl<B: Board> SystemManager<'static, B> {
                         }
                     }
                 }
-                // All three motor effects gate on `config.haptics_enabled`
+                // All three motor effects gate on `config.alerts.haptics_enabled`
                 // so the user-facing toggle in Settings actually
                 // suppresses haptic feedback when disabled.
                 Effect::MotorOn => {
-                    if self.model.config().haptics_enabled {
+                    if self.model.config().alerts.haptics_enabled {
                         self.board.buzz();
                     }
                 }
                 Effect::MotorOff => self.board.buzz_stop(),
                 Effect::MotorPulse { duration_ms } => {
-                    if self.model.config().haptics_enabled {
+                    if self.model.config().alerts.haptics_enabled {
                         self.board.buzz();
                         Timer::after(Duration::from_millis(duration_ms as u64)).await;
                         self.board.buzz_stop();
@@ -466,7 +466,7 @@ impl<B: Board> SystemManager<'static, B> {
                     // separate user-initiated diagnostic, unaffected
                     // by the alert-sound setting.
                     let forward = match cmd {
-                        AudioCommand::PlayAlarm => self.model.config().sound_enabled,
+                        AudioCommand::PlayAlarm => self.model.config().alerts.sound_enabled,
                         AudioCommand::StopAlarm
                         | AudioCommand::StartCapture
                         | AudioCommand::StopCapture
@@ -499,9 +499,9 @@ impl<B: Board> SystemManager<'static, B> {
                     self.refresh_storage_usage().await;
                 }
                 Effect::RestoreFromSd => {
-                    log::info!("restore: copying config blobs from SD to flash");
+                    log::info!("restore: copying config blob from SD to flash");
                     let (copied, skipped) = self.store
-                        .restore_config_from_sd(&[CONFIG_PATH, ALARMS_PATH]);
+                        .restore_config_from_sd(&[CONFIG_PATH]);
                     log::info!(
                         "restore: {} copied, {} skipped - resetting",
                         copied, skipped,
@@ -510,14 +510,6 @@ impl<B: Board> SystemManager<'static, B> {
                     // final UI render can land before the reset.
                     Timer::after(Duration::from_millis(200)).await;
                     esp_hal::system::software_reset();
-                }
-                Effect::SaveAlarms => {
-                    self.store.save_blob(
-                        ALARMS_PATH,
-                        ALARMS_VERSION,
-                        &self.model.cached_data().alarms,
-                    );
-                    self.refresh_storage_usage().await;
                 }
                 Effect::SaveConfig => {
                     self.store.save_blob(
@@ -1206,7 +1198,10 @@ pub trait Bringup {
     }
 
     /// Build the display (takes the framebuffer from the shared HAL).
-    async fn make_display(&mut self) -> Display<'static>;
+    /// Receives the loaded settings tree so the panel's init sequence
+    /// programs the stored brightness - hardware initializes from
+    /// persisted settings, never from hardcoded defaults.
+    async fn make_display(&mut self, config: &Config) -> Display<'static>;
 
     /// The tearing-effect input, when the board routes one to a GPIO.
     fn make_lcd_te(&mut self) -> Option<Input<'static>>;
@@ -1278,10 +1273,26 @@ pub async fn run<T: Bringup>(
 
     bringup.wait_for_peripherals(&mut i2c).await;
 
-    let display = bringup.make_display().await;
+    // Settings FIRST: everything below initializes from the stored
+    // tree (config-first boot). An unreadable/missing blob defaults
+    // and is immediately re-saved in the current format, so a failed
+    // load is a one-time event per device (format cut-over or fresh
+    // flash), never a recurring one.
+    let mut store = bringup.make_store();
+    let stored = store.load_blob::<Config>(CONFIG_PATH, CONFIG_VERSION);
+    let loaded = stored.is_some();
+    let config = stored.unwrap_or_else(Config::default);
+    if !loaded {
+        store.save_blob(CONFIG_PATH, CONFIG_VERSION, &config);
+    }
+    log::info!(
+        "config: {}",
+        if loaded { "loaded" } else { "default (re-saved)" },
+    );
+
+    let display = bringup.make_display(&config).await;
     let lcd_te = bringup.make_lcd_te();
     let (touch, boot_button) = bringup.make_input(&mut i2c).await;
-    let store = bringup.make_store();
     let (rtc_state, imu) = bringup.make_sensors(&mut i2c).await;
 
     let initial_time = rtc_state.snapshot(&mut i2c);
@@ -1309,6 +1320,7 @@ pub async fn run<T: Bringup>(
         imu,
         power: power_state,
         capabilities: bringup.capabilities(),
+        config,
     });
 
     // Each task is spawned exactly once at boot; `.unwrap()` on the

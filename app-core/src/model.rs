@@ -78,7 +78,7 @@ pub enum Effect {
 
     /// Forward a command to the audio task via `AUDIO_COMMAND`.
     /// Carries the alarm / timer alert tone start / stop. The manager
-    /// gates `PlayAlarm` on `config.sound_enabled` (mirroring how
+    /// gates `PlayAlarm` on `config.alerts.sound_enabled` (mirroring how
     /// `MotorOn` gates on `haptics_enabled`); `Stop` always forwards.
     AudioCommand(AudioCommand),
 
@@ -113,13 +113,9 @@ pub enum Effect {
     /// sidesteps mid-alarm / mid-timer edge cases.
     RestoreFromSd,
 
-    /// Persist the current `AlarmState` to
-    /// `/system/config/alarms.bin` on flash. Triggered when a
-    /// screen returns `Action::PersistAlarms` after mutating the
-    /// alarm list.
-    SaveAlarms,
-    /// Persist the current `Config` to `/system/config/config.bin`
-    /// on flash. Triggered by `Action::PersistConfig` after any
+    /// Persist the settings tree (`Config`, alarms included) to
+    /// `/system/config/config.bin` on flash. Triggered by
+    /// `Action::PersistConfig` / `Action::PersistAlarms` after any
     /// change to `cached_data.config`.
     SaveConfig,
 
@@ -595,10 +591,11 @@ impl Model {
                 self.cached_data.time = *time;
                 let subtitle = self
                     .cached_data
+                    .config
                     .alarms
                     .active_hw
                     .map(|idx| {
-                        let e = &self.cached_data.alarms.entries[idx];
+                        let e = &self.cached_data.config.alarms.entries[idx];
                         let mut s: heapless::String<32> = heapless::String::new();
                         let _ = core::fmt::Write::write_fmt(
                             &mut s,
@@ -612,7 +609,7 @@ impl Model {
                     NotificationSource::Alarm,
                     subtitle,
                 );
-                self.cached_data.alarms.alerting = true;
+                self.cached_data.config.alarms.alerting = true;
                 self.start_attention_buzz(out);
                 self.surface_notifications();
                 self.needs_redraw = true;
@@ -640,7 +637,7 @@ impl Model {
                 // display-state gated).
                 if self.cached_data.gps_sync != *state {
                     use crate::data::GpsSyncState;
-                    let tracking = self.config.gps_tracking_enabled;
+                    let tracking = self.config.gps.tracking_enabled;
                     // Tactile milestones for sessions run at arm's
                     // length outdoors (screen dark or unreadable):
                     // short pulse when the first position fix lands,
@@ -675,7 +672,7 @@ impl Model {
                             GpsSyncState::NoSignal => {
                                 self.track_failures += 1;
                                 if self.track_failures >= TRACK_AUTO_OFF_FAILURES {
-                                    self.config.gps_tracking_enabled = false;
+                                    self.config.gps.tracking_enabled = false;
                                     self.cached_data.config = self.config;
                                     self.config_dirty = true;
                                     self.track_failures = 0;
@@ -808,16 +805,16 @@ impl Model {
                 self.buzz = None;
                 let _ = out.push(Effect::MotorOff);
                 let _ = out.push(Effect::AudioCommand(AudioCommand::StopAlarm));
-                self.cached_data.alarms.alerting = false;
-                self.cached_data.alarms.snoozed = false;
+                self.cached_data.config.alarms.alerting = false;
+                self.cached_data.config.alarms.snoozed = false;
                 self.needs_redraw = true;
             }
             Action::SnoozeAlarm => {
                 self.buzz = None;
                 let _ = out.push(Effect::MotorOff);
                 let _ = out.push(Effect::AudioCommand(AudioCommand::StopAlarm));
-                self.cached_data.alarms.alerting = false;
-                self.cached_data.alarms.snoozed = true;
+                self.cached_data.config.alarms.alerting = false;
+                self.cached_data.config.alarms.snoozed = true;
                 let t = &self.cached_data.time;
                 let (hour, minute) = AlarmState::compute_snooze(t.hour, t.minute, 10);
                 let _ = out.push(Effect::RtcCommand(RtcCommand::SetAlarm {
@@ -851,7 +848,11 @@ impl Model {
                 self.needs_redraw = true;
             }
             Action::PersistAlarms => {
-                let _ = out.push(Effect::SaveAlarms);
+                // Screens edit the cached tree directly; adopt their
+                // alarm edits into the authoritative config before
+                // the save reads it.
+                self.config.alarms = self.cached_data.config.alarms;
+                let _ = out.push(Effect::SaveConfig);
                 // Force-replan: editing the active entry's HH:MM
                 // doesn't move `active_hw`, so a non-forced replan
                 // would skip the SetAlarm and leave the chip stuck
@@ -890,13 +891,13 @@ impl Model {
                 self.needs_redraw = true;
             }
             Action::ToggleHaptics => {
-                self.config.haptics_enabled = !self.config.haptics_enabled;
+                self.config.alerts.haptics_enabled = !self.config.alerts.haptics_enabled;
                 self.cached_data.config = self.config;
                 self.config_dirty = true;
                 self.needs_redraw = true;
             }
             Action::ToggleSound => {
-                self.config.sound_enabled = !self.config.sound_enabled;
+                self.config.alerts.sound_enabled = !self.config.alerts.sound_enabled;
                 self.cached_data.config = self.config;
                 self.config_dirty = true;
                 self.needs_redraw = true;
@@ -937,7 +938,7 @@ impl Model {
                 self.needs_redraw = true;
             }
             Action::ToggleDnd => {
-                self.config.dnd = !self.config.dnd;
+                self.config.alerts.dnd = !self.config.alerts.dnd;
                 self.cached_data.config = self.config;
                 self.config_dirty = true;
                 self.needs_redraw = true;
@@ -970,7 +971,7 @@ impl Model {
             }
             Action::GpsSync => {
                 let _ = out.push(Effect::GpsCommand(GpsCommand::SyncOnce {
-                    tz_offset_minutes: self.config.tz_offset_minutes,
+                    tz_offset_minutes: self.config.time.tz_offset_minutes,
                 }));
                 // No optimistic status write: `gps_sync` is the
                 // task's reported state, and the task publishes
@@ -978,7 +979,7 @@ impl Model {
                 // milliseconds behind the tap.
             }
             Action::AdjustTimezone { delta_min } => {
-                self.config.tz_offset_minutes = (self.config.tz_offset_minutes
+                self.config.time.tz_offset_minutes = (self.config.time.tz_offset_minutes
                     + delta_min)
                     .clamp(Config::TZ_OFFSET_MIN, Config::TZ_OFFSET_MAX);
                 self.cached_data.config = self.config;
@@ -986,12 +987,12 @@ impl Model {
                 self.needs_redraw = true;
             }
             Action::ToggleGpsTracking => {
-                self.config.gps_tracking_enabled = !self.config.gps_tracking_enabled;
+                self.config.gps.tracking_enabled = !self.config.gps.tracking_enabled;
                 self.cached_data.config = self.config;
                 self.config_dirty = true;
                 self.track_failures = 0;
                 self.last_track_kick = None;
-                if self.config.gps_tracking_enabled {
+                if self.config.gps.tracking_enabled {
                     // First session right away - the toggle should
                     // answer with visible activity, not after one
                     // full interval.
@@ -1017,8 +1018,8 @@ impl Model {
                 self.needs_redraw = true;
             }
             Action::SetGpsCadence { cadence } => {
-                if self.config.gps_tracking_cadence != cadence {
-                    self.config.gps_tracking_cadence = cadence;
+                if self.config.gps.tracking_cadence != cadence {
+                    self.config.gps.tracking_cadence = cadence;
                     self.cached_data.config = self.config;
                     self.config_dirty = true;
                     self.needs_redraw = true;
@@ -1032,10 +1033,10 @@ impl Model {
     /// the task reports; `track_pending` bridges the gap until the
     /// task's first event lands.
     fn kick_track_session(&mut self, out: &mut Effects) {
-        let continuous = self.config.gps_tracking_cadence
+        let continuous = self.config.gps.tracking_cadence
             == crate::config::GpsTrackingCadence::Continuous;
         let _ = out.push(Effect::GpsCommand(GpsCommand::TrackOnce {
-            tz_offset_minutes: self.config.tz_offset_minutes,
+            tz_offset_minutes: self.config.time.tz_offset_minutes,
             budget_secs: if continuous {
                 TRACK_BUDGET_CONTINUOUS_SECS
             } else {
@@ -1052,7 +1053,7 @@ impl Model {
     /// embassy time pauses during light sleep, the RTC slow clock
     /// doesn't.
     fn maybe_kick_tracking(&mut self, out: &mut Effects) {
-        if !self.config.gps_tracking_enabled || !self.cached_data.capabilities.gps {
+        if !self.config.gps.tracking_enabled || !self.cached_data.capabilities.gps {
             self.cached_data.gps_next_session_secs = None;
             return;
         }
@@ -1071,7 +1072,8 @@ impl Model {
             None => 0,
             Some(at) => self
                 .config
-                .gps_tracking_cadence
+                .gps
+                .tracking_cadence
                 .interval_secs()
                 .saturating_sub(self.cached_data.uptime_secs.wrapping_sub(at)),
         };
@@ -1159,9 +1161,9 @@ impl Model {
             t.year as i32, t.month as i32, t.day as i32,
         );
         let plan = if force {
-            self.cached_data.alarms.plan_reprogram_force(t.hour, t.minute, weekday)
+            self.cached_data.config.alarms.plan_reprogram_force(t.hour, t.minute, weekday)
         } else {
-            self.cached_data.alarms.plan_reprogram(t.hour, t.minute, weekday)
+            self.cached_data.config.alarms.plan_reprogram(t.hour, t.minute, weekday)
         };
         match plan {
             None => {}
@@ -1415,8 +1417,8 @@ mod tests {
         let mut d = SystemData::default();
         d.capabilities.gps = true;
         let mut c = Config::default();
-        c.gps_tracking_enabled = true;
-        c.gps_tracking_cadence = crate::config::GpsTrackingCadence::Continuous;
+        c.gps.tracking_enabled = true;
+        c.gps.tracking_cadence = crate::config::GpsTrackingCadence::Continuous;
         let mut m = Model::new(d, c, Instant::from_millis(0));
         let tick = SystemEvent::TimeUpdated { data: m.cached_data().time };
 
@@ -1446,9 +1448,9 @@ mod tests {
         }
         // The third failure flips tracking off (cadence preference
         // survives); the scheduler stays quiet from here.
-        assert!(!m.cached_data().config.gps_tracking_enabled);
+        assert!(!m.cached_data().config.gps.tracking_enabled);
         assert_eq!(
-            m.cached_data().config.gps_tracking_cadence,
+            m.cached_data().config.gps.tracking_cadence,
             crate::config::GpsTrackingCadence::Continuous,
         );
         let fx = m.handle_event(&tick, Instant::from_millis(0));
@@ -1557,7 +1559,7 @@ mod tests {
         assert!(out.contains(&Effect::RtcCommand(
             RtcCommand::SetAlarm { hour: 8, minute: 5, weekday: None }
         )));
-        assert!(m.cached_data.alarms.snoozed);
+        assert!(m.cached_data.config.alarms.snoozed);
     }
 
     #[test]

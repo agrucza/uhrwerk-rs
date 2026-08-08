@@ -337,9 +337,16 @@ impl<'d> Store<'d> {
         // `sd_online()` is only ever true when `sd` is `Some`, so the
         // `else` is unreachable in practice - kept for total safety.
         let Some(sd) = self.sd.as_mut() else { return };
-        if let Err(e) = sd.write_file(path, bytes) {
+        let mut result = sd.write_file(path, bytes);
+        if result.is_err() {
+            // Same settle-and-retry as `append_line` - blob writes
+            // are whole-file and idempotent, so a retry is safe.
+            embassy_time::block_for(embassy_time::Duration::from_millis(30));
+            result = sd.write_file(path, bytes);
+        }
+        if let Err(e) = result {
             log::warn!(
-                "store: SD mirror save {} failed ({:?}), marking SD offline",
+                "store: SD mirror save {} failed twice ({:?}), marking SD offline",
                 path, e,
             );
             self.mark_sd_offline();
@@ -383,9 +390,23 @@ impl<'d> Store<'d> {
             return;
         }
         let Some(sd) = self.sd.as_mut() else { return };
-        if let Err(e) = sd.append_line(path, bytes) {
+        let mut result = sd.append_line(path, bytes);
+        if result.is_err() {
+            // One settle-and-retry before declaring the mirror
+            // offline: a transiently busy card (observed every boot
+            // as TimeoutReadBuffer once the store moved earlier in
+            // the sequence) otherwise costs a pointless
+            // offline/recover cycle. The failed attempt already
+            // abandoned the SD session, so the retry re-acquires
+            // from a clean state. A duplicated or partial log line
+            // on the mirror is acceptable - the event log parser
+            // skips malformed lines.
+            embassy_time::block_for(embassy_time::Duration::from_millis(30));
+            result = sd.append_line(path, bytes);
+        }
+        if let Err(e) = result {
             log::warn!(
-                "store: SD mirror append {} failed ({:?}), marking SD offline",
+                "store: SD mirror append {} failed twice ({:?}), marking SD offline",
                 path, e,
             );
             self.mark_sd_offline();
