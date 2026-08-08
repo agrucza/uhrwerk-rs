@@ -11,6 +11,7 @@
 use drivers::drv2605::{Config as DrvConfig, Drv2605, RTP_MAX};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_time::{Duration, Timer};
 use system_core::bus::SharedI2c;
 
 #[derive(Clone, Copy)]
@@ -30,19 +31,39 @@ pub static HAPTIC_COMMAND: Channel<CriticalSectionRawMutex, HapticCommand, 8> =
 #[embassy_executor::task]
 pub async fn haptics_task(i2c_bus: &'static SharedI2c) {
     let drv = Drv2605::new(DrvConfig::default());
-    let online = {
-        let mut i2c = i2c_bus.lock().await;
-        match drv.init(&mut *i2c) {
+    // Init retries: at boot this task races the BHI260's ~103 KB
+    // firmware upload on the shared I2C bus, and roughly one boot in
+    // four the DRV2605's first contact failed - costing buzz for the
+    // whole uptime over one bad millisecond. Three attempts, 100 ms
+    // apart (the lock is NOT held across the wait), ride out the
+    // storm; a genuinely absent/broken chip still fails all three.
+    let mut online = false;
+    for attempt in 1..=3 {
+        let result = {
+            let mut i2c = i2c_bus.lock().await;
+            drv.init(&mut *i2c)
+        };
+        match result {
             Ok(id) => {
                 log::info!("Haptics: DRV2605 online (device id {})", id);
-                true
+                online = true;
+                break;
             }
-            Err(_) => {
-                log::error!("Haptics: DRV2605 init failed - buzz disabled");
-                false
+            Err(e) if attempt < 3 => {
+                log::warn!(
+                    "Haptics: DRV2605 init attempt {} failed: {:?} - retrying",
+                    attempt, e,
+                );
+                Timer::after(Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                log::error!(
+                    "Haptics: DRV2605 init failed {} times (last: {:?}) - buzz disabled",
+                    attempt, e,
+                );
             }
         }
-    };
+    }
 
     // Held while the motor is on: the DRV2605 drives autonomously,
     // so if hardware light sleep freezes the executor between an

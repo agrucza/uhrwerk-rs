@@ -315,7 +315,15 @@ impl Bhi260Imu {
             }
             Phase::Upload { offset } => {
                 let end = (offset + bhi260::UPLOAD_CHUNK).min(bhi260::FIRMWARE.len());
-                if self.drv.upload_chunk(i2c, &bhi260::FIRMWARE[offset..end]).is_err() {
+                if let Err(e) = self.drv.upload_chunk(i2c, &bhi260::FIRMWARE[offset..end]) {
+                    // The concrete error names the failure mechanism
+                    // (timeout vs NACK vs bus error) - boot-time
+                    // transients appeared 2026-08-08 and the bare
+                    // "chunk failed" left the diagnosis to guesswork.
+                    log::error!(
+                        "IMU: upload chunk at {}..{} failed: {:?}",
+                        offset, end, e,
+                    );
                     return self.fail("upload chunk failed");
                 }
                 if end == bhi260::FIRMWARE.len() {
@@ -368,12 +376,16 @@ impl Bhi260Imu {
                 // be read out before any configuration (Section
                 // 15.3.11); this also releases the first interrupt.
                 let mut buf = [0u8; 64];
+                // The event arrives once PER FIFO; log it once (the
+                // duplicate line read as a double firmware upload).
+                let mut announced = false;
                 for ch in [bhi260::reg::CHANNEL_WAKE_FIFO, bhi260::reg::CHANNEL_NONWAKE_FIFO] {
                     if let Ok(n) = self.drv.read_fifo(i2c, ch, &mut buf) {
                         let mut p = fifo::Parser::new(&buf[..n]);
                         while let Some(ev) = p.next_event() {
                             if let fifo::Event::Meta { kind, b2, b3, .. } = ev {
-                                if kind == fifo::meta::INITIALIZED {
+                                if kind == fifo::meta::INITIALIZED && !announced {
+                                    announced = true;
                                     log::info!(
                                         "IMU: BHI260AP firmware initialized (RAM ver {})",
                                         u16::from_le_bytes([b2, b3]),

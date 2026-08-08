@@ -1,22 +1,23 @@
-//! NFC bring-up - ST25R3916 behind the shared SPI bus.
+//! NFC boot canary - ST25R3916 behind the shared SPI bus.
 //!
-//! One probe session at boot proves the host-to-chip path and the RF
-//! front end: raise CS (the park holds it LOW against the unpowered
-//! chip - it MUST be high before the rail comes up, or the line
-//! back-feeds the dead chip), power DLDO1, run the datasheet's
-//! power-up ritual, read the IC identity, adjust and measure the
-//! regulators, then the RF proof: 13.56 MHz field on and ISO14443A
-//! REQA polling for a few seconds - any Type A card (bank card,
-//! transit card) answers with its 2-byte ATQA. Afterwards
-//! everything is torn down: field off, chip to power-down, rail
-//! off, CS back LOW. The session effort replaces this boot auto-run
-//! with something command-driven.
+//! A sub-second hardware check at boot: raise CS (the park holds it
+//! LOW against the unpowered chip - it MUST be high before the rail
+//! comes up, or the line back-feeds the dead chip), power DLDO1,
+//! run the datasheet's mandatory first contact, read the IC
+//! identity, tear down (chip to power-down, rail off, CS back LOW).
+//! Screams in the log if a hardware fault or driver regression ever
+//! kills the reader; emits no field.
+//!
+//! This replaces the bring-up probe (oscillator/regulator ritual +
+//! 20 s of ISO14443A field polling, card detection hardware-proven
+//! 2026-08-06 and retired 2026-08-08 - a 20 s field hunt on every
+//! boot earned nothing). The full probe lives in git history for
+//! the NFC session effort to draw on.
 //!
 //! Ritual facts (DS12484 rev 8, section 4.1): the overheat
 //! protection frame must be the first contact after every power-up
 //! and Set Default; sup3V must be set because DLDO1 feeds the chip
-//! 3.3 V while the reset default assumes 5 V; the oscillator is
-//! proven by osc_ok, and Adjust Regulators only runs in Ready mode.
+//! 3.3 V while the reset default assumes 5 V.
 //!
 //! The chip is SPI mode 1 - its device seat carries that config and
 //! the shared-bus wrapper applies it per transaction, so SD (mode 0)
@@ -24,18 +25,13 @@
 
 use drivers::pmu::{Config as PmuConfig, Pmu};
 use drivers::st25r3916::{regs, Error, St25r3916};
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Timer};
 use esp_hal::gpio::Output;
 use esp_hal::spi::master::Config as SpiConfig;
 use esp_hal::spi::Mode as SpiMode;
 use esp_hal::time::Rate;
 use system_core::bus::{self, SharedI2c};
 use system_core::spi_bus::{SharedSpiBus, SharedSpiDevice};
-
-/// How long the card-detect poll keeps the field up, and its retry
-/// cadence. Generous enough to fish a card out of a wallet.
-const CARD_POLL_SECS: u64 = 20;
-const CARD_POLL_GAP_MS: u64 = 500;
 
 type SpiErr = esp_hal::spi::Error;
 
@@ -81,7 +77,7 @@ pub async fn nfc_task(
     let drv = St25r3916::new();
 
     match probe(&drv, &mut spi).await {
-        Ok(()) => log::info!("NFC: probe complete"),
+        Ok(()) => log::info!("NFC: canary complete"),
         Err(e) => log::error!("NFC: probe failed: {:?}", e),
     }
 
@@ -147,100 +143,9 @@ async fn probe(
         return Ok(());
     }
 
-    // 3. Ready mode: oscillator + regulators on, proven by osc_ok.
-    drv.update_reg(spi, regs::reg_a::OP_CONTROL, 0, regs::op_control::EN)?;
-    let mut osc = false;
-    for _ in 0..100 {
-        Timer::after(Duration::from_millis(1)).await;
-        if drv.aux_display(spi)? & regs::aux_display::OSC_OK != 0 {
-            osc = true;
-            break;
-        }
-    }
-    if !osc {
-        log::warn!("NFC: 27.12 MHz oscillator never stabilized - aborting");
-        return Ok(());
-    }
-    log::info!("NFC: oscillator running");
-
-    // 4. Regulator adjustment (improves PSRR per the ritual), then
-    //    read back what the regulators settled at.
-    drv.adjust_regulators(spi)?;
-    wait_irq_timer_nfc(drv, spi, regs::irq_timer_nfc::DCT, 10).await?;
-    match drv.regulator_result_mv_3v3(spi)? {
-        Some(mv) => log::info!("NFC: regulators adjusted (VDD_RF {} mV)", mv),
-        None => log::warn!("NFC: regulator display below 3.3 V-mode range"),
-    }
-    // Supply sanity: measure VDD through the chip's own A/D
-    // (23.4 mV per LSB).
-    drv.measure_power_supply(spi, 0)?;
-    wait_irq_timer_nfc(drv, spi, regs::irq_timer_nfc::DCT, 5).await?;
-    let vdd_mv = drv.ad_result(spi)? as u32 * 234 / 10;
-    log::info!("NFC: VDD measures ~{} mV", vdd_mv);
-
-    // 5. RF proof: ISO14443A reader field + REQA poll. Mode om=0001
-    //    initiator ISO14443A, OOK modulation; 106 kbit/s both ways.
-    //    REQA/ATQA needs no CRC handling (automatic per 4.4.4) and
-    //    no FIFO preparation.
-    drv.write_reg(spi, regs::reg_a::MODE, &[0x08])?;
-    drv.write_reg(spi, regs::reg_a::BIT_RATE, &[0x00])?;
-    drv.update_reg(
-        spi,
-        regs::reg_a::OP_CONTROL,
-        0,
-        regs::op_control::TX_EN | regs::op_control::RX_EN,
-    )?;
-    // ISO14443-3 guard time before the first command.
-    Timer::after(Duration::from_millis(6)).await;
-    log::info!(
-        "NFC: field on - present an ISO14443A card within {} s",
-        CARD_POLL_SECS,
-    );
-    let deadline = Instant::now() + Duration::from_secs(CARD_POLL_SECS);
-    let mut found = false;
-    'poll: while Instant::now() < deadline {
-        drv.direct_command(spi, regs::cmd::TRANSMIT_REQA)?;
-        // ATQA arrives within ~100 us of the REQA end; poll the
-        // (self-clearing) interrupt registers briefly.
-        for _ in 0..5 {
-            Timer::after(Duration::from_millis(2)).await;
-            let irqs = drv.read_interrupts(spi)?;
-            if irqs.main & regs::irq_main::RX_END != 0 {
-                let st = drv.fifo_status(spi)?;
-                let n = (st.bytes as usize).min(4);
-                let mut atqa = [0u8; 4];
-                drv.fifo_read(spi, &mut atqa[..n])?;
-                log::info!(
-                    "NFC: card detected! ATQA {:02X?} (RSSI am/pm {:?})",
-                    &atqa[..n],
-                    drv.rssi(spi)?,
-                );
-                found = true;
-                break 'poll;
-            }
-        }
-        Timer::after(Duration::from_millis(CARD_POLL_GAP_MS)).await;
-    }
-    if !found {
-        log::info!("NFC: no card seen in the poll window");
-    }
-    Ok(())
-}
-
-/// Poll the (read-clears) interrupt registers until a timer/NFC bit
-/// shows up or the budget in milliseconds runs out.
-async fn wait_irq_timer_nfc(
-    drv: &St25r3916,
-    spi: &mut SharedSpiDevice,
-    bit: u8,
-    budget_ms: u32,
-) -> Result<(), Error<SpiErr>> {
-    for _ in 0..budget_ms {
-        Timer::after(Duration::from_millis(1)).await;
-        if drv.read_interrupts(spi)?.timer_nfc & bit != 0 {
-            return Ok(());
-        }
-    }
-    log::warn!("NFC: command-termination IRQ not seen within {} ms", budget_ms);
+    // Identity readable = SPI path, power-up ritual and silicon all
+    // good - the canary's job is done. Oscillator, regulators and
+    // the ISO14443A field were proven during bring-up and return
+    // with the session effort.
     Ok(())
 }

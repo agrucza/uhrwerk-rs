@@ -453,9 +453,16 @@ impl Bringup for TwatchUltraBringup {
         // whole radio -> NTP -> RTC path without UI. Interim fixed
         // CEST offset, same as GPS's first phase - the real trigger
         // carries config.tz_offset_minutes. REMOVE with Phase B.
-        system_core::wifi::WIFI_COMMAND.signal(
-            system_core::wifi::WifiCommand::SyncOnce { tz_offset_minutes: 120 },
-        );
+        //
+        // Kicked DELAYED: with the radio active during the boot
+        // storm, esp-radio's preemption stretched I2C transactions
+        // past their timeouts - every DRV2605/BHI260 boot-init
+        // failure observed 2026-08-08 landed inside the WiFi session
+        // window. Ten seconds puts the session after the IMU's
+        // ~103 KB firmware upload and the haptics init. The radio-
+        // vs-live-I2C interaction still needs a real look when
+        // sessions start running mid-use (provisioning effort).
+        spawner.spawn(wifi_bringup_kick().unwrap());
     }
 
     /// This board carries a GNSS receiver with a live sync task (the
@@ -682,6 +689,20 @@ async fn audio_task(
             }
         };
     }
+}
+
+/// BRING-UP: the delayed WiFi sync kick (see its spawn site in
+/// `spawn_audio`). Ten seconds clears the boot storm - the IMU's
+/// ~103 KB firmware upload, haptics init - before the radio session
+/// starts; the boot-time I2C init transients of 2026-08-08 all
+/// happened with the session overlapping that storm. Dies together
+/// with the boot auto-kick when the provisioning UI lands.
+#[embassy_executor::task]
+async fn wifi_bringup_kick() {
+    Timer::after(Duration::from_secs(10)).await;
+    system_core::wifi::WIFI_COMMAND.signal(
+        system_core::wifi::WifiCommand::SyncOnce { tz_offset_minutes: 120 },
+    );
 }
 
 #[esp_rtos::main]
