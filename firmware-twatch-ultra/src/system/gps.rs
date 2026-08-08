@@ -38,6 +38,7 @@ use esp_hal::Async;
 use system_core::bus::{
     self, GpsCommand, RtcCommand, SharedI2c, EVENTS, GPS_COMMAND, RTC_COMMAND,
 };
+use system_core::clock_math::add_minutes;
 
 /// How long a manual (`SyncOnce`) session may hunt before giving up
 /// and powering the receiver back down. Cold start under open sky
@@ -417,47 +418,3 @@ fn sync_rtc(pvt: &nav::NavPvt, tz_offset_minutes: i16) -> (u8, u8) {
     (hour, minute)
 }
 
-/// Calendar-correct minute-offset shift of a UTC date/time,
-/// including day/month/year rollover in both directions.
-fn add_minutes(year: u16, month: u8, day: u8, hour: u8, min: u8, offset: i32) -> (u16, u8, u8, u8, u8) {
-    let mut y = year as i32;
-    let mut mo = month as i32;
-    let mut d = day as i32;
-    let mut total = hour as i32 * 60 + min as i32 + offset;
-    while total < 0 {
-        total += 24 * 60;
-        d -= 1;
-        if d < 1 {
-            mo -= 1;
-            if mo < 1 {
-                mo = 12;
-                y -= 1;
-            }
-            d = days_in_month(y, mo);
-        }
-    }
-    while total >= 24 * 60 {
-        total -= 24 * 60;
-        d += 1;
-        if d > days_in_month(y, mo) {
-            d = 1;
-            mo += 1;
-            if mo > 12 {
-                mo = 1;
-                y += 1;
-            }
-        }
-    }
-    (y as u16, mo as u8, d as u8, (total / 60) as u8, (total % 60) as u8)
-}
-
-fn days_in_month(year: i32, month: i32) -> i32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        _ => {
-            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-            if leap { 29 } else { 28 }
-        }
-    }
-}

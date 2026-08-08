@@ -43,3 +43,12 @@ lto           = "fat"
 # Keep debug symbols in ELF for espflash panic symbolication.
 # They are stripped from the flash image automatically.
 debug         = 2
+
+# esp-radio's docs require optimization level 2/3 for the radio glue
+# regardless of the profile - below that the WiFi blob's timing
+# assumptions break and association can fail outright.
+[profile.dev.package.esp-radio]
+opt-level = 3
+
+[profile.release.package.esp-radio]
+opt-level = 3

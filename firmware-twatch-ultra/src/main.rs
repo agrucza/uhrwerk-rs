@@ -22,6 +22,9 @@ extern crate alloc;
 
 mod board;
 mod system;
+// Throwaway WiFi credentials (gitignored; template next to it).
+// Dies when on-device provisioning lands.
+mod wifi_secrets;
 
 use crate::system::power::{LoraSleepPins, TwatchUltraBoard};
 use drivers::touch::cst9217::Cst9217;
@@ -112,6 +115,9 @@ struct TwatchUltraBringup {
     /// enabling DLDO1.
     nfc_cs_out: Option<Output<'static>>,
     lpwr: Option<p::LPWR<'static>>,
+    // WiFi radio - session-gated NTP sync, see system-core's wifi
+    // module.
+    wifi: Option<p::WIFI<'static>>,
 }
 
 impl Bringup for TwatchUltraBringup {
@@ -426,6 +432,24 @@ impl Bringup for TwatchUltraBringup {
             )
             .unwrap(),
         );
+        // WiFi: session-gated NTP sync; credentials are the
+        // throwaway wifi_secrets scheme until on-device provisioning
+        // (scan + on-screen keyboard) lands.
+        spawner.spawn(
+            system_core::wifi::wifi_task(
+                self.wifi.take().unwrap(),
+                crate::wifi_secrets::WIFI_SSID,
+                crate::wifi_secrets::WIFI_PASSWORD,
+            )
+            .unwrap(),
+        );
+        // BRING-UP: one sync per boot so every flash exercises the
+        // whole radio -> NTP -> RTC path without UI. Interim fixed
+        // CEST offset, same as GPS's first phase - the real trigger
+        // carries config.tz_offset_minutes. REMOVE with Phase B.
+        system_core::wifi::WIFI_COMMAND.signal(
+            system_core::wifi::WifiCommand::SyncOnce { tz_offset_minutes: 120 },
+        );
     }
 
     /// This board carries a GNSS receiver with a live sync task (the
@@ -714,6 +738,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         lora_cs_out: None,
         nfc_cs_out: None,
         lpwr: Some(peripherals.LPWR),
+        wifi: Some(peripherals.WIFI),
     };
 
     run(bringup, spawner).await
