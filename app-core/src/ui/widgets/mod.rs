@@ -21,6 +21,7 @@ pub mod bodies;
 pub mod chrome;
 pub mod containers;
 pub mod controls;
+pub mod keyboard;
 pub mod picker;
 pub mod scrollable;
 pub mod wheel;
@@ -33,6 +34,7 @@ pub use chrome::{
     STATUS_BAR_H,
 };
 pub use containers::{chamfered_panel, info_tile, tag_label, tile, NOTCH, TAG_LABEL_H};
+pub use keyboard::{Keyboard, KeyboardResult};
 pub use controls::{
     chamfered_button, slider, slider_value_from_x, toggle, ButtonVariant,
     SLIDER_BAR_H, TOGGLE_H, TOGGLE_W,

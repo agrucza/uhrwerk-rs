@@ -35,9 +35,9 @@ use crate::ui::types::{
 use crate::ui::widgets::{
     action_row_rects, chamfered_button, chamfered_panel, fmt_2digit, handle_scroll_drag,
     header, header_icon_hit, home_indicator, render_action_row, render_scrolled, row,
-    slider, slider_value_from_x, status_bar, tag_label, toggle, ButtonVariant, Picker,
-    RowControl, Wheel, NOTCH, ROW_H, SCROLLBAR_GUTTER, SLIDER_BAR_H, STATUS_BAR_H,
-    TAG_LABEL_H, TOGGLE_H, TOGGLE_W, WHEEL_TOTAL_H,
+    slider, slider_value_from_x, status_bar, tag_label, toggle, ButtonVariant, Keyboard,
+    KeyboardResult, Picker, RowControl, Wheel, NOTCH, ROW_H, SCROLLBAR_GUTTER,
+    SLIDER_BAR_H, STATUS_BAR_H, TAG_LABEL_H, TOGGLE_H, TOGGLE_W, WHEEL_TOTAL_H,
 };
 
 /// Slider lower bound for brightness in the Display sub-view -
@@ -178,9 +178,12 @@ enum SettingsView {
     /// Display preferences (brightness slider + auto-lock). Stub
     /// for now; real contents land in W3d.
     Display,
-    /// Wi-Fi configuration / status. Stub for now; real contents
-    /// land when networking is wired up.
+    /// Wi-Fi configuration / status. Passphrase entry works (RAM
+    /// draft only); scan + stored credentials land with the
+    /// provisioning effort.
     Wifi,
+    /// Full-screen passphrase keyboard, opened from the Wifi view.
+    WifiPassphrase,
     /// Bluetooth pairing / status. Stub for now; real contents
     /// land when BLE is wired up.
     Bluetooth,
@@ -567,6 +570,13 @@ pub struct SettingsScreen {
     /// MicTest sub-view LOOP toggle: true while mic -> speaker
     /// loopback is the active meter mode (vs. meter-only capture).
     mic_loopback: bool,
+    /// Entry state of the WifiPassphrase sub-view's text field. 63 =
+    /// the WPA2 passphrase maximum.
+    wifi_passphrase_keyboard: Keyboard,
+    /// RAM-only passphrase draft - survives view switches, dies on
+    /// reboot. Becomes stored credentials once the config blob is
+    /// versioned (provisioning effort).
+    wifi_draft: String<64>,
 }
 
 impl SettingsScreen {
@@ -588,6 +598,8 @@ impl SettingsScreen {
             motion_phase: 0,
             motion_last: None,
             mic_loopback: false,
+            wifi_passphrase_keyboard: Keyboard::new(63),
+            wifi_draft: String::new(),
         }
     }
 
@@ -630,7 +642,8 @@ impl Screen for SettingsScreen {
             SettingsView::StorageRestoreFlash => self.render_storage_restore(display, data, ctx),
             SettingsView::StorageFactoryReset => self.render_storage_factory_reset(display, data, ctx),
             SettingsView::Display   => self.render_display(display, data, ctx),
-            SettingsView::Wifi      => self.render_stub(display, data, "WIFI", ctx),
+            SettingsView::Wifi      => self.render_wifi(display, data, ctx),
+            SettingsView::WifiPassphrase => self.render_wifi_passphrase(display, data, ctx),
             SettingsView::Bluetooth => self.render_stub(display, data, "BLUETOOTH", ctx),
             SettingsView::Zigbee    => self.render_stub(display, data, "ZIGBEE", ctx),
         }
@@ -656,8 +669,9 @@ impl Screen for SettingsScreen {
             SettingsView::StorageRestoreFlash => self.storage_restore_event(event, data),
             SettingsView::StorageFactoryReset => self.storage_factory_reset_event(event, data),
             SettingsView::Display => self.display_event(event, data),
-            SettingsView::Wifi
-            | SettingsView::Bluetooth
+            SettingsView::Wifi => self.wifi_event(event, data),
+            SettingsView::WifiPassphrase => self.wifi_passphrase_event(event, data),
+            SettingsView::Bluetooth
             | SettingsView::Zigbee => self.stub_event(event, data),
         }
     }
@@ -926,6 +940,124 @@ impl SettingsScreen {
                 }
             }
             _ => Action::None,
+        }
+    }
+}
+
+// -- Wi-Fi sub-view ----------------------------------------------------------
+
+/// The passphrase panel - single source for render and hit-test.
+fn wifi_panel_rect() -> Rectangle {
+    let mut s = layout::VStack::new(LEAF_TOP_Y);
+    s.slot(80)
+}
+
+impl SettingsScreen {
+    fn render_wifi<D: DrawTarget<Color = Rgb565>>(
+        &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
+    ) {
+        draw_header(display, data, "WIFI", theme::SIGNAL, ctx);
+
+        let panel = wifi_panel_rect();
+        chamfered_panel(display, panel, NOTCH, theme::STEEL, 1);
+        tag_label(
+            display,
+            panel.top_left.x,
+            panel.top_left.y,
+            "PASSPHRASE",
+            theme::STEEL,
+            NOTCH,
+        );
+        let inner = Rectangle::new(
+            Point::new(panel.top_left.x, panel.top_left.y + TAG_LABEL_H),
+            Size::new(panel.size.width, panel.size.height - TAG_LABEL_H as u32),
+        );
+        if self.wifi_draft.is_empty() {
+            fonts::draw_centered_in_rect(
+                display, &fonts::value(), "NOT SET", inner, theme::FG_DIM,
+            );
+        } else {
+            let mut dots: String<24> = String::new();
+            for _ in 0..self.wifi_draft.chars().count().min(24) {
+                let _ = dots.push('*');
+            }
+            fonts::draw_centered_in_rect(
+                display, &fonts::value(), dots.as_str(), inner, theme::FG,
+            );
+        }
+
+        // Until the versioned config blob can carry credentials the
+        // draft lives in RAM only - say so instead of implying it
+        // stuck.
+        let note = Rectangle::new(
+            Point::new(0, panel.top_left.y + panel.size.height as i32 + 10),
+            Size::new(theme::SCREEN_W as u32, 24),
+        );
+        fonts::draw_centered_in_rect(
+            display, &fonts::caption(),
+            "TAP TO EDIT - RAM ONLY FOR NOW", note, theme::FG_DIM,
+        );
+    }
+
+    fn wifi_event(&mut self, event: &SystemEvent, _data: &mut SystemData) -> Action {
+        match event {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+                self.view = SettingsView::Index;
+                Action::Redraw
+            }
+            SystemEvent::Swipe {
+                dir: crate::events::SwipeDir::Right,
+                region: crate::events::SwipeRegion::Content,
+                ..
+            } => {
+                self.view = SettingsView::Index;
+                Action::Redraw
+            }
+            SystemEvent::Tap { x, y } => {
+                if rect_hit(wifi_panel_rect(), *x, *y) {
+                    self.wifi_passphrase_keyboard.seed(self.wifi_draft.as_str());
+                    self.view = SettingsView::WifiPassphrase;
+                    Action::Redraw
+                } else {
+                    Action::None
+                }
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn render_wifi_passphrase<D: DrawTarget<Color = Rgb565>>(
+        &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
+    ) {
+        draw_header(display, data, "PASSPHRASE", theme::SIGNAL, ctx);
+        self.wifi_passphrase_keyboard.render(display);
+    }
+
+    fn wifi_passphrase_event(
+        &mut self, event: &SystemEvent, _data: &mut SystemData,
+    ) -> Action {
+        // Header back = cancel: the draft stays what it was.
+        if let SystemEvent::Tap { x, y } = event {
+            if header_back_hit(*x, *y) {
+                self.view = SettingsView::Wifi;
+                return Action::Redraw;
+            }
+        }
+        match self.wifi_passphrase_keyboard.handle_event(event) {
+            KeyboardResult::Changed => Action::Redraw,
+            KeyboardResult::Done => {
+                self.wifi_draft.clear();
+                let _ = self
+                    .wifi_draft
+                    .push_str(self.wifi_passphrase_keyboard.text());
+                self.view = SettingsView::Wifi;
+                Action::Redraw
+            }
+            KeyboardResult::Cancelled => {
+                self.view = SettingsView::Wifi;
+                Action::Redraw
+            }
+            KeyboardResult::None => Action::None,
         }
     }
 }
