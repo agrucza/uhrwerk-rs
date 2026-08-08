@@ -56,7 +56,15 @@ pub async fn nfc_task(
     cs.set_high();
     if !set_rail(i2c_bus, true).await {
         cs.set_low();
-        core::future::pending::<()>().await
+        // Release the wake lock BEFORE parking the task forever -
+        // holding it here would silently disable hardware light
+        // sleep for the whole uptime (the fake-sleep bug: display
+        // off, executor idling awake, battery draining at
+        // awake-level current with no log to show for it). The
+        // `return` also tells the borrow checker this branch never
+        // reaches the tail (pending()'s type alone doesn't).
+        drop(_wake);
+        return core::future::pending::<()>().await;
     }
     // Rail settle + chip POR.
     Timer::after(Duration::from_millis(5)).await;
@@ -85,6 +93,11 @@ pub async fn nfc_task(
     let mut cs = spi.release();
     cs.set_low();
     log::info!("NFC: ST25R3916 parked (rail off, CS low)");
+    // Release the wake lock BEFORE parking the task forever (same
+    // hazard as the early-return path above - a held lock here cost
+    // two days of fake sleep before the missing 5 s heartbeat logs
+    // gave it away).
+    drop(_wake);
     // Keep the task (and thus the driven CS pin) alive forever.
     core::future::pending::<()>().await
 }

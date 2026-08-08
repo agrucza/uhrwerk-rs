@@ -273,8 +273,20 @@ async fn bringup(
     );
     let deadline = Instant::now() + Duration::from_secs(SNIFF_WINDOW_SECS);
     let mut packets = 0u32;
+    let mut polls = 0u32;
     while Instant::now() < deadline {
         Timer::after(Duration::from_millis(SNIFF_POLL_MS)).await;
+        // ~10 s heartbeat: the window is otherwise a full minute of
+        // silence, which reads as a hang on the monitor - a silent
+        // window got healthy boots reset by hand until this line
+        // existed (2026-08-08). Keep it.
+        polls += 1;
+        if polls % 100 == 0 {
+            log::info!(
+                "LoRa: sniff alive, {} s left",
+                (deadline.saturating_duration_since(Instant::now())).as_secs(),
+            );
+        }
         let irq = drv.irq_status(spi, busy)?;
         if irq == 0 {
             continue;
