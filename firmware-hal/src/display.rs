@@ -99,40 +99,96 @@ pub const FB_BYTES_PER_TILE: usize = TILE_H as usize * WIDTH as usize * 2;
 
 // -- Framebuffer storage -----------------------------------------------------
 //
-// The render-pass framebuffer is a single tile's worth of RGB565 pixels
-// (~41 KB), declared as a `static mut` so it lands in internal-SRAM BSS
-// regardless of which board variant we're built for.
+// Every board renders TILED into a band-sized staging buffer - that is
+// the one proven, internal-SRAM-speed render path. The `psram-fb`
+// feature only changes where the staging buffer lives and adds a
+// second, full-panel buffer on top:
 //
-// Why a static and not `alloc::vec![..].leak()` (the old pattern):
-//   - On boards where the default heap lives in PSRAM (S3), a leaked
-//     Vec would put the FB in PSRAM. Pulling pixels from PSRAM into the
-//     bus's internal-SRAM `DmaTxBuf` on every flush would cost an extra
-//     cross-bus copy (~2-3x slower than SRAM-to-SRAM). Forcing the FB
-//     into internal SRAM keeps the per-tile flush copy fast.
-//   - On boards without PSRAM (C6) the heap is already in internal SRAM,
-//     so the placement is the same either way - but having every
-//     firmware variant take the FB from this single static keeps the
-//     display path free of per-board allocator divergence.
+//   - Default: staging = a `TILE_H`-row static in internal-SRAM BSS.
+//   - `psram-fb`: staging = a heap allocation of the same size (the
+//     heap is internal SRAM; using it instead of a static keeps the
+//     41 KB out of BSS, which on boards where the main stack is
+//     RAM-left-after-statics goes straight into stack headroom), PLUS
+//     `take_psram_canvas()`: the whole panel (~402 KB) carved from the
+//     head of the mapped PSRAM region. The canvas is NOT the render
+//     target - the render loop mirrors each pushed staging band into
+//     it, keeping a coherent full-panel copy for compositing effects
+//     to read. Rendering directly into PSRAM was tried and measured:
+//     per-byte external-memory access made a settings-scroll frame
+//     ~130 ms vs the ~47 ms tile baseline.
 //
-// Taken at most once via [`take_framebuffer`]; a double-take panics so
-// the failure mode of two render paths fighting over the FB is loud
+// The staging buffer is taken at most once; a double-take panics so
+// the failure mode of two render paths fighting over it is loud
 // rather than silent.
-static mut FRAMEBUFFER: [u8; FB_BYTES_PER_TILE] = [0u8; FB_BYTES_PER_TILE];
 static FRAMEBUFFER_TAKEN: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Take ownership of the static framebuffer. Lives in internal-SRAM BSS
-/// on both S3 and C6. Call exactly once at display init; a second call
-/// panics.
+#[cfg(not(feature = "psram-fb"))]
+static mut FRAMEBUFFER: [u8; FB_BYTES_PER_TILE] = [0u8; FB_BYTES_PER_TILE];
+
+/// Take ownership of the tile staging framebuffer. Call exactly once
+/// at display init; a second call panics.
+///
+/// Default build: the internal-SRAM BSS static (why a static and not
+/// `alloc::vec![..].leak()`: it keeps the display path free of
+/// per-board allocator divergence). `psram-fb` build: a leaked heap
+/// allocation of the same size - same memory class (the heap is
+/// internal SRAM), but BSS stays 41 KB smaller for stack headroom.
 pub fn take_framebuffer() -> &'static mut [u8] {
     use core::sync::atomic::Ordering;
     if FRAMEBUFFER_TAKEN.swap(true, Ordering::AcqRel) {
         panic!("display framebuffer already taken - take_framebuffer() may only be called once");
     }
-    // SAFETY: AtomicBool above guarantees this code path runs at most
-    // once across all execution contexts, so the returned `&mut` slice
-    // has unique access. The static is `'static`-lived.
-    unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUFFER) }
+    #[cfg(not(feature = "psram-fb"))]
+    {
+        // SAFETY: AtomicBool above guarantees this code path runs at
+        // most once across all execution contexts, so the returned
+        // `&mut` slice has unique access. The static is `'static`-lived.
+        unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUFFER) }
+    }
+    #[cfg(feature = "psram-fb")]
+    {
+        alloc::vec![0u8; FB_BYTES_PER_TILE].leak()
+    }
+}
+
+/// Take ownership of the full-panel canvas ([`FB_BYTES`]) carved from
+/// the head of the mapped PSRAM region. Call exactly once; a second
+/// call panics.
+///
+/// This is the persistent whole-panel pixel store the render loop
+/// mirrors pushed staging bands into - never the direct render target
+/// (see the module note above). Future PSRAM users (asset caches etc.)
+/// must carve at `psram.raw_parts()` past [`FB_BYTES`] - this function
+/// owns the region's head.
+///
+/// The canvas does not survive light sleep on boards that gate the
+/// PSRAM rail; that's fine by contract - sleep is only entered with
+/// the display off, and every wake forces a full re-render (see the
+/// render loop in system-core).
+#[cfg(feature = "psram-fb")]
+pub fn take_psram_canvas(psram: &esp_hal::psram::Psram) -> &'static mut [u8] {
+    use core::sync::atomic::Ordering;
+    static CANVAS_TAKEN: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    if CANVAS_TAKEN.swap(true, Ordering::AcqRel) {
+        panic!("PSRAM canvas already taken - take_psram_canvas() may only be called once");
+    }
+    let (ptr, len) = psram.raw_parts();
+    // raw_parts() returns (null, 0) when PSRAM init failed - fail loud
+    // here rather than mirroring into a null slice.
+    assert!(
+        len >= FB_BYTES,
+        "PSRAM init failed or region too small for the full-panel canvas",
+    );
+    // SAFETY: raw_parts() returns the DCache-mapped PSRAM data region,
+    // which stays mapped for the program's lifetime (esp-hal has no
+    // unmap). The atomic take above makes this `&mut` exclusive;
+    // nothing else in the firmware references PSRAM (the heap stays in
+    // internal SRAM).
+    let fb = unsafe { core::slice::from_raw_parts_mut(ptr, FB_BYTES) };
+    fb.fill(0); // PSRAM is not zeroed like BSS; start deterministic
+    fb
 }
 
 /// Bus state machine: either we own the hardware and a free DMA buffer

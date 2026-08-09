@@ -10,4 +10,7 @@
 //! Everything else board-agnostic (the system layer + the storage
 //! subsystem, including `flash_fs`/`fs`) lives in `system-core`.
 
+#[cfg(feature = "psram-fb")]
+extern crate alloc;
+
 pub mod display;

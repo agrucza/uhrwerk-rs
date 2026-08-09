@@ -383,13 +383,21 @@ impl<'fb, B, RST> CO5300<'fb, B, RST> {
 
         let hi = (color >> 8) as u8;
         let lo = (color & 0xFF) as u8;
+        // Build one row of the fill pattern, then memcpy it into each
+        // FB row. Sequential wide copies instead of per-byte stores:
+        // on a PSRAM-resident FB every individual store pays external-
+        // memory latency (plus a cache-line fill on first touch), so
+        // byte-wise filling is the slowest possible access pattern.
+        let w_bytes = (cx1 - cx0) as usize * 2;
+        let mut row_buf = [0u8; WIDTH as usize * 2];
+        for px in row_buf[..w_bytes].chunks_exact_mut(2) {
+            px[0] = hi;
+            px[1] = lo;
+        }
         for row in cy0..cy1 {
-            let row_base = row as usize * WIDTH as usize;
-            for col in cx0..cx1 {
-                let idx = (row_base + col as usize) * 2;
-                self.framebuffer[idx]     = hi;
-                self.framebuffer[idx + 1] = lo;
-            }
+            let start = (row as usize * WIDTH as usize + cx0 as usize) * 2;
+            self.framebuffer[start..start + w_bytes]
+                .copy_from_slice(&row_buf[..w_bytes]);
         }
     }
 

@@ -81,5 +81,5 @@ esp32s3 = { version = "0.35", features = ["critical-section"] }
 # through system-core/firmware-hal.
 app-core     = { path = "../app-core", features = ["serde"] }
 drivers      = { path = "../drivers", features = ["display", "pmu", "xl9555", "cst9217", "drv2605", "imu", "bhi260", "ublox", "sx1262", "st25r3916"] }
-firmware-hal = { path = "../firmware-hal" }
+firmware-hal = { path = "../firmware-hal", features = ["psram-fb"] }
 system-core  = { path = "../system-core", features = ["wifi"] }

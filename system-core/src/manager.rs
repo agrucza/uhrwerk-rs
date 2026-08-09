@@ -122,6 +122,9 @@ pub struct SystemParts<B: Board> {
     pub i2c_bus: &'static crate::bus::SharedI2c,
     pub board: B,
     pub display: Display<'static>,
+    /// Full-panel pixel canvas on boards with PSRAM (see
+    /// [`Bringup::take_fb_canvas`]); `None` on tile-only boards.
+    pub fb_canvas: Option<&'static mut [u8]>,
     pub lcd_te: Option<Input<'static>>,
     pub rtc: esp_hal::rtc_cntl::Rtc<'static>,
     pub store: crate::storage::Store<'static>,
@@ -182,6 +185,12 @@ pub struct SystemManager<'d, B: Board> {
     // [`NUM_TILES`] so every tile (including the short final tile that
     // overlaps the bottom of the panel) has its own slot.
     tile_hashes: [u32; NUM_TILES],
+
+    // Full-panel pixel canvas (PSRAM boards, `None` elsewhere). Every
+    // pushed tile is mirrored into it so it always holds what the
+    // panel shows; compositing effects read it. Never rendered into
+    // directly - see `render()`.
+    fb_canvas: Option<&'static mut [u8]>,
 
     // Force a full re-render on the next render() call, ignoring the
     // active screen's `dirty_rects()` opinion. Set after wake / display-
@@ -267,6 +276,7 @@ impl<B: Board> SystemManager<'static, B> {
             i2c_bus,
             mut board,
             display,
+            fb_canvas,
             lcd_te,
             rtc,
             mut store,
@@ -353,6 +363,7 @@ impl<B: Board> SystemManager<'static, B> {
             model,
             tick_count: 0,
             tile_hashes: [0u32; NUM_TILES],
+            fb_canvas,
             // First render after boot has no snapshot to diff; force
             // a full pass before dirty_rects takes over.
             force_full_redraw: true,
@@ -934,7 +945,23 @@ impl<B: Board> SystemManager<'static, B> {
         // multi-second territory.
         const IDLE_TICK: Duration = Duration::from_secs(1);
         match select(EVENTS.receive(), Timer::after(IDLE_TICK)).await {
-            Either::First(event) => self.handle_event(event).await,
+            Either::First(event) => {
+                self.handle_event(event).await;
+                // Drain the whole backlog BEFORE rendering, so the one
+                // frame below reflects the latest state instead of
+                // replaying history one frame per stale event. Touch
+                // drags produce position samples several times faster
+                // than a frame renders; handling one event per frame
+                // let the 32-slot channel back up, which showed as
+                // ~1 s of scroll lag plus a phantom "glide" after
+                // finger lift (the queue finishing its replay).
+                // Event handling is micro-seconds; the producers are
+                // rate-limited by their hardware, so this loop always
+                // empties quickly and cannot starve the render.
+                while let Ok(event) = EVENTS.try_receive() {
+                    self.handle_event(event).await;
+                }
+            }
             Either::Second(_) => {} // idle heartbeat
         }
 
@@ -993,6 +1020,18 @@ impl<B: Board> SystemManager<'static, B> {
     /// only thing that varies is whether DMA from the bus's TX buffer is
     /// pipelined with the next tile's CPU work, which is decided inside
     /// the bus implementation, not here.
+    ///
+    /// Boards with PSRAM additionally provide `fb_canvas`, a full-panel
+    /// pixel store: every pushed tile is mirrored into it with one
+    /// sequential copy (PSRAM's fast access pattern), so the canvas
+    /// always holds what the panel shows and compositing effects can
+    /// read it. Rendering INTO the canvas directly was tried and
+    /// measured at ~130 ms per settings-scroll frame (vs ~47 ms tiled)
+    /// - external RAM pays per access, so all drawing stays in the
+    /// internal staging tile. The canvas deliberately does NOT need to
+    /// survive light sleep (its rail may be gated): sleep is only
+    /// entered with the display off, and every wake sets
+    /// `force_full_redraw`, which re-renders + re-mirrors everything.
     async fn render(&mut self) {
         let render_start = Instant::now();
         // Clone the cache so we can freely borrow `&mut self.model`
@@ -1119,6 +1158,22 @@ impl<B: Board> SystemManager<'static, B> {
                     waited_for_te = true;
                 }
                 self.display.flush_tile().await;
+
+                // Mirror the pushed tile into the full-panel canvas
+                // (PSRAM boards only). One sequential copy per tile -
+                // the access pattern external RAM is fast at - and it
+                // overlaps the tile's still-running flush DMA, which
+                // reads from the bus's own TX buffer, not this FB.
+                // Mirroring only pushed tiles keeps the canvas exactly
+                // in sync with the panel: a hash-skipped tile was
+                // mirrored when it was last pushed.
+                if let Some(canvas) = self.fb_canvas.as_deref_mut() {
+                    let rows = (HEIGHT - tile_y).min(TILE_H) as usize;
+                    let start = tile_y as usize * ROW_STRIDE;
+                    let bytes = rows * ROW_STRIDE;
+                    canvas[start..start + bytes]
+                        .copy_from_slice(&self.display.framebuffer()[..bytes]);
+                }
             }
         }
 
@@ -1206,6 +1261,16 @@ pub trait Bringup {
     /// The tearing-effect input, when the board routes one to a GPIO.
     fn make_lcd_te(&mut self) -> Option<Input<'static>>;
 
+    /// The full-panel pixel canvas, on boards that carry PSRAM. Called
+    /// after [`make_display`](Bringup::make_display) (boards typically
+    /// map PSRAM during display bring-up). The render loop mirrors
+    /// every pushed tile into it; `None` (the default) means tile-only
+    /// rendering with no mirror - the correct answer for boards
+    /// without external RAM.
+    fn take_fb_canvas(&mut self) -> Option<&'static mut [u8]> {
+        None
+    }
+
     /// Touch + BOOT-button task states; also arms their wake GPIOs.
     async fn make_input(
         &mut self,
@@ -1291,6 +1356,7 @@ pub async fn run<T: Bringup>(
     );
 
     let display = bringup.make_display(&config).await;
+    let fb_canvas = bringup.take_fb_canvas();
     let lcd_te = bringup.make_lcd_te();
     let (touch, boot_button) = bringup.make_input(&mut i2c).await;
     let (rtc_state, imu) = bringup.make_sensors(&mut i2c).await;
@@ -1309,6 +1375,7 @@ pub async fn run<T: Bringup>(
         i2c_bus,
         board,
         display,
+        fb_canvas,
         lcd_te,
         rtc,
         store,

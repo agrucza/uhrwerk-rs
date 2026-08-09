@@ -14,13 +14,13 @@
 //! ## Memory note
 //!
 //! The PSRAM on this board is the APS6404L: 8 MB **quad**-SPI SDR, not
-//! the octal (OPI) part the Waveshare S3 carries. It is left entirely
-//! uninitialized - all boards run the internal-SRAM heap + static
-//! framebuffer model. If PSRAM is ever revived here (e.g. large audio
-//! buffers for the voice-assistant work), the esp-hal config must be
-//! quad mode; the old S3 octal init would not work, and quad bandwidth
-//! is about half of octal, so keep bulk-throughput users (framebuffer)
-//! out of it.
+//! the octal (OPI) part the Waveshare S3 carries - the esp-hal config
+//! must be quad mode, and quad bandwidth is about half of octal. It
+//! holds exactly one thing: the full-panel canvas (mapped in
+//! `make_display`) that the render loop mirrors pushed tiles into -
+//! rendering itself stays in the internal staging tile. The heap stays
+//! in internal SRAM, so no live data beyond the re-mirrorable canvas
+//! depends on the PSRAM rail across light sleep.
 
 #![allow(dead_code)]
 

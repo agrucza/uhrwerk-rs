@@ -78,6 +78,10 @@ struct TwatchUltraBringup {
     lcd_sio3: Option<p::GPIO45<'static>>,
     lcd_cs: Option<p::GPIO41<'static>>,
     dma_ch0: Option<p::DMA_CH0<'static>>,
+    psram: Option<p::PSRAM<'static>>,
+    // Filled by make_display (PSRAM is mapped there), handed to the
+    // orchestrator via take_fb_canvas.
+    fb_canvas: Option<&'static mut [u8]>,
     lcd_reset: Option<p::GPIO37<'static>>,
     // Speaker (MAX98357A, standard I2S TX) and mic (T3902 PDM, RX in
     // hardware PDM-to-PCM mode) - both on I2S0, see `audio_task`.
@@ -197,6 +201,24 @@ impl Bringup for TwatchUltraBringup {
         &mut self,
         config: &app_core::config::Config,
     ) -> Display<'static> {
+        // 8 MB PSRAM, mapped here solely to back the full-panel
+        // canvas - the heap stays in internal SRAM, and rendering stays
+        // in the internal staging tile (`take_framebuffer`); the render
+        // loop mirrors pushed tiles into the canvas. This board's part
+        // is the APS6404L: QUAD-SPI SDR, not the octal chip the
+        // Waveshare S3 carries (see board.rs) - quad mode is required.
+        // The mirror is sequential writes, the access pattern quad
+        // PSRAM handles fine; per-pixel rendering into it would not be.
+        let psram = esp_hal::psram::Psram::new(
+            self.psram.take().unwrap(),
+            esp_hal::psram::PsramConfig {
+                mode: esp_hal::psram::PsramMode::QuadSpi,
+                ram_frequency: esp_hal::psram::SpiRamFreq::Freq80m,
+                ..Default::default()
+            },
+        );
+        self.fb_canvas = Some(firmware_hal::display::take_psram_canvas(&psram));
+
         let fb: &'static mut [u8] = firmware_hal::display::take_framebuffer();
         init_display(
             self.spi2.take().unwrap(),
@@ -214,6 +236,10 @@ impl Bringup for TwatchUltraBringup {
             config.display.brightness_active,
         )
         .await
+    }
+
+    fn take_fb_canvas(&mut self) -> Option<&'static mut [u8]> {
+        self.fb_canvas.take()
     }
 
     fn make_lcd_te(&mut self) -> Option<Input<'static>> {
@@ -711,16 +737,18 @@ async fn main(spawner: embassy_executor::Spawner) {
         esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()),
     );
 
-    // Internal-SRAM heap. 96 KB, deliberately SMALLER than the other
-    // boards' 128 KB: the main stack is the RAM left over after all
-    // statics, and esp-radio's ~56 KB of static buffers shrank it to
-    // 13.8 KB - which the deepest save path (tagged config serialize
-    // + SD mirror through embedded-sdmmc's FAT walker) overflowed
-    // (stack-guard panic, 2026-08-08). 96 KB frees 32 KB back to the
-    // stack (~46 KB); observed heap peak with the radio fully active
-    // is ~60 KB, leaving ~36 KB heap margin. The 8 MB QSPI PSRAM
-    // stays unused (see board.rs).
-    esp_alloc::heap_allocator!(size: 96 * 1024);
+    // Internal-SRAM heap, 128 KB, unified with the other boards. The
+    // main stack is the RAM left over after all statics - with
+    // esp-radio's ~56 KB of static buffers AND the 41 KB tile staging
+    // FB moved from BSS into this heap (`psram-fb`) that leaves ~55 KB
+    // of stack; the deepest save path (tagged config serialize + SD
+    // mirror through embedded-sdmmc's FAT walker) blew through 13.8 KB
+    // once (stack-guard panic, 2026-08-08), so re-check the readelf
+    // number (see NOTE below) whenever statics grow. Heap load: ~60 KB
+    // observed radio-active peak + the 41 KB staging FB = ~101 KB
+    // worst case. The 8 MB QSPI PSRAM holds only the full-panel canvas
+    // (see board.rs memory note).
+    esp_alloc::heap_allocator!(size: 128 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_int =
@@ -754,6 +782,8 @@ async fn main(spawner: embassy_executor::Spawner) {
         lcd_sio3: Some(peripherals.GPIO45),
         lcd_cs: Some(peripherals.GPIO41),
         dma_ch0: Some(peripherals.DMA_CH0),
+        psram: Some(peripherals.PSRAM),
+        fb_canvas: None,
         lcd_reset: Some(peripherals.GPIO37),
         i2s0: Some(peripherals.I2S0),
         dma_ch1: Some(peripherals.DMA_CH1),

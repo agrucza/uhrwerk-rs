@@ -26,3 +26,12 @@ log          = { version = "0.4.29", default-features = false }
 # `default-features = false` disables the drivers crate's `defmt` feature.
 # `display` enables the CO5300 driver module that we wrap here.
 drivers = { path = "../drivers", default-features = false, features = ["display"] }
+
+[features]
+# Boards with external RAM: adds `take_psram_canvas` (the full-panel
+# pixel store the render loop mirrors pushed tiles into) and moves the
+# tile staging framebuffer from a BSS static to a heap allocation
+# (same internal SRAM, but the 41 KB leave BSS - on boards where the
+# main stack is RAM-after-statics that's direct stack headroom).
+# Rendering itself stays in the internal staging tile on every board.
+psram-fb = []

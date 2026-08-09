@@ -61,6 +61,10 @@ struct S3Bringup {
     lcd_sio3: Option<p::GPIO7<'static>>,
     lcd_cs: Option<p::GPIO12<'static>>,
     dma_ch0: Option<p::DMA_CH0<'static>>,
+    psram: Option<p::PSRAM<'static>>,
+    // Filled by make_display (PSRAM is mapped there), handed to the
+    // orchestrator via take_fb_canvas.
+    fb_canvas: Option<&'static mut [u8]>,
     lcd_reset: Option<p::GPIO8<'static>>,
     lcd_te: Option<p::GPIO13<'static>>,
     touch_rst: Option<p::GPIO9<'static>>,
@@ -116,6 +120,24 @@ impl Bringup for S3Bringup {
         &mut self,
         config: &app_core::config::Config,
     ) -> Display<'static> {
+        // 8 MB OPI PSRAM, mapped here solely to back the full-panel
+        // canvas - the heap stays in internal SRAM, and rendering stays
+        // in the internal staging tile (`take_framebuffer`); the render
+        // loop mirrors pushed tiles into the canvas. Settings match the
+        // pre-May-21 proven config (octal, RAM 80 MHz, core 160 MHz).
+        let psram = esp_hal::psram::Psram::new(
+            self.psram.take().unwrap(),
+            esp_hal::psram::PsramConfig {
+                mode: esp_hal::psram::PsramMode::OctalSpi,
+                ram_frequency: esp_hal::psram::SpiRamFreq::Freq80m,
+                core_clock: Some(
+                    esp_hal::psram::SpiTimingConfigCoreClock::SpiTimingConfigCoreClock160m,
+                ),
+                ..Default::default()
+            },
+        );
+        self.fb_canvas = Some(firmware_hal::display::take_psram_canvas(&psram));
+
         let fb: &'static mut [u8] = firmware_hal::display::take_framebuffer();
         init_display(
             self.spi2.take().unwrap(),
@@ -133,6 +155,10 @@ impl Bringup for S3Bringup {
             config.display.brightness_active,
         )
         .await
+    }
+
+    fn take_fb_canvas(&mut self) -> Option<&'static mut [u8]> {
+        self.fb_canvas.take()
     }
 
     fn make_lcd_te(&mut self) -> Option<Input<'static>> {
@@ -397,15 +423,13 @@ async fn main(spawner: embassy_executor::Spawner) {
         esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()),
     );
 
-    // Internal-SRAM heap, unified with the C6 (no PSRAM). PSRAM was
-    // only ever the heap backing on this board - the framebuffer and
-    // the DMA TxBuf are internal-SRAM statics - and live heap use is
-    // ~12 KB, so the 8 MB OPI PSRAM was pure headroom. Dropping it
-    // removes the dominant idle/sleep power draw here (the OPI PSRAM
-    // runs at 80 MHz and is never gated during light sleep). 128 KB is
-    // generous next to the C6's 64 KB - the S3 has the internal SRAM
-    // to spare - and covers the ~16 KB audio drain + file-read buffers
-    // with margin. `peripherals.PSRAM` is now simply left unused.
+    // Internal-SRAM heap, unified with the C6. PSRAM holds ONLY the
+    // full-panel canvas (mapped in make_display) - keeping the heap
+    // internal means allocations stay DMA-capable and no live data
+    // beyond the re-mirrorable canvas depends on the PSRAM rail across
+    // light sleep. Heap load: the 41 KB tile staging FB (`psram-fb`
+    // allocates it here instead of BSS) + ~16 KB audio drain +
+    // file-read buffers, comfortable in 128 KB.
     esp_alloc::heap_allocator!(size: 128 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
@@ -431,6 +455,8 @@ async fn main(spawner: embassy_executor::Spawner) {
         lcd_sio3: Some(peripherals.GPIO7),
         lcd_cs: Some(peripherals.GPIO12),
         dma_ch0: Some(peripherals.DMA_CH0),
+        psram: Some(peripherals.PSRAM),
+        fb_canvas: None,
         lcd_reset: Some(peripherals.GPIO8),
         lcd_te: Some(peripherals.GPIO13),
         touch_rst: Some(peripherals.GPIO9),
