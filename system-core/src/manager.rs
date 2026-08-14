@@ -192,6 +192,20 @@ pub struct SystemManager<'d, B: Board> {
     // directly - see `render()`.
     fb_canvas: Option<&'static mut [u8]>,
 
+    // Canvas tiles whose mirror copy was deferred (bit per tile, same
+    // layout as `render()`'s tile mask). While a finger is on the
+    // glass the per-tile canvas memcpy is skipped: on quad-PSRAM
+    // boards it costs ~6-8 ms per tile, which turned ~47 ms
+    // interactive frames into ~115-130 ms. `sync_canvas()` re-mirrors
+    // the stale tiles at the first quiet tick after the touch ends.
+    canvas_stale: u16,
+
+    // A finger is currently on the glass (TouchPressed seen, no
+    // release yet). Gates the canvas mirror; cleared by any
+    // release-shaped event and by WakeInterrupt, so a release
+    // swallowed around a sleep transition can't wedge the gate shut.
+    touch_active: bool,
+
     // Force a full re-render on the next render() call, ignoring the
     // active screen's `dirty_rects()` opinion. Set after wake / display-
     // power-on (the panel's GRAM may not match anything we've drawn yet,
@@ -364,6 +378,8 @@ impl<B: Board> SystemManager<'static, B> {
             tick_count: 0,
             tile_hashes: [0u32; NUM_TILES],
             fb_canvas,
+            canvas_stale: 0,
+            touch_active: false,
             // First render after boot has no snapshot to diff; force
             // a full pass before dirty_rects takes over.
             force_full_redraw: true,
@@ -793,6 +809,18 @@ impl<B: Board> SystemManager<'static, B> {
     /// action interpretation). This wrapper hands the event to the
     /// model and executes the returned effects on hardware.
     async fn handle_event(&mut self, event: SystemEvent) {
+        // Interaction tracking for the canvas-mirror gate (see the
+        // `canvas_stale` field docs): finger down defers per-tile
+        // mirroring, anything release-shaped re-enables it.
+        match &event {
+            SystemEvent::TouchPressed { .. } => self.touch_active = true,
+            SystemEvent::TouchReleased
+            | SystemEvent::Tap { .. }
+            | SystemEvent::Swipe { .. }
+            | SystemEvent::WakeInterrupt => self.touch_active = false,
+            _ => {}
+        }
+
         // Bridge fresh RTC time into the SD-card wall clock so file
         // mtimes and log lines see real calendar time. Cheap - a
         // single atomic store.
@@ -988,6 +1016,20 @@ impl<B: Board> SystemManager<'static, B> {
         if !self.model.sleeping() && self.model.needs_redraw() {
             self.board.set_cpu_freq(CpuFreq::Mhz160);
             self.render().await;
+            // The frame above may have been the tail of an
+            // interaction - re-mirror any deferred canvas tiles while
+            // the clock is still raised. No-op unless tiles are stale
+            // and the finger is up.
+            self.sync_canvas();
+            self.board.set_cpu_freq(CpuFreq::Mhz80);
+        } else if self.canvas_stale != 0
+            && !self.touch_active
+            && !self.model.sleeping()
+        {
+            // Interaction ended without a final redraw (plain
+            // release) - the deferred mirror work is all that's left.
+            self.board.set_cpu_freq(CpuFreq::Mhz160);
+            self.sync_canvas();
             self.board.set_cpu_freq(CpuFreq::Mhz80);
         }
 
@@ -1025,10 +1067,15 @@ impl<B: Board> SystemManager<'static, B> {
     /// pixel store: every pushed tile is mirrored into it with one
     /// sequential copy (PSRAM's fast access pattern), so the canvas
     /// always holds what the panel shows and compositing effects can
-    /// read it. Rendering INTO the canvas directly was tried and
-    /// measured at ~130 ms per settings-scroll frame (vs ~47 ms tiled)
-    /// - external RAM pays per access, so all drawing stays in the
-    /// internal staging tile. The canvas deliberately does NOT need to
+    /// read it. While a finger is on the glass the mirror is deferred
+    /// (`canvas_stale` / `sync_canvas()`): quad-PSRAM boards pay
+    /// ~6-8 ms per mirrored tile, which made interactive scroll frames
+    /// ~115-130 ms vs ~47 ms unmirrored. Compositing only reads the
+    /// canvas from rest states, so re-syncing at the first quiet tick
+    /// keeps the contract. Rendering INTO the canvas directly was
+    /// tried and measured at ~130 ms per settings-scroll frame (vs
+    /// ~47 ms tiled) - external RAM pays per access, so all drawing
+    /// stays in the internal staging tile. The canvas deliberately does NOT need to
     /// survive light sleep (its rail may be gated): sleep is only
     /// entered with the display off, and every wake sets
     /// `force_full_redraw`, which re-renders + re-mirrors everything.
@@ -1166,13 +1213,21 @@ impl<B: Board> SystemManager<'static, B> {
                 // reads from the bus's own TX buffer, not this FB.
                 // Mirroring only pushed tiles keeps the canvas exactly
                 // in sync with the panel: a hash-skipped tile was
-                // mirrored when it was last pushed.
+                // mirrored when it was last pushed. During touch
+                // interaction the copy is deferred to `sync_canvas()`
+                // - the tile is only marked stale here.
                 if let Some(canvas) = self.fb_canvas.as_deref_mut() {
-                    let rows = (HEIGHT - tile_y).min(TILE_H) as usize;
-                    let start = tile_y as usize * ROW_STRIDE;
-                    let bytes = rows * ROW_STRIDE;
-                    canvas[start..start + bytes]
-                        .copy_from_slice(&self.display.framebuffer()[..bytes]);
+                    let bit = 1u16 << tile_idx;
+                    if self.touch_active {
+                        self.canvas_stale |= bit;
+                    } else {
+                        let rows = (HEIGHT - tile_y).min(TILE_H) as usize;
+                        let start = tile_y as usize * ROW_STRIDE;
+                        let bytes = rows * ROW_STRIDE;
+                        canvas[start..start + bytes]
+                            .copy_from_slice(&self.display.framebuffer()[..bytes]);
+                        self.canvas_stale &= !bit;
+                    }
                 }
             }
         }
@@ -1195,6 +1250,53 @@ impl<B: Board> SystemManager<'static, B> {
         if render_ms > 10 {
             log::info!("render: {}ms", render_ms);
         }
+    }
+
+    /// Re-mirror canvas tiles whose copy was deferred while a finger
+    /// was on the glass. The staging FB is transient (every tile
+    /// overwrites it), so a deferred tile can't be copied after the
+    /// fact - it is re-rendered here and then mirrored. Runs only at
+    /// rest (no touch, no pending redraw, awake), where the model
+    /// state still matches what `render()` last pushed, so the
+    /// repaint reproduces the panel's pixels exactly. Pure CPU +
+    /// PSRAM work: nothing is pushed to the panel and `tile_hashes`
+    /// stay untouched (same pixels, same hashes).
+    fn sync_canvas(&mut self) {
+        if self.canvas_stale == 0
+            || self.fb_canvas.is_none()
+            || self.touch_active
+            || self.model.sleeping()
+            || self.model.needs_redraw()
+        {
+            return;
+        }
+        let sync_start = Instant::now();
+        let data = self.model.cached_data().clone();
+        let battery_pct = data.power.battery_percent;
+
+        for tile_idx in 0..NUM_TILES {
+            if self.canvas_stale & (1u16 << tile_idx) == 0 {
+                continue;
+            }
+            let tile_y = (tile_idx as u16) * TILE_H;
+            let tile_h = (HEIGHT - tile_y).min(TILE_H);
+            let ctx = RenderCtx { tile_y, tile_h };
+
+            self.display.set_tile_y(tile_y);
+            self.display.clear(app_core::ui::theme::BG).ok();
+            self.model.screen_mut().render(&mut self.display, &data, &ctx);
+            if let Some(pct) = battery_pct {
+                primitives::battery_warning_frame(&mut self.display, pct);
+            }
+
+            let canvas = self.fb_canvas.as_deref_mut().unwrap();
+            let start = tile_y as usize * ROW_STRIDE;
+            let bytes = tile_h as usize * ROW_STRIDE;
+            canvas[start..start + bytes]
+                .copy_from_slice(&self.display.framebuffer()[..bytes]);
+        }
+        self.canvas_stale = 0;
+        log::info!("canvas sync: {}ms", sync_start.elapsed().as_millis());
     }
 
     /// Log heap watermark every ~2000 loop iterations. Useful
