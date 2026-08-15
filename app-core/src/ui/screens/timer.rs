@@ -262,11 +262,11 @@ impl Screen for TimerScreen {
         &self,
         display: &mut D,
         data: &SystemData,
-        _ctx: &RenderCtx,
+        ctx: &RenderCtx,
     ) {
         match self.view {
-            TimerView::Main => self.render_main(display, data),
-            TimerView::Picker => self.render_picker(display, data),
+            TimerView::Main => self.render_main(display, data, ctx),
+            TimerView::Picker => self.render_picker(display, data, ctx),
         }
     }
 
@@ -345,8 +345,8 @@ impl Screen for TimerScreen {
 // -- Main view ---------------------------------------------------------------
 
 impl TimerScreen {
-    fn render_main<D: BlendTarget>(&self, display: &mut D, data: &SystemData) {
-        draw_app_chrome(display, data, "TIMER", TELEMETRY, ACCENT);
+    fn render_main<D: BlendTarget>(&self, display: &mut D, data: &SystemData, ctx: &RenderCtx) {
+        draw_app_chrome(display, data, "TIMER", TELEMETRY, ACCENT, ctx);
 
         // -- Readout panel -------------------------------------------------
         let panel_color = ACCENT;
@@ -491,8 +491,8 @@ impl TimerScreen {
 // -- Picker view -------------------------------------------------------------
 
 impl TimerScreen {
-    fn render_picker<D: BlendTarget>(&self, display: &mut D, data: &SystemData) {
-        draw_app_chrome(display, data, "SET TIMER", TELEMETRY, ACCENT);
+    fn render_picker<D: BlendTarget>(&self, display: &mut D, data: &SystemData, ctx: &RenderCtx) {
+        draw_app_chrome(display, data, "SET TIMER", TELEMETRY, ACCENT, ctx);
 
         // Wheels are the readout - their selection cells already
         // show the current HH/MM/SS. The accent flashes red

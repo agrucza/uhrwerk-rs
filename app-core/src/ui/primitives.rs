@@ -109,6 +109,7 @@ pub fn battery_color(percent: u8) -> Color {
 pub fn battery_warning_frame<D: BlendTarget>(
     display: &mut D,
     percent: u8,
+    safe: &crate::data::SafeArea,
 ) {
     use super::theme;
     if percent >= 20 { return; }
@@ -117,11 +118,21 @@ pub fn battery_warning_frame<D: BlendTarget>(
     /// Empirical bezel corner radius - tuned by eye against the
     /// actual visible bezel curve, not `theme::CORNER_R`.
     const BEZEL_ARC_R: i32 = 116;
-    /// Pixels between the bezel and the frame stroke.
-    const INSET: i32 = 0;
-    let w = theme::SCREEN_W as i32 - INSET * 2;
-    let h = theme::SCREEN_H as i32 - INSET * 2;
-    let radius = (BEZEL_ARC_R - INSET) as u32;
+    // The frame hugs the *visible* glass: the per-board safe-area
+    // insets keep it out from under the case lip (without them the
+    // T-Watch case swallows the whole top run). Boards that declare
+    // a measured aperture corner radius get their arc; the legacy
+    // Waveshare-tuned constant covers the rest.
+    let x = safe.left;
+    let y = safe.top;
+    let w = theme::SCREEN_W as i32 - safe.left - safe.right;
+    let h = theme::SCREEN_H as i32 - safe.top - safe.bottom;
+    let radius = if safe.corner_r > 0 {
+        safe.corner_r as u32
+    } else {
+        let min_inset = safe.top.min(safe.bottom).min(safe.left).min(safe.right);
+        (BEZEL_ARC_R - min_inset) as u32
+    };
 
     let style = PrimitiveStyleBuilder::new()
         .stroke_color(color)
@@ -129,7 +140,7 @@ pub fn battery_warning_frame<D: BlendTarget>(
         .stroke_alignment(StrokeAlignment::Inside)
         .build();
     RoundedRectangle::with_equal_corners(
-        Rectangle::new(Point::new(INSET, INSET), Size::new(w as u32, h as u32)),
+        Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32)),
         Size::new(radius, radius),
     )
     .into_styled(style)

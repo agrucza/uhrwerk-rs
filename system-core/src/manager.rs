@@ -138,6 +138,9 @@ pub struct SystemParts<B: Board> {
     /// The board's optional-hardware flags (from
     /// [`Bringup::capabilities`]), cached into `SystemData`.
     pub capabilities: app_core::data::Capabilities,
+    /// Panel pixels masked by this device's case (from
+    /// [`Bringup::safe_area`]), cached into `SystemData`.
+    pub safe_area: app_core::data::SafeArea,
     /// The settings tree, loaded from flash by `run()` BEFORE any
     /// hardware that consumes a persisted setting was initialized
     /// (config-first boot).
@@ -302,6 +305,7 @@ impl<B: Board> SystemManager<'static, B> {
             imu: imu_state,
             power: power_state,
             capabilities,
+            safe_area,
             config: loaded_config,
         } = parts;
 
@@ -357,6 +361,7 @@ impl<B: Board> SystemManager<'static, B> {
         cached_data.power = initial_power;
         cached_data.storage = initial_usage;
         cached_data.capabilities = capabilities;
+        cached_data.safe_area = safe_area;
         crate::event_log::load_battery_history(
             &mut store, &mut cached_data.battery_history,
         );
@@ -1155,7 +1160,7 @@ impl<B: Board> SystemManager<'static, B> {
 
             self.model.screen_mut().render(&mut self.display, &data, &ctx);
             if let Some(pct) = battery_pct {
-                primitives::battery_warning_frame(&mut self.display, pct);
+                primitives::battery_warning_frame(&mut self.display, pct, &data.safe_area);
             }
 
             // Decide whether this tile needs to go over QSPI. For
@@ -1286,7 +1291,7 @@ impl<B: Board> SystemManager<'static, B> {
             self.display.clear(app_core::ui::theme::BG).ok();
             self.model.screen_mut().render(&mut self.display, &data, &ctx);
             if let Some(pct) = battery_pct {
-                primitives::battery_warning_frame(&mut self.display, pct);
+                primitives::battery_warning_frame(&mut self.display, pct, &data.safe_area);
             }
 
             let canvas = self.fb_canvas.as_deref_mut().unwrap();
@@ -1413,6 +1418,14 @@ pub trait Bringup {
     fn capabilities(&self) -> app_core::data::Capabilities {
         app_core::data::Capabilities::default()
     }
+
+    /// Panel pixels physically masked by this device's case/bezel,
+    /// measured per board (bezel-ruler probe). Cached into
+    /// `SystemData`; only edge-hugging chrome consumes it. Default:
+    /// zero - correct for bezels that mask nothing that matters.
+    fn safe_area(&self) -> app_core::data::SafeArea {
+        app_core::data::SafeArea::default()
+    }
 }
 
 /// Shared boot orchestration: build every piece via the board's
@@ -1489,6 +1502,7 @@ pub async fn run<T: Bringup>(
         imu,
         power: power_state,
         capabilities: bringup.capabilities(),
+        safe_area: bringup.safe_area(),
         config,
     });
 

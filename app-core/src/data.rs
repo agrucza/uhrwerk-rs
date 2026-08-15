@@ -31,6 +31,91 @@ pub struct Capabilities {
 }
 
 // ============================================================================
+// SafeArea - pixels of the panel hidden under the device's case/bezel.
+// ============================================================================
+
+/// Per-edge pixel counts of the panel physically masked by the
+/// device's case or glass edge, provided by the bin at boot through
+/// the `Bringup` seam and cached in `SystemData`. Measured per board
+/// with the bezel-ruler probe (2026-08-15): every unit hides the
+/// outermost ~1-3 px under its glass edge; the T-Watch Ultra's case
+/// lip additionally swallows ~8 px on the top and sides.
+///
+/// Only edge-hugging chrome consumes these (status bar, clock swipe
+/// hint, low-battery frame) - regular content already starts well
+/// inboard and screens should keep deriving layout from the
+/// `theme::*` geometry, not from these insets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SafeArea {
+    pub top: i32,
+    pub bottom: i32,
+    pub left: i32,
+    pub right: i32,
+    /// Effective corner radius of the case aperture, in pixels,
+    /// measured from the *visible* glass corner (i.e. inside the
+    /// edge insets above). `0` = no corner data - edge-adjacent
+    /// chrome then keeps its legacy constant padding, which is
+    /// correct for the Waveshare boards whose layouts were tuned
+    /// against their printed bezels directly.
+    pub corner_r: i32,
+}
+
+impl SafeArea {
+    /// Horizontal case intrusion at panel row `y` on the left edge:
+    /// the edge inset plus the corner arc's extra bite when `y` is
+    /// within `corner_r` of the top or bottom of the visible glass.
+    pub fn left_inset_at(&self, y: i32, panel_h: i32) -> i32 {
+        self.left + self.corner_extra(y, panel_h)
+    }
+
+    /// Right-edge counterpart of [`Self::left_inset_at`].
+    pub fn right_inset_at(&self, y: i32, panel_h: i32) -> i32 {
+        self.right + self.corner_extra(y, panel_h)
+    }
+
+    /// Circular-arc corner model: how much deeper than the straight
+    /// edge the aperture cuts in at row `y`. Zero outside the corner
+    /// bands or when no corner radius is declared.
+    fn corner_extra(&self, y: i32, panel_h: i32) -> i32 {
+        let r = self.corner_r;
+        if r <= 0 {
+            return 0;
+        }
+        // Distance from the nearer horizontal edge of the visible
+        // glass (edge insets already excluded).
+        let d = (y - self.top).min(panel_h - 1 - self.bottom - y);
+        if d >= r {
+            return 0;
+        }
+        if d < 0 {
+            return r;
+        }
+        let chord = (r - d) as u64;
+        r - isqrt(r as u64 * r as u64 - chord * chord) as i32
+    }
+}
+
+/// Integer square root (floor), bit-pair method.
+fn isqrt(v: u64) -> u32 {
+    let mut x = v;
+    let mut res: u64 = 0;
+    let mut bit: u64 = 1 << 62;
+    while bit > x {
+        bit >>= 2;
+    }
+    while bit != 0 {
+        if x >= res + bit {
+            x -= res + bit;
+            res = (res >> 1) + bit;
+        } else {
+            res >>= 1;
+        }
+        bit >>= 2;
+    }
+    res as u32
+}
+
+// ============================================================================
 // GpsSyncState - progress of a GPS time-sync session.
 // ============================================================================
 

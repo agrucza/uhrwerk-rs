@@ -32,12 +32,13 @@ use crate::ui::{fonts, glyphs, layout, theme};
 use crate::ui::types::{
     Action, RenderCtx, Screen, SelfTestId, SelfTestResult, SystemData, SystemEvent,
 };
+use crate::ui::widgets;
 use crate::ui::widgets::{
-    action_row_rects, chamfered_button, chamfered_panel, fmt_2digit, handle_scroll_drag,
-    header, header_icon_hit, home_indicator, render_action_row, render_scrolled,
-    ring_gauge, row, slider, slider_value_from_x, status_bar, tag_label, toggle,
+    action_row_rects, draw_app_chrome, chamfered_button, chamfered_panel, fmt_2digit, handle_scroll_drag,
+    header_icon_hit, render_action_row, render_scrolled,
+    ring_gauge, row, slider, slider_value_from_x, tag_label, toggle,
     ButtonVariant, Keyboard, KeyboardResult, Picker, RowControl, Wheel, NOTCH, ROW_H,
-    SCROLLBAR_GUTTER, SLIDER_BAR_H, STATUS_BAR_H, TAG_LABEL_H, TOGGLE_H, TOGGLE_W,
+    SCROLLBAR_GUTTER, SLIDER_BAR_H, TAG_LABEL_H, TOGGLE_H, TOGGLE_W,
     WHEEL_TOTAL_H,
 };
 
@@ -63,26 +64,16 @@ const AUTO_LOCK_OPTIONS: &[AutoLockOption] = &[
 
 // -- Settings chrome helpers -------------------------------------------------
 
-/// Y of the top status bar shared by every sub-view.
-const STATUS_Y: i32 = 0;
-/// Horizontal inset for status-bar content to clear the bezel arc.
-const STATUS_X_INSET: i32 = 85;
 
-/// Top of the Nightwatch header bar on settings sub-views. Sits
-/// below the status bar with an 8 px gap so the two read as
-/// separated.
-const HDR_TOP: i32 = STATUS_Y + STATUS_BAR_H + 8;
-/// Height of the Nightwatch header bar (see [`widgets::HEADER_H`]).
-const HDR_H: i32 = 28;
+const HDR_TOP: i32 = widgets::APP_HEADER_TOP;
+const HDR_H: i32 = widgets::HEADER_H;
 /// Y of the bottom home-indicator bar.
-const HOME_BAR_Y: i32 = theme::SCREEN_H as i32 - 18;
+const HOME_BAR_Y: i32 = widgets::APP_HOME_BAR_Y;
 
-/// Header rect shared by every settings sub-view.
+/// Header rect shared by every settings sub-view (the shared
+/// app-chrome header rect).
 fn hdr_rect() -> Rectangle {
-    Rectangle::new(
-        Point::new(0, HDR_TOP),
-        Size::new(theme::SCREEN_W as u32, HDR_H as u32),
-    )
+    widgets::app_header_rect()
 }
 
 /// Draw the full Settings chrome: top status bar (tinted by `accent`,
@@ -95,37 +86,11 @@ fn draw_header<D: BlendTarget>(
     accent: Color,
     ctx: &RenderCtx,
 ) {
-    // The three chrome pieces sit at fixed y-positions: status bar at
-    // the very top, title header just below it, home indicator at the
-    // very bottom. For each piece, only do its work when this tile's
-    // y-range actually overlaps the piece - otherwise the per-call
-    // setup (string format, glyph lookup, fill_contiguous iterator)
-    // is wasted, since the driver's per-pixel clip would reject every
-    // write anyway.
-    if ctx.intersects_y(STATUS_Y, STATUS_Y + STATUS_BAR_H) {
-        let mut time_buf: heapless::String<8> = heapless::String::new();
-        let _ = core::fmt::Write::write_fmt(
-            &mut time_buf,
-            format_args!("{:02}:{:02}", data.time.hour, data.time.minute),
-        );
-        status_bar(
-            display,
-            STATUS_Y,
-            time_buf.as_str(),
-            data.power.battery_percent,
-            accent,
-            STATUS_X_INSET,
-        );
-    }
-
-    if ctx.intersects_y(HDR_TOP, HDR_TOP + HDR_H) {
-        header(display, hdr_rect(), title, "SYS.CFG", accent);
-    }
-
-    // Home indicator is an 18 px pill at the bottom edge.
-    if ctx.intersects_y(HOME_BAR_Y, HOME_BAR_Y + 18) {
-        home_indicator(display, HOME_BAR_Y, accent);
-    }
+    // Thin wrapper: settings' only chrome delta is the fixed
+    // "SYS.CFG" telemetry string. Everything else - per-tile
+    // gating, safe-area insets, corner-safe header rect - lives in
+    // the one shared path.
+    draw_app_chrome(display, data, title, "SYS.CFG", accent, ctx);
 }
 
 /// Y of the first row below the settings header.

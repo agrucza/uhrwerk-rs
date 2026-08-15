@@ -34,6 +34,7 @@ use crate::ui::types::{
     SystemData,
 };
 use crate::ui::widgets::{
+    corner_safe_header_rect,
     app_chrome_back_hit, app_header_rect, chamfered_panel, handle_scroll_drag, header,
     render_scrolled, status_bar, APP_CONTENT_TOP, APP_HOME_BAR_Y, SCROLLBAR_GUTTER,
 };
@@ -118,13 +119,17 @@ impl Screen for NotificationsScreen {
         );
         status_bar(
             display,
-            0,
+            data.safe_area.top,
             time_buf.as_str(),
             data.power.battery_percent,
             ACCENT,
             85,
         );
-        header(display, app_header_rect(), "ALERTS", tele.as_str(), ACCENT);
+        header(
+            display,
+            corner_safe_header_rect(app_header_rect(), &data.safe_area),
+            "ALERTS", tele.as_str(), ACCENT,
+        );
 
         if data.notifications.entries.is_empty() {
             // Empty state: centered caption inside the content band.

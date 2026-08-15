@@ -242,24 +242,31 @@ impl Screen for QuickAccessScreen {
         );
         status_bar(
             display,
-            STATUS_Y,
+            STATUS_Y + data.safe_area.top,
             time_buf.as_str(),
             data.power.battery_percent,
             theme::INFO,
             STATUS_X_INSET,
         );
-        // Header.
+        // Header, padded clear of the case's top corner arcs
+        // (no-op on boards without corner data).
+        // Sampled at the title ink's vertical center (see app_drawer:
+        // top-row sampling over-insets against the receding arc).
+        let panel_h = theme::SCREEN_H as i32;
+        let mid_y = HEADER_Y + 4;
+        let left_pad = PAD_X.max(data.safe_area.left_inset_at(mid_y, panel_h) + 2);
+        let right_pad = PAD_X.max(data.safe_area.right_inset_at(mid_y, panel_h) + 2);
         let font_title = fonts::value();
         fonts::draw_at(
             display, &font_title,
             "QUICK.ACCESS",
-            PAD_X, HEADER_Y - 8,
+            left_pad, HEADER_Y - 8,
             theme::INFO,
         );
         fonts::draw_right(
             display, &fonts::caption(),
             "v PULL",
-            theme::SCREEN_W as i32 - PAD_X, HEADER_Y,
+            theme::SCREEN_W as i32 - right_pad, HEADER_Y,
             theme::FG_MUTED,
         );
 

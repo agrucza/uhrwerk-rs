@@ -169,7 +169,7 @@ impl Screen for AlarmScreen {
     ) {
         match self.view {
             AlarmView::List => self.render_list(display, data, ctx),
-            AlarmView::Edit { index } => self.render_edit(display, data, index),
+            AlarmView::Edit { index } => self.render_edit(display, data, index, ctx),
         }
     }
 
@@ -194,7 +194,7 @@ impl AlarmScreen {
         let active_count = data.config.alarms.entries.iter().filter(|e| e.enabled).count();
         let mut tele_buf: heapless::String<16> = heapless::String::new();
         let _ = write!(tele_buf, "x{:02} ACTIVE", active_count);
-        draw_app_chrome(display, data, "ALARMS", tele_buf.as_str(), ACCENT);
+        draw_app_chrome(display, data, "ALARMS", tele_buf.as_str(), ACCENT, ctx);
 
         // Render the row stack inside a clipped viewport plus the
         // right-edge scroll indicator, both via the shared
@@ -352,11 +352,11 @@ impl AlarmScreen {
 
 impl AlarmScreen {
     fn render_edit<D: BlendTarget>(
-        &self, display: &mut D, data: &SystemData, index: usize,
+        &self, display: &mut D, data: &SystemData, index: usize, ctx: &RenderCtx,
     ) {
         let mut tele_buf: heapless::String<8> = heapless::String::new();
         let _ = write!(tele_buf, "{}{:02}", EDIT_TELEMETRY_PREFIX, index);
-        draw_app_chrome(display, data, "EDIT ALARM", tele_buf.as_str(), ACCENT);
+        draw_app_chrome(display, data, "EDIT ALARM", tele_buf.as_str(), ACCENT, ctx);
 
         // Day chip row.
         let chips = day_chip_rects();

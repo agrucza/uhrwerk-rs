@@ -147,9 +147,9 @@ impl Screen for StopwatchScreen {
         &self,
         display: &mut D,
         data: &SystemData,
-        _ctx: &RenderCtx,
+        ctx: &RenderCtx,
     ) {
-        draw_app_chrome(display, data, "STOPWATCH", TELEMETRY, ACCENT);
+        draw_app_chrome(display, data, "STOPWATCH", TELEMETRY, ACCENT, ctx);
 
         // -- Readout panel -------------------------------------------------
         let panel = READOUT_RECT;

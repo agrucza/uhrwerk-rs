@@ -30,9 +30,11 @@ pub mod wheel;
 
 pub use bodies::{row, RowControl, ROW_H};
 pub use chrome::{
-    app_chrome_back_hit, app_header_rect, draw_app_chrome, header, header_icon_hit,
+    app_chrome_back_hit, app_header_rect, corner_safe_header_rect, draw_app_chrome,
+    header, header_icon_hit,
     home_indicator, status_bar,
-    APP_CONTENT_TOP, APP_HEADER_TOP, APP_HOME_BAR_Y, HEADER_H, HOME_INDICATOR_H,
+    APP_CONTENT_TOP, APP_HEADER_TOP, APP_HOME_BAR_Y, APP_STATUS_Y, HEADER_H,
+    HOME_INDICATOR_H,
     STATUS_BAR_H,
 };
 pub use containers::{chamfered_panel, info_tile, tag_label, tile, NOTCH, TAG_LABEL_H};

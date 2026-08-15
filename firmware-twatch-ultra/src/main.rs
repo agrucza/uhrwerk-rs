@@ -497,6 +497,21 @@ impl Bringup for TwatchUltraBringup {
     fn capabilities(&self) -> app_core::data::Capabilities {
         app_core::data::Capabilities { gps: true, steps: true }
     }
+
+    /// The watch case's molded lip overhangs the panel: bezel-ruler
+    /// probe 2026-08-15 measured ~5-8 px swallowed on the top and
+    /// both sides, ~1-4 px at the bottom (the Waveshare boards'
+    /// printed-glass bezels mask nothing that matters and keep the
+    /// zero default).
+    fn safe_area(&self) -> app_core::data::SafeArea {
+        app_core::data::SafeArea {
+            top: 8, bottom: 4, left: 8, right: 8,
+            // Derived from the clock-telemetry clipping (~42 px
+            // intrusion at y=34): a circular arc of r=112 inside
+            // the visible glass reproduces it.
+            corner_r: 112,
+        }
+    }
 }
 
 /// Flip the I2S0 RX unit into hardware PDM-to-PCM mode for the T3902

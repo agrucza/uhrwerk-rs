@@ -170,18 +170,28 @@ impl Screen for AppDrawerScreen {
         );
         status_bar(
             display,
-            STATUS_Y,
+            STATUS_Y + data.safe_area.top,
             time_buf.as_str(),
             data.power.battery_percent,
             theme::ACCENT,
             STATUS_X_INSET,
         );
-        // Header row.
+        // Header row, padded clear of the case's top corner arcs
+        // (no-op on boards without corner data).
+        // Sampled at the title ink's vertical center: the case arc
+        // recedes fast across the text's height and glyph corners are
+        // naturally empty, so the center row is the honest constraint
+        // - sampling the top row pushed the header ~20 px further in
+        // than the case requires (visibly misaligned with the grid).
+        let panel_h = theme::SCREEN_H as i32;
+        let mid_y = HEADER_Y + 4;
+        let left_pad = GRID_PAD_X.max(data.safe_area.left_inset_at(mid_y, panel_h) + 2);
+        let right_pad = GRID_PAD_X.max(data.safe_area.right_inset_at(mid_y, panel_h) + 2);
         let font_title = fonts::value();
         fonts::draw_at(
             display, &font_title,
             "APPS",
-            GRID_PAD_X, HEADER_Y - 8,
+            left_pad, HEADER_Y - 8,
             theme::ACCENT,
         );
         let installed = TILES.iter().filter(|t| t.target.is_some()).count();
@@ -190,7 +200,7 @@ impl Screen for AppDrawerScreen {
         fonts::draw_right(
             display, &fonts::caption(),
             buf.as_str(),
-            theme::SCREEN_W as i32 - GRID_PAD_X, HEADER_Y,
+            theme::SCREEN_W as i32 - right_pad, HEADER_Y,
             theme::FG_MUTED,
         );
 

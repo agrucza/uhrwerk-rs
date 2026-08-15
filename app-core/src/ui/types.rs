@@ -753,6 +753,10 @@ pub struct SystemData {
     pub time: TimeData,
     pub power: PowerData,
     pub motion: MotionData,
+    /// Panel pixels hidden under this device's case/bezel (from
+    /// [`crate::data::SafeArea`], bin-provided). Consumed by the
+    /// edge-hugging chrome only.
+    pub safe_area: crate::data::SafeArea,
     /// The board's IMU chip name, from `SystemEvent::ImuIdentified`;
     /// empty until the IMU task announces it.
     pub imu_name: &'static str,

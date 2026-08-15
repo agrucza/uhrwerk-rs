@@ -117,6 +117,25 @@ pub fn header<D: BlendTarget>(
     .draw(display).ok();
 }
 
+/// Shrink a header rect clear of the case's top corner arcs at the
+/// rect's own height (no-op on boards without corner data). Every
+/// `header` call site routes its rect through this so the chevron
+/// and right telemetry keep their padding relative to the *visible*
+/// glass instead of the panel edge.
+pub fn corner_safe_header_rect(
+    rect: Rectangle,
+    safe: &crate::data::SafeArea,
+) -> Rectangle {
+    let mid_y = rect.top_left.y + rect.size.height as i32 / 2;
+    let panel_h = theme::SCREEN_H as i32;
+    let li = safe.left_inset_at(mid_y, panel_h);
+    let ri = safe.right_inset_at(mid_y, panel_h);
+    Rectangle::new(
+        Point::new(rect.top_left.x + li, rect.top_left.y),
+        Size::new((rect.size.width as i32 - li - ri).max(0) as u32, rect.size.height),
+    )
+}
+
 /// Returns `true` if `(x, y)` lands inside the back-chevron hit zone
 /// of a Nightwatch `header` drawn at `header_rect`. Zone is wider
 /// and taller than the visible chevron so finger pads don't have to
@@ -213,11 +232,15 @@ pub fn home_indicator<D: BlendTarget>(
 
 // -- Shared app chrome -------------------------------------------------------
 //
-// Standard layout shared by every full-app screen (settings, stopwatch,
-// timer, alarm, status, ...): a tinted top status bar, an accent
-// Nightwatch header below it, and a signal-red home indicator pinned
-// to the bottom. Screens declare their accent + system-code telemetry;
-// the rest is constant.
+// THE full-app chrome path - every full-app screen (settings,
+// stopwatch, timer, alarm, ...) draws its status bar + header + home
+// indicator through `draw_app_chrome`, nothing else. Overlays with
+// deliberately different chrome (app drawer, quick access,
+// notifications) compose the primitives directly, but every
+// edge-adjacent placement must go through the safe-area helpers
+// (`data.safe_area.*_inset_at`, `corner_safe_header_rect`). One
+// path per visual concept - a cross-cutting change (like the
+// safe-area seam) must never have to chase per-screen copies again.
 
 /// Y of the top status bar in standard app chrome.
 pub const APP_STATUS_Y: i32 = 0;
@@ -262,23 +285,39 @@ pub fn draw_app_chrome<D: BlendTarget>(
     title: &str,
     telemetry: &str,
     accent: Color,
+    ctx: &crate::ui::types::RenderCtx,
 ) {
     use core::fmt::Write;
-    let mut time_buf: heapless::String<8> = heapless::String::new();
-    let _ = write!(
-        &mut time_buf,
-        "{:02}:{:02}", data.time.hour, data.time.minute,
-    );
-    status_bar(
-        display,
-        APP_STATUS_Y,
-        time_buf.as_str(),
-        data.power.battery_percent,
-        accent,
-        APP_STATUS_X_INSET,
-    );
-    header(display, app_header_rect(), title, telemetry, accent);
-    home_indicator(display, APP_HOME_BAR_Y, theme::ACCENT);
+    // The three pieces sit at fixed y-positions; skip each one's
+    // setup work (string format, glyph lookup) when this tile's
+    // y-range can't contain it - the driver would reject every
+    // write per-pixel anyway.
+    let top = data.safe_area.top;
+    if ctx.intersects_y(APP_STATUS_Y + top, APP_STATUS_Y + top + STATUS_BAR_H) {
+        let mut time_buf: heapless::String<8> = heapless::String::new();
+        let _ = write!(
+            &mut time_buf,
+            "{:02}:{:02}", data.time.hour, data.time.minute,
+        );
+        status_bar(
+            display,
+            APP_STATUS_Y + top,
+            time_buf.as_str(),
+            data.power.battery_percent,
+            accent,
+            APP_STATUS_X_INSET,
+        );
+    }
+    if ctx.intersects_y(APP_HEADER_TOP, APP_HEADER_TOP + HEADER_H) {
+        header(
+            display,
+            corner_safe_header_rect(app_header_rect(), &data.safe_area),
+            title, telemetry, accent,
+        );
+    }
+    if ctx.intersects_y(APP_HOME_BAR_Y, APP_HOME_BAR_Y + HOME_INDICATOR_H) {
+        home_indicator(display, APP_HOME_BAR_Y, theme::ACCENT);
+    }
 }
 
 /// Hit test for the back chevron of the standard app chrome.

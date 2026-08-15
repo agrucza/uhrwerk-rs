@@ -171,7 +171,7 @@ impl Screen for ClockScreen {
         // per-pixel for the current tile, so we don't gain anything
         // from acting on `ctx` here.
         draw_telemetry_strip(display, data);
-        draw_swipe_hint(display);
+        draw_swipe_hint(display, data.safe_area.top);
         draw_hero_numerals(display, data);
         draw_meta_row(display, data);
         draw_gps_row(display, data);
@@ -275,15 +275,15 @@ fn rect_hit(rect: Rectangle, x: u16, y: u16) -> bool {
 
 // -- Draw helpers -----------------------------------------------------------
 
-fn draw_swipe_hint<D: BlendTarget>(display: &mut D) {
-    // 2px bar, 36px wide, centered horizontally. Cyan at 55% opacity
-    // in the spec - we render at full saturation because embedded-
-    // graphics has no blending and a dimmer cyan would just look
-    // washed out on pure black.
+fn draw_swipe_hint<D: BlendTarget>(display: &mut D, top_inset: i32) {
+    // 2px bar, 36px wide, centered horizontally, pushed below the
+    // case's masked band on boards that have one. Cyan at 55%
+    // opacity in the spec - rendered at full saturation (a dimmer
+    // cyan reads washed out on pure black).
     let cx = theme::SCREEN_W as i32 / 2;
     let x = cx - HINT_W / 2;
     Rectangle::new(
-        Point::new(x, HINT_Y),
+        Point::new(x, HINT_Y + top_inset),
         Size::new(HINT_W as u32, HINT_H as u32),
     )
     .into_styled(PrimitiveStyle::with_fill(theme::INFO))
@@ -295,12 +295,19 @@ fn draw_telemetry_strip<D: BlendTarget>(
 ) {
     let font = fonts::caption();
 
+    // The strip sits inside the case's top corner arcs on some
+    // devices - widen the pads to whatever the aperture needs at
+    // this height (no-ops on boards without corner data).
+    let panel_h = theme::SCREEN_H as i32;
+    let left_pad = PAD_X.max(data.safe_area.left_inset_at(TELE_Y + 6, panel_h) + 6);
+    let right_pad = PAD_X.max(data.safe_area.right_inset_at(TELE_Y + 6, panel_h) + 6);
+
     // Left: SYS-ID code. Static filler per the spec - no real
     // telemetry to report yet.
     fonts::draw_at(
         display, &font,
         "SYS-ID 232.29CB.98B",
-        PAD_X, TELE_Y,
+        left_pad, TELE_Y,
         theme::INFO,
     );
 
@@ -319,7 +326,7 @@ fn draw_telemetry_strip<D: BlendTarget>(
     fonts::draw_right(
         display, &font,
         buf.as_str(),
-        theme::SCREEN_W as i32 - PAD_X, TELE_Y,
+        theme::SCREEN_W as i32 - right_pad, TELE_Y,
         theme::FG_MUTED,
     );
 }
