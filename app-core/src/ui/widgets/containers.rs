@@ -36,6 +36,25 @@ pub const NOTCH: i32 = 10;
 /// Height of a tag-label ribbon.
 pub const TAG_LABEL_H: i32 = 15;
 
+/// Blend strength for the anti-aliasing pixels laid along 45-degree
+/// chamfer edges (~43% coverage - the elbow of each stair step).
+const DIAG_AA_ALPHA: u8 = 110;
+
+// -- Chamfer anti-aliasing ---------------------------------------------------
+
+/// Soften a 45-degree diagonal running from `(sx, sy)` in the
+/// `(+1, -1)` direction for `len` steps (both Nightwatch chamfer
+/// diagonals - TL and BR - have this orientation). Blends `color`
+/// into the two "elbow" pixels of every stair step, turning the hard
+/// staircase into an anti-aliased edge. Call after drawing the
+/// diagonal itself.
+fn soften_diag<D: BlendTarget>(display: &mut D, sx: i32, sy: i32, len: i32, color: Color) {
+    for i in 0..len {
+        display.blend_pixel(sx + i + 1, sy - i, color, DIAG_AA_ALPHA);
+        display.blend_pixel(sx + i, sy - i - 1, color, DIAG_AA_ALPHA);
+    }
+}
+
 // -- chamfered_panel ---------------------------------------------------------
 
 /// Draw the 6-line outline of a chamfered hex panel: a rectangle with
@@ -82,6 +101,11 @@ pub fn chamfered_panel<D: BlendTarget>(
         .into_styled(style).draw(display).ok();
     Line::new(Point::new(x, y + notch), Point::new(x + notch, y))
         .into_styled(style).draw(display).ok();
+
+    // Anti-alias the two 45-degree diagonals; the four straight edges
+    // are pixel-exact already.
+    soften_diag(display, x, y + notch, notch, color);
+    soften_diag(display, r - notch, b, notch, color);
 }
 
 // -- tag_label ---------------------------------------------------------------
@@ -110,12 +134,12 @@ pub fn tag_label<D: BlendTarget>(
     let w = text_w + 12 + tl_notch;
     let h = TAG_LABEL_H;
 
-    Rectangle::new(
-        Point::new(left_x, top_y),
-        Size::new(w as u32, h as u32),
-    )
-    .into_styled(PrimitiveStyle::with_fill(color))
-    .draw(display).ok();
+    // Ribbon body: subtle top-lit vertical gradient instead of a flat
+    // fill, dithered so the 15 px ramp shows no banding.
+    display.fill_vgradient(
+        left_x, top_y, w, h,
+        color, theme::dimmed(color, 185),
+    );
 
     let br_chamfer = 5i32;
     let r = left_x + w - 1;
@@ -128,6 +152,9 @@ pub fn tag_label<D: BlendTarget>(
         .into_styled(PrimitiveStyle::with_stroke(theme::BG, 1))
         .draw(display).ok();
     }
+    // Soften the carved edge: blend BG into the ribbon pixels just
+    // inside the cut so the color/black boundary is anti-aliased.
+    soften_diag(display, r - br_chamfer, b, br_chamfer, theme::BG);
 
     if tl_notch > 0 {
         for i in 0..tl_notch {
@@ -138,6 +165,10 @@ pub fn tag_label<D: BlendTarget>(
             .into_styled(PrimitiveStyle::with_stroke(theme::BG, 1))
             .draw(display).ok();
         }
+        // Same softening for the TL nesting chamfer. This diagonal
+        // runs from (left_x, top_y + tl_notch - 1) up-right, matching
+        // soften_diag's `(+1, -1)` orientation.
+        soften_diag(display, left_x, top_y + tl_notch - 1, tl_notch - 1, theme::BG);
     }
 
     let text_rect = Rectangle::new(

@@ -245,7 +245,7 @@ impl Screen for QuickAccessScreen {
             STATUS_Y,
             time_buf.as_str(),
             data.power.battery_percent,
-            theme::CYAN,
+            theme::INFO,
             STATUS_X_INSET,
         );
         // Header.
@@ -254,7 +254,7 @@ impl Screen for QuickAccessScreen {
             display, &font_title,
             "QUICK.ACCESS",
             PAD_X, HEADER_Y - 8,
-            theme::CYAN,
+            theme::INFO,
         );
         fonts::draw_right(
             display, &fonts::caption(),
@@ -270,7 +270,7 @@ impl Screen for QuickAccessScreen {
             display, &fonts::caption(),
             "BRIGHTNESS",
             PAD_X, BRIGHT_LABEL_Y,
-            theme::CYAN,
+            theme::INFO,
         );
 
         // Brightness bar: generic slider widget. Bar full width
@@ -297,7 +297,7 @@ impl Screen for QuickAccessScreen {
 
             // Off: chrome label + chrome icon + steel border, no fill.
             // On: black label + black icon on a signal fill, signal border.
-            let border = if on { theme::SIGNAL } else { theme::STEEL };
+            let border = if on { theme::ACCENT } else { theme::BORDER };
             let content_color = if on { theme::BG } else { theme::FG_MUTED };
 
             if on {
@@ -308,7 +308,7 @@ impl Screen for QuickAccessScreen {
                         (rect.size.height as i32 - 2) as u32,
                     ),
                 )
-                .into_styled(PrimitiveStyle::with_fill(theme::SIGNAL))
+                .into_styled(PrimitiveStyle::with_fill(theme::ACCENT))
                 .draw(display).ok();
             }
 
@@ -331,7 +331,7 @@ impl Screen for QuickAccessScreen {
             );
         }
 
-        home_indicator(display, HOME_BAR_Y, theme::SIGNAL);
+        home_indicator(display, HOME_BAR_Y, theme::ACCENT);
     }
 
     fn on_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {

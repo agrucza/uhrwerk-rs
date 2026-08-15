@@ -54,7 +54,7 @@ use crate::ui::widgets::{
 /// Per-screen accent. Orange = "data stream / dynamic" per the spec;
 /// also differentiates Timer (counting down) from Stopwatch (green,
 /// counting up).
-const ACCENT: Color = theme::ORANGE;
+const ACCENT: Color = theme::MEDIA;
 
 /// Static system-code shown in the header's right-telemetry slot.
 const TELEMETRY: &str = "TMR.0001";
@@ -396,12 +396,12 @@ impl TimerScreen {
         if data.timer.remaining().as_secs() == 0 {
             chamfered_button(
                 display, right, "RESET",
-                ButtonVariant::Ghost, theme::STEEL,
+                ButtonVariant::Ghost, theme::BORDER,
             );
         } else {
             chamfered_button(
                 display, right, "RESET",
-                ButtonVariant::Primary, theme::SIGNAL,
+                ButtonVariant::Primary, theme::ACCENT,
             );
         }
     }

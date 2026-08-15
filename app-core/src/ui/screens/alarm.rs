@@ -52,7 +52,7 @@ use crate::ui::widgets::{
 
 /// Per-screen accent. Yellow = wake/warn; mirrors the spec's
 /// ALERTS-app tile border choice.
-const ACCENT: Color = theme::YELLOW;
+const ACCENT: Color = theme::ALERT;
 
 /// Static system-code prefix shown in the header's right-telemetry
 /// slot during Edit (with the entry index).
@@ -221,7 +221,7 @@ impl AlarmScreen {
         let entry = &data.config.alarms.entries[entry_idx];
         let rect = row_rect(entry_idx, scroll);
 
-        let border = if entry.enabled { ACCENT } else { theme::STEEL };
+        let border = if entry.enabled { ACCENT } else { theme::BORDER };
         chamfered_panel(display, rect, NOTCH, border, 1);
 
         // Time block, left-aligned.
@@ -269,9 +269,9 @@ impl AlarmScreen {
             let cell_color = if active {
                 ACCENT
             } else if entry.enabled {
-                theme::STEEL
+                theme::BORDER
             } else {
-                theme::STEEL_2
+                theme::FG_DIM
             };
             let cell_rect = Rectangle::new(
                 Point::new(strip_x + i as i32 * day_cell_w, strip_y),
@@ -472,7 +472,7 @@ fn day_chip_rects() -> [Rectangle; 7] {
 fn day_chip<D: BlendTarget>(
     display: &mut D, rect: Rectangle, label: &str, active: bool,
 ) {
-    let color = if active { ACCENT } else { theme::STEEL_2 };
+    let color = if active { ACCENT } else { theme::FG_DIM };
     chamfered_panel(display, rect, DAY_CHIP_NOTCH, color, 1);
     fonts::draw_centered_in_rect(display, &fonts::caption(), label, rect, color);
 }

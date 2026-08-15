@@ -34,10 +34,11 @@ use crate::ui::types::{
 };
 use crate::ui::widgets::{
     action_row_rects, chamfered_button, chamfered_panel, fmt_2digit, handle_scroll_drag,
-    header, header_icon_hit, home_indicator, render_action_row, render_scrolled, row,
-    slider, slider_value_from_x, status_bar, tag_label, toggle, ButtonVariant, Keyboard,
-    KeyboardResult, Picker, RowControl, Wheel, NOTCH, ROW_H, SCROLLBAR_GUTTER,
-    SLIDER_BAR_H, STATUS_BAR_H, TAG_LABEL_H, TOGGLE_H, TOGGLE_W, WHEEL_TOTAL_H,
+    header, header_icon_hit, home_indicator, render_action_row, render_scrolled,
+    ring_gauge, row, slider, slider_value_from_x, status_bar, tag_label, toggle,
+    ButtonVariant, Keyboard, KeyboardResult, Picker, RowControl, Wheel, NOTCH, ROW_H,
+    SCROLLBAR_GUTTER, SLIDER_BAR_H, STATUS_BAR_H, TAG_LABEL_H, TOGGLE_H, TOGGLE_W,
+    WHEEL_TOTAL_H,
 };
 
 /// Slider lower bound for brightness in the Display sub-view -
@@ -683,10 +684,10 @@ impl SettingsScreen {
     fn render_index<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "SETTINGS", theme::SIGNAL, ctx);
+        draw_header(display, data, "SETTINGS", theme::ACCENT, ctx);
         render_scrolled(
             display, self.index_scroll.offset(),
-            index_viewport_rect(), index_content_h(data), theme::SIGNAL, ctx,
+            index_viewport_rect(), index_content_h(data), theme::ACCENT, ctx,
             |clipped, scroll| render_rows(clipped, data, INDEX_ROWS, scroll, ctx),
         );
     }
@@ -779,14 +780,14 @@ fn render_rows<D: BlendTarget>(
             RowKind::Navigate { value_fn, .. } => {
                 let val = value_fn(data);
                 let control = if val.is_empty() {
-                    RowControl::Chevron(theme::CYAN)
+                    RowControl::Chevron(theme::INFO)
                 } else {
                     RowControl::Inline(val.as_str(), theme::FG_MUTED)
                 };
                 row(
                     display, rect,
                     |d, cx, cy, c| draw_row_icon(d, kind, cx, cy, c),
-                    theme::CYAN,
+                    theme::INFO,
                     r.label,
                     control,
                 );
@@ -795,7 +796,7 @@ fn render_rows<D: BlendTarget>(
                 row(
                     display, rect,
                     |d, cx, cy, c| draw_row_icon(d, kind, cx, cy, c),
-                    theme::CYAN,
+                    theme::INFO,
                     r.label,
                     RowControl::Toggle(is_on(data)),
                 );
@@ -864,11 +865,11 @@ fn draw_clock_panel<D: BlendTarget>(
     tag: &str,
     value: &str,
 ) {
-    chamfered_panel(display, rect, NOTCH, theme::SIGNAL, 1);
+    chamfered_panel(display, rect, NOTCH, theme::ACCENT, 1);
     tag_label(
         display,
         rect.top_left.x, rect.top_left.y,
-        tag, theme::SIGNAL, NOTCH,
+        tag, theme::ACCENT, NOTCH,
     );
     let inner = Rectangle::new(
         Point::new(rect.top_left.x, rect.top_left.y + TAG_LABEL_H),
@@ -884,7 +885,7 @@ impl SettingsScreen {
     fn render_clock<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "CLOCK", theme::SIGNAL, ctx);
+        draw_header(display, data, "CLOCK", theme::ACCENT, ctx);
 
         let mut time_buf: String<12> = String::new();
         let _ = write!(time_buf, "{:02}:{:02}:{:02}",
@@ -956,16 +957,16 @@ impl SettingsScreen {
     fn render_wifi<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "WIFI", theme::SIGNAL, ctx);
+        draw_header(display, data, "WIFI", theme::ACCENT, ctx);
 
         let panel = wifi_panel_rect();
-        chamfered_panel(display, panel, NOTCH, theme::STEEL, 1);
+        chamfered_panel(display, panel, NOTCH, theme::BORDER, 1);
         tag_label(
             display,
             panel.top_left.x,
             panel.top_left.y,
             "PASSPHRASE",
-            theme::STEEL,
+            theme::BORDER,
             NOTCH,
         );
         let inner = Rectangle::new(
@@ -1029,7 +1030,7 @@ impl SettingsScreen {
     fn render_wifi_passphrase<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "PASSPHRASE", theme::SIGNAL, ctx);
+        draw_header(display, data, "PASSPHRASE", theme::ACCENT, ctx);
         self.wifi_passphrase_keyboard.render(display);
     }
 
@@ -1068,15 +1069,15 @@ impl SettingsScreen {
     fn render_time_entry<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "SET TIME", theme::SIGNAL, ctx);
+        draw_header(display, data, "SET TIME", theme::ACCENT, ctx);
 
         let cells = picker_cell_rects();
-        self.time_picker.wheels[0].render(display, cells[0], theme::SIGNAL, fmt_2digit);
-        self.time_picker.wheels[1].render(display, cells[1], theme::SIGNAL, fmt_2digit);
-        self.time_picker.wheels[2].render(display, cells[2], theme::SIGNAL, fmt_2digit);
-        draw_picker_separators(display, &cells, ":", theme::SIGNAL);
+        self.time_picker.wheels[0].render(display, cells[0], theme::ACCENT, fmt_2digit);
+        self.time_picker.wheels[1].render(display, cells[1], theme::ACCENT, fmt_2digit);
+        self.time_picker.wheels[2].render(display, cells[2], theme::ACCENT, fmt_2digit);
+        draw_picker_separators(display, &cells, ":", theme::ACCENT);
 
-        render_action_row(display, theme::SIGNAL);
+        render_action_row(display, theme::ACCENT);
     }
 
     fn time_entry_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
@@ -1130,19 +1131,19 @@ impl SettingsScreen {
     fn render_date_entry<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "SET DATE", theme::SIGNAL, ctx);
+        draw_header(display, data, "SET DATE", theme::ACCENT, ctx);
 
         let cells = picker_cell_rects();
-        self.date_picker.wheels[0].render(display, cells[0], theme::SIGNAL, fmt_2digit);
-        self.date_picker.wheels[1].render(display, cells[1], theme::SIGNAL, fmt_2digit);
+        self.date_picker.wheels[0].render(display, cells[0], theme::ACCENT, fmt_2digit);
+        self.date_picker.wheels[1].render(display, cells[1], theme::ACCENT, fmt_2digit);
         // Year wheel has 4-digit values - format unpadded to fit
         // the 72 px column at value-font size.
-        self.date_picker.wheels[2].render(display, cells[2], theme::SIGNAL, |v, buf| {
+        self.date_picker.wheels[2].render(display, cells[2], theme::ACCENT, |v, buf| {
             let _ = write!(buf, "{}", v);
         });
-        draw_picker_separators(display, &cells, ".", theme::SIGNAL);
+        draw_picker_separators(display, &cells, ".", theme::ACCENT);
 
-        render_action_row(display, theme::SIGNAL);
+        render_action_row(display, theme::ACCENT);
     }
 
     fn date_entry_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
@@ -1334,11 +1335,11 @@ fn motion_value(idx: usize, data: &SystemData, buf: &mut heapless::String<12>) {
 fn draw_motion_panel<D: BlendTarget>(
     display: &mut D, rect: Rectangle, tag: &str, value: &str,
 ) {
-    chamfered_panel(display, rect, NOTCH, theme::CYAN, 1);
+    chamfered_panel(display, rect, NOTCH, theme::INFO, 1);
     tag_label(
         display,
         rect.top_left.x, rect.top_left.y,
-        tag, theme::CYAN, NOTCH,
+        tag, theme::INFO, NOTCH,
     );
     let inner = Rectangle::new(
         Point::new(rect.top_left.x, rect.top_left.y + TAG_LABEL_H),
@@ -1354,13 +1355,13 @@ impl SettingsScreen {
         data: &SystemData,
         ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "MOTION", theme::SIGNAL, ctx);
+        draw_header(display, data, "MOTION", theme::ACCENT, ctx);
 
         let scroll = self.imu_scroll.offset();
         let layout = motion_layout(scroll, data.capabilities.steps);
 
         render_scrolled(
-            display, scroll, motion_viewport_rect(), layout.content_h, theme::SIGNAL, ctx,
+            display, scroll, motion_viewport_rect(), layout.content_h, theme::ACCENT, ctx,
             |clipped, _| {
                 // Live readouts.
                 let mut value_buf: heapless::String<12> = heapless::String::new();
@@ -1401,7 +1402,7 @@ impl SettingsScreen {
                     };
                     chamfered_button(
                         clipped, button_rect, "RUN SELF-TEST",
-                        variant, theme::SIGNAL,
+                        variant, theme::ACCENT,
                     );
                 }
             },
@@ -1485,7 +1486,7 @@ impl SettingsScreen {
         data: &SystemData,
         ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "BATTERY", theme::SIGNAL, ctx);
+        draw_header(display, data, "BATTERY", theme::ACCENT, ctx);
 
         // Top: chamfered tag-labeled BATTERY panel with live
         // percent/voltage centered inside.
@@ -1497,26 +1498,47 @@ impl SettingsScreen {
             Point::new(panel_x, panel_y),
             Size::new(panel_w as u32, panel_h as u32),
         );
-        chamfered_panel(display, panel_rect, NOTCH, theme::SIGNAL, 1);
+        chamfered_panel(display, panel_rect, NOTCH, theme::ACCENT, 1);
         tag_label(
             display,
             panel_rect.top_left.x,
             panel_rect.top_left.y,
             "NOW",
-            theme::SIGNAL,
+            theme::ACCENT,
             NOTCH,
         );
+
+        // Charge ring on the panel's left: sweep = battery percent,
+        // color follows the same health palette as the battery icon.
+        // Sized/positioned to clear the NOW tag in the TL corner.
+        let ring_r = 18i32;
+        let ring_cx = panel_x + 52;
+        let ring_cy = panel_y + panel_h / 2 + 4;
+        let pct = data.power.battery_percent;
+        ring_gauge(
+            display, ctx,
+            ring_cx, ring_cy, ring_r, 5,
+            pct.unwrap_or(0) as u32, 100,
+            crate::ui::primitives::battery_color(pct.unwrap_or(100)),
+            Some(theme::SURFACE_3),
+        );
+
         let mut val: String<20> = String::new();
-        match (data.power.battery_percent, data.power.battery_voltage_mv) {
-            (Some(pct), Some(mv)) => {
-                let _ = write!(val, "{}% / {}.{:02}V", pct, mv / 1000, (mv % 1000) / 10);
+        match (pct, data.power.battery_voltage_mv) {
+            (Some(p), Some(mv)) => {
+                let _ = write!(val, "{}% / {}.{:02}V", p, mv / 1000, (mv % 1000) / 10);
             }
-            (Some(pct), None) => { let _ = write!(val, "{}%", pct); }
-            _                  => { let _ = val.push_str("--"); }
+            (Some(p), None) => { let _ = write!(val, "{}%", p); }
+            _               => { let _ = val.push_str("--"); }
         }
+        // Value text centers in the panel area right of the ring.
+        let text_rect = Rectangle::new(
+            Point::new(panel_x + 80, panel_y),
+            Size::new((panel_w - 88) as u32, panel_h as u32),
+        );
         fonts::draw_centered_in_rect(
             display, &fonts::value(),
-            val.as_str(), panel_rect, theme::FG,
+            val.as_str(), text_rect, theme::FG,
         );
 
         // Sparkline: full screen width, edge-to-edge, no card around.
@@ -1538,13 +1560,13 @@ impl SettingsScreen {
             Point::new(panel_x, uptime_y),
             Size::new(panel_w as u32, panel_h as u32),
         );
-        chamfered_panel(display, uptime_rect, NOTCH, theme::CYAN, 1);
+        chamfered_panel(display, uptime_rect, NOTCH, theme::INFO, 1);
         tag_label(
             display,
             uptime_rect.top_left.x,
             uptime_rect.top_left.y,
             "UPTIME",
-            theme::CYAN,
+            theme::INFO,
             NOTCH,
         );
         let mut up_buf: String<16> = String::new();
@@ -1563,13 +1585,13 @@ impl SettingsScreen {
             Point::new(panel_x, active_y),
             Size::new(panel_w as u32, panel_h as u32),
         );
-        chamfered_panel(display, active_rect, NOTCH, theme::CYAN, 1);
+        chamfered_panel(display, active_rect, NOTCH, theme::INFO, 1);
         tag_label(
             display,
             active_rect.top_left.x,
             active_rect.top_left.y,
             "ACTIVE",
-            theme::CYAN,
+            theme::INFO,
             NOTCH,
         );
         let mut act_buf: String<16> = String::new();
@@ -1593,13 +1615,13 @@ impl SettingsScreen {
             Point::new(panel_x, slept_y),
             Size::new(panel_w as u32, panel_h as u32),
         );
-        chamfered_panel(display, slept_rect, NOTCH, theme::CYAN, 1);
+        chamfered_panel(display, slept_rect, NOTCH, theme::INFO, 1);
         tag_label(
             display,
             slept_rect.top_left.x,
             slept_rect.top_left.y,
             "SLEEPS",
-            theme::CYAN,
+            theme::INFO,
             NOTCH,
         );
         let mut slept_buf: String<16> = String::new();
@@ -1653,7 +1675,7 @@ impl SettingsScreen {
         data: &SystemData,
         ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "STORAGE", theme::SIGNAL, ctx);
+        draw_header(display, data, "STORAGE", theme::ACCENT, ctx);
         // Storage sub-index doesn't scroll today (4 rows always
         // fit). Scroll = 0; if more storage rows land later,
         // give SettingsScreen a second `ScrollState` and viewport.
@@ -1697,7 +1719,7 @@ impl SettingsScreen {
         data: &SystemData,
         ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "FLASH", theme::SIGNAL, ctx);
+        draw_header(display, data, "FLASH", theme::ACCENT, ctx);
 
         // Chamfered HUD panel with a hanging FLASH tag ribbon - the
         // spec's "tag-labelled panel" idiom. Body carries the usage
@@ -1710,7 +1732,7 @@ impl SettingsScreen {
             Size::new(panel_w as u32, panel_h as u32),
         );
         // Symmetric chamfered panel (Nightwatch default - TL + BR both cut).
-        chamfered_panel(display, panel_rect, NOTCH, theme::SIGNAL, 1);
+        chamfered_panel(display, panel_rect, NOTCH, theme::ACCENT, 1);
 
         // Tag ribbon sits exactly at the panel's TL corner. Its own
         // TL chamfer of size NOTCH carves out the same triangular
@@ -1721,7 +1743,7 @@ impl SettingsScreen {
             panel_rect.top_left.x,
             panel_rect.top_left.y,
             "FLASH",
-            theme::SIGNAL,
+            theme::ACCENT,
             NOTCH,
         );
 
@@ -1768,16 +1790,16 @@ impl SettingsScreen {
         data: &SystemData,
         ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "SD CARD", theme::SIGNAL, ctx);
+        draw_header(display, data, "SD CARD", theme::ACCENT, ctx);
 
         // Status: chamfered tag-labelled panel. Border + tag tint
         // tracks online/offline (green/signal). Read-only - the
         // button below triggers the probe.
         let (status_rect, probe_rect) = storage_sd_slots();
         let (accent, status_text) = if data.storage.sd_online {
-            (theme::GREEN, "ONLINE")
+            (theme::OK, "ONLINE")
         } else {
-            (theme::SIGNAL, "NOT PRESENT")
+            (theme::ACCENT, "NOT PRESENT")
         };
         chamfered_panel(display, status_rect, NOTCH, accent, 1);
         tag_label(
@@ -1798,7 +1820,7 @@ impl SettingsScreen {
         let probe_text = if data.storage.sd_online { "REPROBE" } else { "INITIALIZE" };
         chamfered_button(
             display, probe_rect, probe_text,
-            ButtonVariant::Primary, theme::SIGNAL,
+            ButtonVariant::Primary, theme::ACCENT,
         );
     }
 
@@ -1837,18 +1859,18 @@ impl SettingsScreen {
         data: &SystemData,
         ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "RESTORE FROM SD", theme::SIGNAL, ctx);
+        draw_header(display, data, "RESTORE FROM SD", theme::ACCENT, ctx);
 
         // Warning panel: signal-bordered chamfered panel with a
         // RESTORE tag. Body explains what the action does.
         let (warn_rect, cancel_rect, primary_rect) = confirmation_slots();
-        chamfered_panel(display, warn_rect, NOTCH, theme::SIGNAL, 1);
+        chamfered_panel(display, warn_rect, NOTCH, theme::ACCENT, 1);
         tag_label(
             display,
             warn_rect.top_left.x,
             warn_rect.top_left.y,
             "RESTORE",
-            theme::SIGNAL,
+            theme::ACCENT,
             NOTCH,
         );
         let body = if data.storage.sd_online {
@@ -1867,17 +1889,17 @@ impl SettingsScreen {
         
         chamfered_button(
             display, cancel_rect, "CANCEL",
-            ButtonVariant::Ghost, theme::STEEL,
+            ButtonVariant::Ghost, theme::BORDER,
         );
         if data.storage.sd_online {
             chamfered_button(
                 display, primary_rect, "RESTORE",
-                ButtonVariant::Primary, theme::SIGNAL,
+                ButtonVariant::Primary, theme::ACCENT,
             );
         } else {
             chamfered_button(
                 display, primary_rect, "RESTORE",
-                ButtonVariant::Ghost, theme::STEEL,
+                ButtonVariant::Ghost, theme::BORDER,
             );
         }
     }
@@ -1950,7 +1972,7 @@ impl SettingsScreen {
         
         chamfered_button(
             display, cancel_rect, "CANCEL",
-            ButtonVariant::Ghost, theme::STEEL,
+            ButtonVariant::Ghost, theme::BORDER,
         );
         chamfered_button(
             display, primary_rect, "PURGE",
@@ -2000,7 +2022,7 @@ impl SettingsScreen {
         data: &SystemData,
         ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "DISPLAY", theme::SIGNAL, ctx);
+        draw_header(display, data, "DISPLAY", theme::ACCENT, ctx);
 
         let slots = display_slots();
         let always_on = data.config.display.always_on;
@@ -2008,13 +2030,13 @@ impl SettingsScreen {
         // Brightness panel: tag-labelled chamfered panel with the
         // generic slider widget inside.
         let panel = slots.brightness_panel;
-        chamfered_panel(display, panel, NOTCH, theme::SIGNAL, 1);
+        chamfered_panel(display, panel, NOTCH, theme::ACCENT, 1);
         tag_label(
             display,
             panel.top_left.x,
             panel.top_left.y,
             "BRIGHTNESS",
-            theme::SIGNAL,
+            theme::ACCENT,
             NOTCH,
         );
         let pct = brightness_pct(data);
@@ -2033,13 +2055,13 @@ impl SettingsScreen {
         // because the auto-lock timer is bypassed entirely - keeping
         // a Primary highlight would lie about what's active.
         let panel = slots.auto_lock_panel;
-        chamfered_panel(display, panel, NOTCH, theme::SIGNAL, 1);
+        chamfered_panel(display, panel, NOTCH, theme::ACCENT, 1);
         tag_label(
             display,
             panel.top_left.x,
             panel.top_left.y,
             "AUTO-LOCK",
-            theme::SIGNAL,
+            theme::ACCENT,
             NOTCH,
         );
         let current_secs = data.config.display.off_timeout_s as u32;
@@ -2051,7 +2073,7 @@ impl SettingsScreen {
             };
             chamfered_button(
                 display, slots.auto_lock_buttons[i], opt.label,
-                variant, theme::SIGNAL,
+                variant, theme::ACCENT,
             );
         }
 
@@ -2061,14 +2083,14 @@ impl SettingsScreen {
         row(
             display, slots.night_mode_row,
             |d, cx, cy, c| glyphs::moon(d, cx, cy, 8, c),
-            theme::CYAN,
+            theme::INFO,
             "NIGHT MODE",
             RowControl::Toggle(data.config.display.night_mode),
         );
         row(
             display, slots.always_on_row,
             |d, cx, cy, c| glyphs::power(d, cx, cy, 8, c),
-            theme::CYAN,
+            theme::INFO,
             "ALWAYS-ON",
             RowControl::Toggle(always_on),
         );
@@ -2148,16 +2170,16 @@ impl SettingsScreen {
         title: &str,
         ctx: &RenderCtx,
     ) {
-        draw_header(display, data, title, theme::SIGNAL, ctx);
+        draw_header(display, data, title, theme::ACCENT, ctx);
         let mut s = layout::VStack::new(LEAF_TOP_Y);
         let panel = s.slot(80);
-        chamfered_panel(display, panel, NOTCH, theme::STEEL, 1);
+        chamfered_panel(display, panel, NOTCH, theme::BORDER, 1);
         tag_label(
             display,
             panel.top_left.x,
             panel.top_left.y,
             "WIP",
-            theme::STEEL,
+            theme::BORDER,
             NOTCH,
         );
         fonts::draw_centered_in_rect(
@@ -2180,13 +2202,13 @@ impl SettingsScreen {
         data: &SystemData,
         ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "MIC TEST", theme::SIGNAL, ctx);
+        draw_header(display, data, "MIC TEST", theme::ACCENT, ctx);
 
         let (panel, tones_rect, loop_rect) = mic_test_slots();
-        chamfered_panel(display, panel, NOTCH, theme::STEEL, 1);
+        chamfered_panel(display, panel, NOTCH, theme::BORDER, 1);
         tag_label(
             display, panel.top_left.x, panel.top_left.y,
-            "LEVEL", theme::STEEL, NOTCH,
+            "LEVEL", theme::BORDER, NOTCH,
         );
 
         // Track + GREEN fill whose width tracks the live level.
@@ -2195,11 +2217,11 @@ impl SettingsScreen {
             Point::new(panel.top_left.x + inset, panel.top_left.y + 34),
             Size::new(panel.size.width - (inset as u32) * 2, 26),
         );
-        bar.into_styled(PrimitiveStyle::with_fill(theme::INK)).draw(display).ok();
+        bar.into_styled(PrimitiveStyle::with_fill(theme::SURFACE)).draw(display).ok();
         let fill_w = bar.size.width * data.mic_level as u32 / 255;
         if fill_w > 0 {
             Rectangle::new(bar.top_left, Size::new(fill_w, bar.size.height))
-                .into_styled(PrimitiveStyle::with_fill(theme::GREEN))
+                .into_styled(PrimitiveStyle::with_fill(theme::OK))
                 .draw(display)
                 .ok();
         }
@@ -2221,17 +2243,17 @@ impl SettingsScreen {
         // Primary-filled while loopback is live.
         chamfered_button(
             display, tones_rect, "TONES",
-            ButtonVariant::Ghost, theme::STEEL,
+            ButtonVariant::Ghost, theme::BORDER,
         );
         if self.mic_loopback {
             chamfered_button(
                 display, loop_rect, "LOOP ON",
-                ButtonVariant::Primary, theme::SIGNAL,
+                ButtonVariant::Primary, theme::ACCENT,
             );
         } else {
             chamfered_button(
                 display, loop_rect, "LOOP",
-                ButtonVariant::Ghost, theme::STEEL,
+                ButtonVariant::Ghost, theme::BORDER,
             );
         }
     }
@@ -2291,17 +2313,17 @@ impl SettingsScreen {
         data: &SystemData,
         ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "GPS", theme::SIGNAL, ctx);
+        draw_header(display, data, "GPS", theme::ACCENT, ctx);
         let slots = gps_slots();
 
         // Session status: state line + the field lesson as a hint
         // (low-e window glazing blocks GNSS outright - sessions need
         // real sky).
-        chamfered_panel(display, slots.status_panel, NOTCH, theme::STEEL, 1);
+        chamfered_panel(display, slots.status_panel, NOTCH, theme::BORDER, 1);
         tag_label(
             display,
             slots.status_panel.top_left.x, slots.status_panel.top_left.y,
-            "STATUS", theme::STEEL, NOTCH,
+            "STATUS", theme::BORDER, NOTCH,
         );
         // What the receiver is doing NOW. A running session reports
         // itself; between tracking sessions the receiver is powered
@@ -2360,23 +2382,23 @@ impl SettingsScreen {
         } else {
             chamfered_button(
                 display, slots.sync_btn, "SYNC NOW",
-                ButtonVariant::Primary, theme::SIGNAL,
+                ButtonVariant::Primary, theme::ACCENT,
             );
         }
 
         // Timezone stepper: +/- 15 min covers every real UTC offset
         // (Newfoundland, Nepal); the value between the steppers.
-        chamfered_panel(display, slots.tz_panel, NOTCH, theme::STEEL, 1);
+        chamfered_panel(display, slots.tz_panel, NOTCH, theme::BORDER, 1);
         tag_label(
             display,
             slots.tz_panel.top_left.x, slots.tz_panel.top_left.y,
-            "TIMEZONE", theme::STEEL, NOTCH,
+            "TIMEZONE", theme::BORDER, NOTCH,
         );
         chamfered_button(
-            display, slots.tz_minus, "-", ButtonVariant::Ghost, theme::STEEL,
+            display, slots.tz_minus, "-", ButtonVariant::Ghost, theme::BORDER,
         );
         chamfered_button(
-            display, slots.tz_plus, "+", ButtonVariant::Ghost, theme::STEEL,
+            display, slots.tz_plus, "+", ButtonVariant::Ghost, theme::BORDER,
         );
         let m = data.config.time.tz_offset_minutes;
         let a = m.unsigned_abs();
@@ -2397,11 +2419,11 @@ impl SettingsScreen {
         // Tracking: enable toggle in the tag row, cadence radio row
         // below. The cadence buttons stay live while tracking is
         // off - they set a remembered preference, they don't act.
-        chamfered_panel(display, slots.tracking_panel, NOTCH, theme::STEEL, 1);
+        chamfered_panel(display, slots.tracking_panel, NOTCH, theme::BORDER, 1);
         tag_label(
             display,
             slots.tracking_panel.top_left.x, slots.tracking_panel.top_left.y,
-            "TRACKING", theme::STEEL, NOTCH,
+            "TRACKING", theme::BORDER, NOTCH,
         );
         let t = slots.tracking_toggle;
         toggle(
@@ -2419,7 +2441,7 @@ impl SettingsScreen {
                 ButtonVariant::Ghost
             };
             chamfered_button(
-                display, slots.tracking_buttons[i], label, variant, theme::SIGNAL,
+                display, slots.tracking_buttons[i], label, variant, theme::ACCENT,
             );
         }
     }
@@ -2576,11 +2598,11 @@ fn format_result(
         }
         SelfTestResult::Running => {
             let _ = buf.push_str("RUNNING");
-            (buf, theme::FG_MUTED, Some(theme::SIGNAL))
+            (buf, theme::FG_MUTED, Some(theme::ACCENT))
         }
         SelfTestResult::PassAxes3(v) => {
             let _ = write!(&mut buf, "{} {} {} {}", v[0], v[1], v[2], unit);
-            (buf, theme::FG, Some(theme::GREEN))
+            (buf, theme::FG, Some(theme::OK))
         }
         SelfTestResult::FailAxes3(v) => {
             let _ = write!(&mut buf, "{} {} {} {}", v[0], v[1], v[2], unit);
@@ -2797,9 +2819,9 @@ fn brightness_pct(data: &SystemData) -> u8 {
 /// fail/error.
 fn imu_result_accent(result: &SelfTestResult) -> Color {
     match result {
-        SelfTestResult::NotRun => theme::STEEL,
-        SelfTestResult::Running => theme::SIGNAL,
-        SelfTestResult::PassAxes3(_) => theme::GREEN,
+        SelfTestResult::NotRun => theme::BORDER,
+        SelfTestResult::Running => theme::ACCENT,
+        SelfTestResult::PassAxes3(_) => theme::OK,
         SelfTestResult::FailAxes3(_) | SelfTestResult::Error(_) => theme::DANGER,
     }
 }

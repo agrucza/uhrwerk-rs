@@ -26,22 +26,27 @@ pub const TOGGLE_H: i32 = 16;
 
 /// Draw a toggle switch at the given top-left.
 ///
-/// - Off: `INK_3` fill, `STEEL` border, `STEEL_2` pill flush-left.
-/// - On: `SIGNAL` fill and border, `BG` pill flush-right.
+/// - Off: elevated-surface trough, `BORDER` border, `FG_DIM` pill
+///   flush-left.
+/// - On: `ACCENT` trough and border, `BG` pill flush-right.
+///
+/// Troughs are top-lit vertical gradients (dithered) so the control
+/// reads as a lit tube rather than a flat chip.
 pub fn toggle<D: BlendTarget>(
     display: &mut D,
     top_left: Point,
     on: bool,
 ) {
-    let (bg, border, pill) = if on {
-        (theme::SIGNAL, theme::SIGNAL, theme::BG)
+    let (trough_top, trough_bottom, border, pill) = if on {
+        (theme::ACCENT, theme::dimmed(theme::ACCENT, 165), theme::ACCENT, theme::BG)
     } else {
-        (theme::INK_3, theme::STEEL, theme::STEEL_2)
+        (theme::SURFACE_3, theme::SURFACE, theme::BORDER, theme::FG_DIM)
     };
 
-    Rectangle::new(top_left, Size::new(TOGGLE_W as u32, TOGGLE_H as u32))
-        .into_styled(PrimitiveStyle::with_fill(bg))
-        .draw(display).ok();
+    display.fill_vgradient(
+        top_left.x, top_left.y, TOGGLE_W, TOGGLE_H,
+        trough_top, trough_bottom,
+    );
     Rectangle::new(top_left, Size::new(TOGGLE_W as u32, TOGGLE_H as u32))
         .into_styled(PrimitiveStyle::with_stroke(border, 1))
         .draw(display).ok();
@@ -110,22 +115,25 @@ pub fn slider<D: BlendTarget>(
         );
     }
 
+    // Trough + value fill as top-lit vertical gradients (dithered) -
+    // the accent fill reads as a glowing tube against the dark trough.
+    display.fill_vgradient(
+        rect.top_left.x, rect.top_left.y,
+        rect.size.width as i32, rect.size.height as i32,
+        theme::SURFACE_3, theme::SURFACE,
+    );
     Rectangle::new(rect.top_left, rect.size)
-        .into_styled(PrimitiveStyle::with_fill(theme::INK_3))
-        .draw(display).ok();
-    Rectangle::new(rect.top_left, rect.size)
-        .into_styled(PrimitiveStyle::with_stroke(theme::STEEL, 1))
+        .into_styled(PrimitiveStyle::with_stroke(theme::BORDER, 1))
         .draw(display).ok();
     let range = (max as i32 - min as i32).max(1);
     let fill_w =
         ((value as i32 - min as i32).max(0) * (rect.size.width as i32 - 2)) / range;
     if fill_w > 0 {
-        Rectangle::new(
-            Point::new(rect.top_left.x + 1, rect.top_left.y + 1),
-            Size::new(fill_w as u32, (rect.size.height as i32 - 2) as u32),
-        )
-        .into_styled(PrimitiveStyle::with_fill(theme::SIGNAL))
-        .draw(display).ok();
+        display.fill_vgradient(
+            rect.top_left.x + 1, rect.top_left.y + 1,
+            fill_w, rect.size.height as i32 - 2,
+            theme::ACCENT, theme::dimmed(theme::ACCENT, 165),
+        );
     }
 }
 
@@ -192,11 +200,14 @@ pub fn chamfered_button<D: BlendTarget>(
     let notch = BUTTON_NOTCH;
     match variant {
         ButtonVariant::Primary => {
-            // Fill the whole rect with accent, then carve TL and BR
-            // chamfer corners back to BG so the hex shape reads.
-            Rectangle::new(rect.top_left, rect.size)
-                .into_styled(PrimitiveStyle::with_fill(accent))
-                .draw(display).ok();
+            // Fill the whole rect with a top-lit accent gradient, then
+            // carve TL and BR chamfer corners back to BG so the hex
+            // shape reads.
+            display.fill_vgradient(
+                rect.top_left.x, rect.top_left.y,
+                rect.size.width as i32, rect.size.height as i32,
+                accent, theme::dimmed(accent, 175),
+            );
 
             let x = rect.top_left.x;
             let y = rect.top_left.y;
@@ -230,7 +241,7 @@ pub fn chamfered_button<D: BlendTarget>(
         ButtonVariant::Ghost => {
             // No fill - just the chamfered outline in steel and the
             // label in FG.
-            chamfered_panel(display, rect, notch, theme::STEEL, 1);
+            chamfered_panel(display, rect, notch, theme::BORDER, 1);
             let _ = accent; // unused for Ghost
             fonts::draw_centered_in_rect(
                 display, &fonts::caption(), label, rect, theme::FG,

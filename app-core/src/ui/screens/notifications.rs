@@ -40,7 +40,7 @@ use crate::ui::widgets::{
 
 /// Per-screen accent. Yellow == warning per spec ("ALERTS" header
 /// is yellow-tinted).
-const ACCENT: Color = theme::YELLOW;
+const ACCENT: Color = theme::ALERT;
 
 /// Side margin matching the alarm list rows.
 const SIDE_MARGIN: i32 = 14;
@@ -343,10 +343,10 @@ fn render_row<D: BlendTarget>(
 /// Severity → border / label / badge colour.
 fn severity_color(sev: NotificationSeverity) -> Color {
     match sev {
-        NotificationSeverity::Critical => theme::SIGNAL,
-        NotificationSeverity::Warning  => theme::YELLOW,
-        NotificationSeverity::Ok       => theme::GREEN,
-        NotificationSeverity::Info     => theme::CYAN,
+        NotificationSeverity::Critical => theme::ACCENT,
+        NotificationSeverity::Warning  => theme::WARN,
+        NotificationSeverity::Ok       => theme::OK,
+        NotificationSeverity::Info     => theme::INFO,
     }
 }
 

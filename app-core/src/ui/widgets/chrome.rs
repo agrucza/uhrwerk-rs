@@ -89,18 +89,26 @@ pub fn header<D: BlendTarget>(
         .map(|b| b.size.height as i32)
         .unwrap_or(18);
     let title_top = y + (h - title_h) / 2;
+    let title_x = x + pad + 26;
     fonts::draw_at(
         display, &title_font, title,
-        x + pad + 26, title_top,
+        title_x, title_top,
         accent,
     );
 
+    // Right telemetry yields to a long title: skip it when the title
+    // run would collide (title + breathing gap reaches the telemetry's
+    // left edge). The title is the header's identity; the telemetry is
+    // decoration.
     let tele_font = fonts::caption();
-    fonts::draw_right(
-        display, &tele_font, right_text,
-        x + w - pad, y + h - 12,
-        theme::FG_MUTED,
-    );
+    let tele_left = x + w - pad - fonts::measure_width(&tele_font, right_text);
+    if title_x + fonts::measure_width(&title_font, title) + 12 <= tele_left {
+        fonts::draw_right(
+            display, &tele_font, right_text,
+            x + w - pad, y + h - 12,
+            theme::FG_MUTED,
+        );
+    }
 
     Line::new(
         Point::new(x, y + h - 1),
@@ -270,7 +278,7 @@ pub fn draw_app_chrome<D: BlendTarget>(
         APP_STATUS_X_INSET,
     );
     header(display, app_header_rect(), title, telemetry, accent);
-    home_indicator(display, APP_HOME_BAR_Y, theme::SIGNAL);
+    home_indicator(display, APP_HOME_BAR_Y, theme::ACCENT);
 }
 
 /// Hit test for the back chevron of the standard app chrome.

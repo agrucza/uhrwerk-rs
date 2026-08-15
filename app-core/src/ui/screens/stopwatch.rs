@@ -52,7 +52,7 @@ use crate::ui::widgets::{
 
 /// Per-screen accent. Stopwatch reads as "running / live / active",
 /// which lines up with the spec's RUN/CALL green semantics.
-const ACCENT: Color = theme::GREEN;
+const ACCENT: Color = theme::OK;
 
 /// Static system-code shown in the header's right-telemetry slot.
 const TELEMETRY: &str = "STW.0001";
@@ -205,12 +205,12 @@ impl Screen for StopwatchScreen {
             // Nothing to reset - show as inert ghost.
             chamfered_button(
                 display, right, "RESET",
-                ButtonVariant::Ghost, theme::STEEL,
+                ButtonVariant::Ghost, theme::BORDER,
             );
         } else {
             chamfered_button(
                 display, right, "RESET",
-                ButtonVariant::Primary, theme::SIGNAL,
+                ButtonVariant::Primary, theme::ACCENT,
             );
         }
     }

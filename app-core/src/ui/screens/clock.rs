@@ -286,7 +286,7 @@ fn draw_swipe_hint<D: BlendTarget>(display: &mut D) {
         Point::new(x, HINT_Y),
         Size::new(HINT_W as u32, HINT_H as u32),
     )
-    .into_styled(PrimitiveStyle::with_fill(theme::CYAN))
+    .into_styled(PrimitiveStyle::with_fill(theme::INFO))
     .draw(display).ok();
 }
 
@@ -301,7 +301,7 @@ fn draw_telemetry_strip<D: BlendTarget>(
         display, &font,
         "SYS-ID 232.29CB.98B",
         PAD_X, TELE_Y,
-        theme::CYAN,
+        theme::INFO,
     );
 
     // Right: "TUE 24 APR".
@@ -332,11 +332,11 @@ fn draw_hero_numerals<D: BlendTarget>(
 
     let mut hh: String<4> = String::new();
     let _ = write!(hh, "{:02}", data.time.hour);
-    fonts::draw_centered(display, &mega, hh.as_str(), cx, HERO_HH_TOP, theme::SIGNAL);
+    fonts::draw_centered(display, &mega, hh.as_str(), cx, HERO_HH_TOP, theme::ACCENT);
 
     let mut mm: String<4> = String::new();
     let _ = write!(mm, "{:02}", data.time.minute);
-    fonts::draw_centered(display, &mega, mm.as_str(), cx, HERO_MM_TOP, theme::BONE);
+    fonts::draw_centered(display, &mega, mm.as_str(), cx, HERO_MM_TOP, theme::FG);
 }
 
 fn draw_meta_row<D: BlendTarget>(
@@ -373,7 +373,7 @@ fn draw_meta_row<D: BlendTarget>(
     let left_x = cx - group_w / 2;
 
     fonts::draw_at(display, &font, ss.as_str(),
-        left_x, META_Y, theme::CYAN);
+        left_x, META_Y, theme::INFO);
     fonts::draw_at(display, &font, coords,
         left_x + ss_w + gap, META_Y, theme::FG_MUTED);
 }
@@ -444,7 +444,7 @@ fn draw_bottom_tiles<D: BlendTarget>(
         }
         None => "OFF",
     };
-    info_tile(display, left, glyphs::bell, alarm_value, "ALARM", theme::YELLOW);
+    info_tile(display, left, glyphs::bell, alarm_value, "ALARM", theme::ALERT);
 
     // -- Timer tile: remaining time, or OFF when idle/zero -----------------
     let mut timer_buf: String<8> = String::new();
@@ -458,7 +458,7 @@ fn draw_bottom_tiles<D: BlendTarget>(
         let _ = write!(timer_buf, "{:02}:{:02}", secs / 3600, (secs / 60) % 60);
         timer_buf.as_str()
     };
-    info_tile(display, right, glyphs::hourglass, timer_value, "TIMER", theme::ORANGE);
+    info_tile(display, right, glyphs::hourglass, timer_value, "TIMER", theme::MEDIA);
 }
 
 // -- Small date helpers -----------------------------------------------------

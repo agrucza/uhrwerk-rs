@@ -231,9 +231,9 @@ impl Wheel {
             let color = if abs == 0 {
                 accent
             } else if abs == 1 {
-                theme::CHROME
+                theme::FG_MUTED
             } else {
-                theme::STEEL_2
+                theme::FG_DIM
             };
 
             let mut buf: heapless::String<16> = heapless::String::new();

@@ -13,7 +13,7 @@
 //!   uppercase caption).
 //! - Bottom: 2px home-indicator bar in signal red, centered.
 //!
-//! Non-real tiles are dimmed with a `STEEL` border + chrome caption
+//! Non-real tiles are dimmed with a `BORDER` steel + muted caption
 //! so the grid geometry stays complete even with fewer than 9 apps.
 
 use embedded_graphics::{
@@ -93,17 +93,17 @@ struct TileDef {
 /// are placeholders to keep the grid complete.
 const TILES: [TileDef; 9] = [
     // Row 0
-    TileDef { target: Some(ScreenId::Settings),  caption: "SYS.CFG",  border: theme::SIGNAL, icon: IconKind::Settings  },
-    TileDef { target: None,                      caption: "VITALS",   border: theme::STEEL,  icon: IconKind::Heart     },
-    TileDef { target: Some(ScreenId::Clock),     caption: "CLOCK",    border: theme::CYAN,   icon: IconKind::Clock     },
+    TileDef { target: Some(ScreenId::Settings),  caption: "SYS.CFG",  border: theme::ACCENT, icon: IconKind::Settings  },
+    TileDef { target: None,                      caption: "VITALS",   border: theme::BORDER,  icon: IconKind::Heart     },
+    TileDef { target: Some(ScreenId::Clock),     caption: "CLOCK",    border: theme::INFO,   icon: IconKind::Clock     },
     // Row 1
-    TileDef { target: Some(ScreenId::Stopwatch), caption: "STPWCH",   border: theme::GREEN,  icon: IconKind::Stopwatch },
-    TileDef { target: Some(ScreenId::Timer),     caption: "TIMER",    border: theme::ORANGE, icon: IconKind::Timer     },
-    TileDef { target: Some(ScreenId::Alarm),     caption: "ALARM",    border: theme::YELLOW, icon: IconKind::Alarm     },
+    TileDef { target: Some(ScreenId::Stopwatch), caption: "STPWCH",   border: theme::OK,  icon: IconKind::Stopwatch },
+    TileDef { target: Some(ScreenId::Timer),     caption: "TIMER",    border: theme::MEDIA, icon: IconKind::Timer     },
+    TileDef { target: Some(ScreenId::Alarm),     caption: "ALARM",    border: theme::ALERT, icon: IconKind::Alarm     },
     // Row 2
-    TileDef { target: None,                      caption: "",         border: theme::STEEL,  icon: IconKind::Empty     },
-    TileDef { target: None,                      caption: "MSG",      border: theme::STEEL,  icon: IconKind::Empty     },
-    TileDef { target: None,                      caption: "CAL",      border: theme::STEEL,  icon: IconKind::Empty     },
+    TileDef { target: None,                      caption: "",         border: theme::BORDER,  icon: IconKind::Empty     },
+    TileDef { target: None,                      caption: "MSG",      border: theme::BORDER,  icon: IconKind::Empty     },
+    TileDef { target: None,                      caption: "CAL",      border: theme::BORDER,  icon: IconKind::Empty     },
 ];
 
 // -- Layout constants --------------------------------------------------------
@@ -173,7 +173,7 @@ impl Screen for AppDrawerScreen {
             STATUS_Y,
             time_buf.as_str(),
             data.power.battery_percent,
-            theme::SIGNAL,
+            theme::ACCENT,
             STATUS_X_INSET,
         );
         // Header row.
@@ -182,7 +182,7 @@ impl Screen for AppDrawerScreen {
             display, &font_title,
             "APPS",
             GRID_PAD_X, HEADER_Y - 8,
-            theme::SIGNAL,
+            theme::ACCENT,
         );
         let installed = TILES.iter().filter(|t| t.target.is_some()).count();
         let mut buf: String<16> = String::new();
@@ -197,7 +197,7 @@ impl Screen for AppDrawerScreen {
         // 3x3 tile grid. The tile whose `target` matches the
         // pre-drawer screen gets two visual cues as a "you came from
         // here" indicator (the spec's glow can't be rendered):
-        //   - interior fill in INK_3 (raised dark, distinct from
+        //   - interior fill in SURFACE_3 (raised dark, distinct from
         //     the black background the other tiles sit on)
         //   - 2 px border instead of 1 px
         for (i, t) in TILES.iter().enumerate() {
@@ -208,7 +208,7 @@ impl Screen for AppDrawerScreen {
             let is_active = t.target == Some(self.previous);
 
             if is_active {
-                // Fill the tile interior with INK_3 before the border.
+                // Fill the tile interior with SURFACE_3 before the border.
                 // A small inset keeps the fill inside the chamfer
                 // lines so the corners still read as cut.
                 let inset = Rectangle::new(
@@ -218,7 +218,7 @@ impl Screen for AppDrawerScreen {
                         (rect.size.height as i32 - 4) as u32,
                     ),
                 );
-                inset.into_styled(PrimitiveStyle::with_fill(theme::INK_3))
+                inset.into_styled(PrimitiveStyle::with_fill(theme::SURFACE_3))
                     .draw(display).ok();
             }
 
@@ -238,7 +238,7 @@ impl Screen for AppDrawerScreen {
             );
         }
 
-        home_indicator(display, HOME_BAR_Y, theme::SIGNAL);
+        home_indicator(display, HOME_BAR_Y, theme::ACCENT);
     }
 
     fn on_event(&mut self, event: &SystemEvent, _data: &mut SystemData) -> Action {

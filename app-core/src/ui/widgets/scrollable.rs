@@ -89,7 +89,7 @@ where
             display,
             bar_x, bar_y, SCROLLBAR_W, bar_h,
             content_h, viewport.size.height as i32, scroll,
-            accent, theme::STEEL_2,
+            accent, theme::FG_DIM,
         );
     }
 }

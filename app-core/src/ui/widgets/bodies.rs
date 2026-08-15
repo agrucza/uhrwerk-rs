@@ -68,8 +68,11 @@ where
     let icon_cx = x + ROW_PAD + 8;
     icon(display, icon_cx, cy, icon_color);
 
+    // Uppercase labels: cap ink spans exactly `ascent` px from the
+    // draw anchor, so anchoring at cy - ascent/2 centers the caps on
+    // the row's midline for whatever the body role is baked at.
     let label_font = fonts::body();
-    let label_h = 14;
+    let label_h = label_font.ascent();
     fonts::draw_at(
         display, &label_font, label,
         x + ROW_PAD + ROW_ICON_COL_W, cy - label_h / 2,
@@ -97,12 +100,12 @@ where
             toggle(display, top, on);
         }
         RowControl::Inline(text, color) => {
-            // Match the label's body font (helvR14) so both sides of
-            // the row read at the same weight.
+            // Match the label's body role so both sides of the row
+            // read at the same weight, centered the same way.
             let font = fonts::body();
             fonts::draw_right(
                 display, &font, text,
-                x + w - ROW_PAD, cy - 7,
+                x + w - ROW_PAD, cy - font.ascent() / 2,
                 color,
             );
         }
@@ -111,6 +114,6 @@ where
     Line::new(
         Point::new(x, y + h - 1),
         Point::new(x + w - 1, y + h - 1),
-    ).into_styled(PrimitiveStyle::with_stroke(theme::STEEL, 1))
+    ).into_styled(PrimitiveStyle::with_stroke(theme::BORDER, 1))
     .draw(display).ok();
 }

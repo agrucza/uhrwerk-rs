@@ -414,10 +414,10 @@ fn draw_key<D: BlendTarget>(
     style: KeyStyle,
 ) {
     let (fill, border, fg) = match style {
-        KeyStyle::Char => (theme::INK_3, theme::STEEL, theme::FG),
-        KeyStyle::Special => (theme::BG, theme::STEEL, theme::FG_MUTED),
-        KeyStyle::Active => (theme::INK_3, theme::SIGNAL, theme::SIGNAL),
-        KeyStyle::Hot => (theme::SIGNAL_DEEP, theme::SIGNAL, theme::SIGNAL),
+        KeyStyle::Char => (theme::SURFACE_3, theme::BORDER, theme::FG),
+        KeyStyle::Special => (theme::BG, theme::BORDER, theme::FG_MUTED),
+        KeyStyle::Active => (theme::SURFACE_3, theme::ACCENT, theme::ACCENT),
+        KeyStyle::Hot => (theme::ACCENT_DEEP, theme::ACCENT, theme::ACCENT),
         KeyStyle::Ghost => (theme::BG, theme::FG_DIM, theme::FG_DIM),
     };
     Rectangle::new(rect.top_left, rect.size)
