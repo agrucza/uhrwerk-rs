@@ -12,24 +12,24 @@
 //! - `battery_warning_frame` - low-battery system overlay.
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     prelude::Primitive,
     primitives::{PrimitiveStyleBuilder, Rectangle, RoundedRectangle, StrokeAlignment},
     Drawable,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 
 // -- Rounded panel -----------------------------------------------------------
 
 /// Draw a rounded rectangle with optional fill and border. Returns the
 /// axis-aligned bounding rectangle so callers can lay content inside it.
-pub fn rounded_panel<D: DrawTarget<Color = Rgb565>>(
+pub fn rounded_panel<D: BlendTarget>(
     display: &mut D,
     x: i32, y: i32, w: i32, h: i32,
     radius: u32,
-    fill: Option<Rgb565>,
-    border: Option<Rgb565>,
+    fill: Option<Color>,
+    border: Option<Color>,
 ) -> Rectangle {
     let rect = Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32));
     let rr = RoundedRectangle::with_equal_corners(rect, Size::new(radius, radius));
@@ -54,14 +54,14 @@ pub fn rounded_panel<D: DrawTarget<Color = Rgb565>>(
 ///
 /// When the content fits inside the viewport (`content_h <= viewport_h`)
 /// the call is a no-op - no scrollbar is needed.
-pub fn scrollbar_v<D: DrawTarget<Color = Rgb565>>(
+pub fn scrollbar_v<D: BlendTarget>(
     display: &mut D,
     x: i32, y: i32, w: i32, h: i32,
     content_h: i32,
     viewport_h: i32,
     offset: i32,
-    active_color: Rgb565,
-    dim_color: Rgb565,
+    active_color: Color,
+    dim_color: Color,
 ) {
     if content_h <= viewport_h || h <= 0 || w <= 0 { return; }
     let radius = (w as u32) / 2;
@@ -85,7 +85,7 @@ pub fn scrollbar_v<D: DrawTarget<Color = Rgb565>>(
 /// Pick the right status color for a given battery percentage:
 /// bone (neutral) when healthy, yellow as a heads-up, signal red when
 /// critical.
-pub fn battery_color(percent: u8) -> Rgb565 {
+pub fn battery_color(percent: u8) -> Color {
     use super::theme;
     if percent > 50 { theme::FG }
     else if percent >= 20 { theme::WARN }
@@ -106,7 +106,7 @@ pub fn battery_color(percent: u8) -> Rgb565 {
 /// bezel the frame sits. The arc center lands at
 /// `(BEZEL_ARC_R, BEZEL_ARC_R)`, matching the bezel arc, so the frame
 /// runs exactly `INSET` px inside the bezel at every point.
-pub fn battery_warning_frame<D: DrawTarget<Color = Rgb565>>(
+pub fn battery_warning_frame<D: BlendTarget>(
     display: &mut D,
     percent: u8,
 ) {

@@ -9,19 +9,19 @@
 //! local copies, so visual tweaks to an icon propagate everywhere.
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     prelude::Primitive,
     primitives::{Circle, Line, PrimitiveStyle, Rectangle, Triangle},
     Drawable,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 
 // -- Clock / time glyphs ----------------------------------------------------
 
 /// Analog-clock glyph: circle with hour and minute hands, center dot.
-pub fn clock<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn clock<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let thin  = PrimitiveStyle::with_stroke(color, 2);
     let thick = PrimitiveStyle::with_stroke(color, 3);
@@ -49,8 +49,8 @@ pub fn clock<D: DrawTarget<Color = Rgb565>>(
 
 /// Stopwatch glyph: a small dial with a button stem on top and a
 /// hand pointing up-right. Distinct from the regular clock glyph.
-pub fn stopwatch<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn stopwatch<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let thin  = PrimitiveStyle::with_stroke(color, 2);
     let thick = PrimitiveStyle::with_stroke(color, 3);
@@ -83,8 +83,8 @@ pub fn stopwatch<D: DrawTarget<Color = Rgb565>>(
 
 /// Hourglass glyph: two triangular chambers meeting at a point,
 /// with flat horizontal caps top and bottom.
-pub fn hourglass<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn hourglass<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 3);
 
@@ -131,8 +131,8 @@ pub fn hourglass<D: DrawTarget<Color = Rgb565>>(
 
 /// Stylised bell glyph: small handle on top, trapezoidal body
 /// flaring to a horizontal base, and a clapper dot below.
-pub fn bell<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn bell<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     let fill   = PrimitiveStyle::with_fill(color);
@@ -179,8 +179,8 @@ pub fn bell<D: DrawTarget<Color = Rgb565>>(
 // -- Playback control glyphs ------------------------------------------------
 
 /// Filled right-pointing triangle (play icon).
-pub fn play<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn play<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     Triangle::new(
         Point::new(cx - radius / 2, cy - radius),
@@ -192,8 +192,8 @@ pub fn play<D: DrawTarget<Color = Rgb565>>(
 }
 
 /// Two filled vertical bars (pause icon).
-pub fn pause<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn pause<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let bar_w = (radius * 2 / 5).max(3);
     let bar_h = radius * 2;
@@ -210,8 +210,8 @@ pub fn pause<D: DrawTarget<Color = Rgb565>>(
 }
 
 /// Filled square (stop / reset icon).
-pub fn stop<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn stop<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let side = radius * 7 / 4;
     Rectangle::new(
@@ -225,8 +225,8 @@ pub fn stop<D: DrawTarget<Color = Rgb565>>(
 // -- App launcher glyphs ----------------------------------------------------
 
 /// Three stacked horizontal bars (settings / menu icon).
-pub fn settings<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn settings<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let style = PrimitiveStyle::with_stroke(color, 3);
     let half_w = radius * 3 / 4;
@@ -244,8 +244,8 @@ pub fn settings<D: DrawTarget<Color = Rgb565>>(
 }
 
 /// Four small filled squares in a 2x2 grid (panel / app-grid icon).
-pub fn panel<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn panel<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let s = (radius / 3).max(4);
     let gap = 4;
@@ -274,8 +274,8 @@ pub fn panel<D: DrawTarget<Color = Rgb565>>(
 
 /// Heart glyph: two filled semicircles merging into a downward V.
 /// Reads as an outline at small radii because the strokes stay 2 px.
-pub fn heart<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn heart<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     // 0.45 * radius via integer math so the glyph compiles in no_std
@@ -298,8 +298,8 @@ pub fn heart<D: DrawTarget<Color = Rgb565>>(
 }
 
 /// Map-pin glyph: teardrop outline with a hollow dot at the center.
-pub fn map_pin<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn map_pin<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     let r = radius * 2 / 3;
@@ -323,8 +323,8 @@ pub fn map_pin<D: DrawTarget<Color = Rgb565>>(
 /// Handset glyph: a rounded bar with two stubs on each end. Drawn as
 /// a single tilted rectangle + two short perpendicular lines so it
 /// reads as a classic phone handset silhouette.
-pub fn phone<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn phone<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     // Handset body: a diagonal line from upper-left to lower-right.
@@ -346,8 +346,8 @@ pub fn phone<D: DrawTarget<Color = Rgb565>>(
 
 /// Calendar glyph: square outline with a thick top bar and two small
 /// vertical "ring" lines poking above.
-pub fn calendar<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn calendar<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     let fill = PrimitiveStyle::with_fill(color);
@@ -375,8 +375,8 @@ pub fn calendar<D: DrawTarget<Color = Rgb565>>(
 
 /// Running figure glyph: stick-figure head + diagonal body + bent legs
 /// suggesting mid-stride.
-pub fn run<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn run<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     let head_r = radius / 4;
@@ -414,8 +414,8 @@ pub fn run<D: DrawTarget<Color = Rgb565>>(
 /// and three short rectangular teeth poking below. Tuned to read at
 /// a 16 px tile radius - eye dots are large enough not to get lost,
 /// teeth are spaced so they clearly separate.
-pub fn skull<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn skull<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     let fill = PrimitiveStyle::with_fill(color);
@@ -450,8 +450,8 @@ pub fn skull<D: DrawTarget<Color = Rgb565>>(
 
 /// Battery glyph: horizontal rounded body with a small nub on the
 /// right. Outline only.
-pub fn battery<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn battery<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     let fill = PrimitiveStyle::with_fill(color);
@@ -474,8 +474,8 @@ pub fn battery<D: DrawTarget<Color = Rgb565>>(
 /// IMU / 6-axis motion-sensor glyph: a circle with three axis lines
 /// crossing its center (horizontal, vertical, and a diagonal "Z"
 /// suggestion). Reads as a gyro / motion sensor affordance.
-pub fn imu<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn imu<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     let r = radius;
@@ -496,8 +496,8 @@ pub fn imu<D: DrawTarget<Color = Rgb565>>(
 /// IC-chip glyph: a DIP-style rectangular body (taller than wide)
 /// with short pin stubs on the left and right edges (3 each side).
 /// Used as the flash storage icon.
-pub fn chip<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn chip<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     let fill = PrimitiveStyle::with_fill(color);
@@ -535,8 +535,8 @@ pub fn chip<D: DrawTarget<Color = Rgb565>>(
 /// chamfered (the orientation notch) plus three small contact stubs
 /// near the top. Distinct from the chip glyph so flash + SD read
 /// as different media.
-pub fn sd_card<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn sd_card<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     let fill = PrimitiveStyle::with_fill(color);
@@ -572,11 +572,11 @@ pub fn sd_card<D: DrawTarget<Color = Rgb565>>(
 /// Moon glyph: crescent shape drawn as a filled circle with a
 /// smaller offset circle cut out (in the display's background color,
 /// which is always `#000` on AMOLED). Used as the Night Mode icon.
-pub fn moon<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn moon<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let fill = PrimitiveStyle::with_fill(color);
-    let carve = PrimitiveStyle::with_fill(Rgb565::new(0, 0, 0));
+    let carve = PrimitiveStyle::with_fill(Color::new(0, 0, 0));
 
     // Base disc.
     Circle::with_center(Point::new(cx, cy), (radius * 2) as u32)
@@ -599,8 +599,8 @@ pub fn moon<D: DrawTarget<Color = Rgb565>>(
 /// Signal-strength glyph: 3 ascending vertical bars. Reads at ~10 px.
 /// `radius` is half the glyph's visible size (so a 10 px icon is
 /// radius = 5).
-pub fn signal_small<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn signal_small<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let fill = PrimitiveStyle::with_fill(color);
     let bar_w = 2i32;
@@ -620,8 +620,8 @@ pub fn signal_small<D: DrawTarget<Color = Rgb565>>(
 /// Bluetooth glyph: stylised "B" rune formed by a vertical spine
 /// and two pairs of diagonals creating the upper and lower lobes.
 /// Readable at ~10 px.
-pub fn bluetooth_small<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn bluetooth_small<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 1);
     let r = radius;
@@ -642,8 +642,8 @@ pub fn bluetooth_small<D: DrawTarget<Color = Rgb565>>(
 
 /// Lightning-bolt glyph: classic filled zigzag. Used as the flash /
 /// flashlight icon.
-pub fn bolt<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn bolt<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     // 3-segment zigzag from upper-right down through middle-left,
@@ -659,8 +659,8 @@ pub fn bolt<D: DrawTarget<Color = Rgb565>>(
 
 /// Lock glyph: padlock body (filled rect) with a shackle arc above
 /// drawn as three line segments approximating a half-circle.
-pub fn lock<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn lock<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     let fill = PrimitiveStyle::with_fill(color);
@@ -699,8 +699,8 @@ pub fn lock<D: DrawTarget<Color = Rgb565>>(
 /// upper-left to lower-right. Universal "no" symbol; works as
 /// shorthand at row-icon scale (~16 px) without needing a literal
 /// bell-with-slash composition.
-pub fn dnd<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn dnd<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     Circle::with_center(Point::new(cx, cy), (radius * 2) as u32)
@@ -713,8 +713,8 @@ pub fn dnd<D: DrawTarget<Color = Rgb565>>(
 
 /// Power glyph: outlined circle with the top arc broken, plus a
 /// short vertical line in the gap. IEC standby symbol.
-pub fn power<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn power<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     // Approximate the broken-top circle with a full circle - at
@@ -733,8 +733,8 @@ pub fn power<D: DrawTarget<Color = Rgb565>>(
 /// Zigbee glyph: hexagon outline. Six lines tracing a regular
 /// hexagon, the classic Zigbee branding shape and a clean way to
 /// signal "mesh network" at row-icon scale.
-pub fn zigbee<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, cx: i32, cy: i32, radius: i32, color: Rgb565,
+pub fn zigbee<D: BlendTarget>(
+    display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let stroke = PrimitiveStyle::with_stroke(color, 2);
     let half_w = radius * 7 / 8;

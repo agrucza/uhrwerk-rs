@@ -6,13 +6,13 @@
 //! each render.
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     prelude::Primitive,
     primitives::{Line, PrimitiveStyle, Rectangle},
     Drawable,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 
 use crate::ui::{fonts, theme};
 use crate::ui::widgets::containers::chamfered_panel;
@@ -28,7 +28,7 @@ pub const TOGGLE_H: i32 = 16;
 ///
 /// - Off: `INK_3` fill, `STEEL` border, `STEEL_2` pill flush-left.
 /// - On: `SIGNAL` fill and border, `BG` pill flush-right.
-pub fn toggle<D: DrawTarget<Color = Rgb565>>(
+pub fn toggle<D: BlendTarget>(
     display: &mut D,
     top_left: Point,
     on: bool,
@@ -92,7 +92,7 @@ const SLIDER_LABEL_OFFSET: i32 = 6;
 /// it relative to the bar" boilerplate at every call site. Pass
 /// `None` for a bare bar (e.g. when the surrounding panel already
 /// shows the value some other way).
-pub fn slider<D: DrawTarget<Color = Rgb565>>(
+pub fn slider<D: BlendTarget>(
     display: &mut D,
     rect: Rectangle,
     value: u8,
@@ -182,12 +182,12 @@ pub enum ButtonVariant {
 ///   black to expose the chamfer; label drawn in black so it reads
 ///   as printed on the colored body.
 /// `Ghost`: outline-only in steel, label in `theme::FG`.
-pub fn chamfered_button<D: DrawTarget<Color = Rgb565>>(
+pub fn chamfered_button<D: BlendTarget>(
     display: &mut D,
     rect: Rectangle,
     label: &str,
     variant: ButtonVariant,
-    accent: Rgb565,
+    accent: Color,
 ) {
     let notch = BUTTON_NOTCH;
     match variant {

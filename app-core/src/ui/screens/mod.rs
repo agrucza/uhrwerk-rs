@@ -7,7 +7,7 @@ pub mod settings;
 pub mod stopwatch;
 pub mod timer;
 
-use embedded_graphics::{draw_target::DrawTarget, pixelcolor::Rgb565};
+use crate::ui::types::BlendTarget;
 
 use crate::events::SystemEvent;
 use super::types::{Action, DirtyRegion, RenderCtx, Screen, ScreenId, SystemData};
@@ -73,7 +73,7 @@ impl ActiveScreen {
         Self::AppDrawer(app_drawer::AppDrawerScreen::new(previous))
     }
 
-    pub fn render<D: DrawTarget<Color = Rgb565>>(
+    pub fn render<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,

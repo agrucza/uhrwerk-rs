@@ -11,11 +11,11 @@
 //! arguments themselves.
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::Point,
-    pixelcolor::Rgb565,
     primitives::Rectangle,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 use u8g2_fonts::{fonts as raw, FontRenderer};
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 
@@ -58,12 +58,12 @@ pub fn hero()     -> FontRenderer { FontRenderer::new::<Hero>() }
 
 /// Draw text horizontally centered around `cx`, with the top of the
 /// glyphs at `top_y`.
-pub fn draw_centered<D: DrawTarget<Color = Rgb565>>(
+pub fn draw_centered<D: BlendTarget>(
     display: &mut D,
     font: &FontRenderer,
     text: &str,
     cx: i32, top_y: i32,
-    color: Rgb565,
+    color: Color,
 ) {
     let _ = font.render_aligned(
         text,
@@ -82,12 +82,12 @@ pub fn draw_centered<D: DrawTarget<Color = Rgb565>>(
 /// (ascent + descent), which leaves text without descenders sitting
 /// visually too high.
 #[allow(dead_code)]
-pub fn draw_centered_xy<D: DrawTarget<Color = Rgb565>>(
+pub fn draw_centered_xy<D: BlendTarget>(
     display: &mut D,
     font: &FontRenderer,
     text: &str,
     cx: i32, cy: i32,
-    color: Rgb565,
+    color: Color,
 ) {
     let _ = font.render_aligned(
         text,
@@ -107,12 +107,12 @@ pub fn draw_centered_xy<D: DrawTarget<Color = Rgb565>>(
 /// Implementation: measure the text at (0,0) top-aligned, then offset
 /// the render position so the returned bbox lands at the rect's
 /// center.
-pub fn draw_centered_in_rect<D: DrawTarget<Color = Rgb565>>(
+pub fn draw_centered_in_rect<D: BlendTarget>(
     display: &mut D,
     font: &FontRenderer,
     text: &str,
     rect: Rectangle,
-    color: Rgb565,
+    color: Color,
 ) {
     // 1. Measure the rendered glyph bounding box at origin, top-aligned.
     let dims = match font.get_rendered_dimensions(
@@ -152,12 +152,12 @@ pub fn draw_centered_in_rect<D: DrawTarget<Color = Rgb565>>(
 
 /// Draw text top-left aligned at `(x, y)`.
 #[allow(dead_code)]
-pub fn draw_at<D: DrawTarget<Color = Rgb565>>(
+pub fn draw_at<D: BlendTarget>(
     display: &mut D,
     font: &FontRenderer,
     text: &str,
     x: i32, y: i32,
-    color: Rgb565,
+    color: Color,
 ) {
     let _ = font.render_aligned(
         text,
@@ -170,12 +170,12 @@ pub fn draw_at<D: DrawTarget<Color = Rgb565>>(
 }
 
 /// Draw text right-aligned: glyphs end at `right_x`, top at `y`.
-pub fn draw_right<D: DrawTarget<Color = Rgb565>>(
+pub fn draw_right<D: BlendTarget>(
     display: &mut D,
     font: &FontRenderer,
     text: &str,
     right_x: i32, y: i32,
-    color: Rgb565,
+    color: Color,
 ) {
     let _ = font.render_aligned(
         text,

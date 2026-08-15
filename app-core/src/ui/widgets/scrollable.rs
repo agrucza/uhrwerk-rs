@@ -3,7 +3,7 @@
 //! Anything that wants smooth-scroll behaviour (settings index,
 //! alarm list, future event-log viewer, ...) goes through this
 //! module rather than wiring up a `ScrollState` plus an ad-hoc
-//! `display.clipped(...)` plus a manual `scrollbar_v` call. Two
+//! `BlendClipped` plus a manual `scrollbar_v` call. Two
 //! entry points:
 //!
 //! * [`render_scrolled`] - draws the scrollable body inside a
@@ -19,11 +19,9 @@
 //! that put a viewport into a y-band that intrudes on the bezel arc
 //! accept the same minor edge clipping for the scrollbar.
 
-use embedded_graphics::{
-    draw_target::{Clipped, DrawTarget, DrawTargetExt},
-    pixelcolor::Rgb565,
-    primitives::Rectangle,
-};
+use embedded_graphics::primitives::Rectangle;
+use crate::ui::types::{BlendClipped, BlendTarget};
+use crate::ui::theme::Color;
 
 use crate::events::SystemEvent;
 use crate::ui::types::RenderCtx;
@@ -63,16 +61,16 @@ pub fn render_scrolled<D, F>(
     scroll: i32,
     viewport: Rectangle,
     content_h: i32,
-    accent: Rgb565,
+    accent: Color,
     ctx: &RenderCtx,
     body: F,
 )
 where
-    D: DrawTarget<Color = Rgb565>,
-    F: FnOnce(&mut Clipped<'_, D>, i32),
+    D: BlendTarget,
+    F: FnOnce(&mut BlendClipped<'_, D>, i32),
 {
     {
-        let mut clipped = display.clipped(&viewport);
+        let mut clipped = BlendClipped::new(display, &viewport);
         body(&mut clipped, scroll);
     }
     let bar_x = viewport.top_left.x

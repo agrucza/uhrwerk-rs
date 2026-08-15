@@ -16,13 +16,13 @@
 //! better than a flat row list.
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     prelude::Primitive,
     primitives::{Line, PrimitiveStyle, Rectangle, StyledDrawable},
     Drawable,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 use heapless::String;
 use core::fmt::Write;
 
@@ -87,11 +87,11 @@ fn hdr_rect() -> Rectangle {
 /// Draw the full Settings chrome: top status bar (tinted by `accent`,
 /// carrying live HH:MM + battery% from `data`), Nightwatch header
 /// with `title` + `SYS.CFG` telemetry, and bottom home-indicator bar.
-fn draw_header<D: DrawTarget<Color = Rgb565>>(
+fn draw_header<D: BlendTarget>(
     display: &mut D,
     data: &SystemData,
     title: &str,
-    accent: Rgb565,
+    accent: Color,
     ctx: &RenderCtx,
 ) {
     // The three chrome pieces sit at fixed y-positions: status bar at
@@ -220,8 +220,8 @@ enum RowIcon {
     Gps,
 }
 
-fn draw_row_icon<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, kind: RowIcon, cx: i32, cy: i32, color: Rgb565,
+fn draw_row_icon<D: BlendTarget>(
+    display: &mut D, kind: RowIcon, cx: i32, cy: i32, color: Color,
 ) {
     let r = 8;
     match kind {
@@ -617,7 +617,7 @@ impl SettingsScreen {
 // -- Screen impl -------------------------------------------------------------
 
 impl Screen for SettingsScreen {
-    fn render<D: DrawTarget<Color = Rgb565>>(
+    fn render<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -680,7 +680,7 @@ impl Screen for SettingsScreen {
 // -- Index sub-view ----------------------------------------------------------
 
 impl SettingsScreen {
-    fn render_index<D: DrawTarget<Color = Rgb565>>(
+    fn render_index<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
     ) {
         draw_header(display, data, "SETTINGS", theme::SIGNAL, ctx);
@@ -752,7 +752,7 @@ fn index_content_h(data: &SystemData) -> i32 {
 /// rows show an inline value (or a chevron when the value is empty);
 /// toggle rows show a Nightwatch toggle. `scroll` shifts each row's
 /// y by `-scroll` so the caller can render into a clipped viewport.
-fn render_rows<D: DrawTarget<Color = Rgb565>>(
+fn render_rows<D: BlendTarget>(
     display: &mut D, data: &SystemData, rows: &[IndexRow], scroll: i32, ctx: &RenderCtx,
 ) {
     let mut pos = 0;
@@ -858,7 +858,7 @@ fn clock_panel_rect(slot: usize) -> Rectangle {
     )
 }
 
-fn draw_clock_panel<D: DrawTarget<Color = Rgb565>>(
+fn draw_clock_panel<D: BlendTarget>(
     display: &mut D,
     rect: Rectangle,
     tag: &str,
@@ -881,7 +881,7 @@ fn draw_clock_panel<D: DrawTarget<Color = Rgb565>>(
 }
 
 impl SettingsScreen {
-    fn render_clock<D: DrawTarget<Color = Rgb565>>(
+    fn render_clock<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
     ) {
         draw_header(display, data, "CLOCK", theme::SIGNAL, ctx);
@@ -953,7 +953,7 @@ fn wifi_panel_rect() -> Rectangle {
 }
 
 impl SettingsScreen {
-    fn render_wifi<D: DrawTarget<Color = Rgb565>>(
+    fn render_wifi<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
     ) {
         draw_header(display, data, "WIFI", theme::SIGNAL, ctx);
@@ -1026,7 +1026,7 @@ impl SettingsScreen {
         }
     }
 
-    fn render_wifi_passphrase<D: DrawTarget<Color = Rgb565>>(
+    fn render_wifi_passphrase<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
     ) {
         draw_header(display, data, "PASSPHRASE", theme::SIGNAL, ctx);
@@ -1065,7 +1065,7 @@ impl SettingsScreen {
 // -- Time entry picker -------------------------------------------------------
 
 impl SettingsScreen {
-    fn render_time_entry<D: DrawTarget<Color = Rgb565>>(
+    fn render_time_entry<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
     ) {
         draw_header(display, data, "SET TIME", theme::SIGNAL, ctx);
@@ -1127,7 +1127,7 @@ impl SettingsScreen {
 // -- Date entry picker -------------------------------------------------------
 
 impl SettingsScreen {
-    fn render_date_entry<D: DrawTarget<Color = Rgb565>>(
+    fn render_date_entry<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
     ) {
         draw_header(display, data, "SET DATE", theme::SIGNAL, ctx);
@@ -1331,7 +1331,7 @@ fn motion_value(idx: usize, data: &SystemData, buf: &mut heapless::String<12>) {
     };
 }
 
-fn draw_motion_panel<D: DrawTarget<Color = Rgb565>>(
+fn draw_motion_panel<D: BlendTarget>(
     display: &mut D, rect: Rectangle, tag: &str, value: &str,
 ) {
     chamfered_panel(display, rect, NOTCH, theme::CYAN, 1);
@@ -1348,7 +1348,7 @@ fn draw_motion_panel<D: DrawTarget<Color = Rgb565>>(
 }
 
 impl SettingsScreen {
-    fn render_imu<D: DrawTarget<Color = Rgb565>>(
+    fn render_imu<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -1479,7 +1479,7 @@ impl SettingsScreen {
 
     // -- Battery sub-view ----------------------------------------------------
 
-    fn render_battery<D: DrawTarget<Color = Rgb565>>(
+    fn render_battery<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -1647,7 +1647,7 @@ impl SettingsScreen {
 impl SettingsScreen {
     // -- Storage sub-index ---------------------------------------------------
 
-    fn render_storage_index<D: DrawTarget<Color = Rgb565>>(
+    fn render_storage_index<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -1691,7 +1691,7 @@ impl SettingsScreen {
 
     // -- Flash leaf (read-only info) -----------------------------------------
 
-    fn render_storage_flash<D: DrawTarget<Color = Rgb565>>(
+    fn render_storage_flash<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -1762,7 +1762,7 @@ impl SettingsScreen {
 
     // -- SD card leaf (status + tap to probe) --------------------------------
 
-    fn render_storage_sd<D: DrawTarget<Color = Rgb565>>(
+    fn render_storage_sd<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -1831,7 +1831,7 @@ impl SettingsScreen {
 
     // -- Restore-from-SD leaf (destructive, gated on SD online) --------------
 
-    fn render_storage_restore<D: DrawTarget<Color = Rgb565>>(
+    fn render_storage_restore<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -1921,7 +1921,7 @@ impl SettingsScreen {
 
     // -- Factory reset leaf (destructive) ------------------------------------
 
-    fn render_storage_factory_reset<D: DrawTarget<Color = Rgb565>>(
+    fn render_storage_factory_reset<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -1994,7 +1994,7 @@ impl SettingsScreen {
 
     // -- Display sub-view ----------------------------------------------------
 
-    fn render_display<D: DrawTarget<Color = Rgb565>>(
+    fn render_display<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -2141,7 +2141,7 @@ impl SettingsScreen {
     // panel saying "WIP" with the view's title; back chevron and
     // right-swipe both pop to the index.
 
-    fn render_stub<D: DrawTarget<Color = Rgb565>>(
+    fn render_stub<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -2174,7 +2174,7 @@ impl SettingsScreen {
     /// "parrot" test, which replays ~1.0 s mic snippets through the
     /// speaker. Together they prove the ES7210 RX and ES8311 TX paths
     /// on hardware before any networking is involved.
-    fn render_mic_test<D: DrawTarget<Color = Rgb565>>(
+    fn render_mic_test<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -2285,7 +2285,7 @@ impl SettingsScreen {
         }
     }
 
-    fn render_gps<D: DrawTarget<Color = Rgb565>>(
+    fn render_gps<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -2515,11 +2515,11 @@ fn picker_cell_rects() -> [Rectangle; 3] {
 /// Draw a single-character separator (`":"` for time, `"."` for date)
 /// between adjacent picker columns, sitting on the wheels' selection
 /// band centerline.
-fn draw_picker_separators<D: DrawTarget<Color = Rgb565>>(
+fn draw_picker_separators<D: BlendTarget>(
     display: &mut D,
     cells: &[Rectangle; 3],
     sep: &str,
-    accent: Rgb565,
+    accent: Color,
 ) {
     let band_cy = cells[0].top_left.y + cells[0].size.height as i32 / 2;
     for i in 0..2 {
@@ -2567,7 +2567,7 @@ fn rect_hit(rect: Rectangle, x: u16, y: u16) -> bool {
 fn format_result(
     result: &SelfTestResult,
     unit: &'static str,
-) -> (String<32>, Rgb565, Option<Rgb565>) {
+) -> (String<32>, Color, Option<Color>) {
     let mut buf: String<32> = String::new();
     match result {
         SelfTestResult::NotRun => {
@@ -2795,7 +2795,7 @@ fn brightness_pct(data: &SystemData) -> u8 {
 /// given IMU test result. Visualises run state at a glance:
 /// steel = inactive, signal = running, green = pass, danger =
 /// fail/error.
-fn imu_result_accent(result: &SelfTestResult) -> Rgb565 {
+fn imu_result_accent(result: &SelfTestResult) -> Color {
     match result {
         SelfTestResult::NotRun => theme::STEEL,
         SelfTestResult::Running => theme::SIGNAL,
@@ -2814,7 +2814,7 @@ fn imu_result_accent(result: &SelfTestResult) -> Rgb565 {
 /// `rect` is the full sparkline area (no surrounding card); the
 /// polyline insets by a small horizontal margin so endpoints don't
 /// land at the screen edge but is otherwise full width.
-fn draw_battery_sparkline<D: DrawTarget<Color = Rgb565>>(
+fn draw_battery_sparkline<D: BlendTarget>(
     display: &mut D,
     rect: Rectangle,
     history: &crate::data::BatteryHistory,

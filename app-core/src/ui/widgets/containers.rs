@@ -17,13 +17,13 @@
 //! code place content into the same rect after the container is drawn.
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     prelude::Primitive,
     primitives::{Line, PrimitiveStyle, Rectangle},
     Drawable,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 
 use crate::ui::{fonts, theme};
 
@@ -54,11 +54,11 @@ pub const TAG_LABEL_H: i32 = 15;
 ///    └────────────────┘
 ///                notch
 /// ```
-pub fn chamfered_panel<D: DrawTarget<Color = Rgb565>>(
+pub fn chamfered_panel<D: BlendTarget>(
     display: &mut D,
     rect: Rectangle,
     notch: i32,
-    color: Rgb565,
+    color: Color,
     stroke_width: u32,
 ) {
     let x = rect.top_left.x;
@@ -98,11 +98,11 @@ pub fn chamfered_panel<D: DrawTarget<Color = Rgb565>>(
 ///
 /// Text is always drawn in black so it reads as printed on the
 /// colored ribbon.
-pub fn tag_label<D: DrawTarget<Color = Rgb565>>(
+pub fn tag_label<D: BlendTarget>(
     display: &mut D,
     left_x: i32, top_y: i32,
     text: &str,
-    color: Rgb565,
+    color: Color,
     tl_notch: i32,
 ) {
     let font = fonts::caption();
@@ -158,15 +158,15 @@ pub fn tag_label<D: DrawTarget<Color = Rgb565>>(
 pub fn tile<D, F>(
     display: &mut D,
     rect: Rectangle,
-    border: Rgb565,
+    border: Color,
     stroke_width: u32,
     icon: F,
-    icon_color: Rgb565,
+    icon_color: Color,
     caption: &str,
 )
 where
-    D: DrawTarget<Color = Rgb565>,
-    F: FnOnce(&mut D, i32, i32, Rgb565),
+    D: BlendTarget,
+    F: FnOnce(&mut D, i32, i32, Color),
 {
     chamfered_panel(display, rect, NOTCH, border, stroke_width);
 
@@ -211,11 +211,11 @@ pub fn info_tile<D, F>(
     icon: F,
     value: &str,
     suffix: &str,
-    accent: Rgb565,
+    accent: Color,
 )
 where
-    D: DrawTarget<Color = Rgb565>,
-    F: FnOnce(&mut D, i32, i32, i32, Rgb565),
+    D: BlendTarget,
+    F: FnOnce(&mut D, i32, i32, i32, Color),
 {
     chamfered_panel(display, rect, INFO_TILE_NOTCH, accent, 1);
 

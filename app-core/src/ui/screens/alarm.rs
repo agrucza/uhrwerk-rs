@@ -29,11 +29,11 @@
 use core::fmt::Write;
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     primitives::Rectangle,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 
 use crate::events::SystemEvent;
 use crate::ui::{fonts, layout, theme};
@@ -52,7 +52,7 @@ use crate::ui::widgets::{
 
 /// Per-screen accent. Yellow = wake/warn; mirrors the spec's
 /// ALERTS-app tile border choice.
-const ACCENT: Rgb565 = theme::YELLOW;
+const ACCENT: Color = theme::YELLOW;
 
 /// Static system-code prefix shown in the header's right-telemetry
 /// slot during Edit (with the entry index).
@@ -161,7 +161,7 @@ impl AlarmScreen {
 }
 
 impl Screen for AlarmScreen {
-    fn render<D: DrawTarget<Color = Rgb565>>(
+    fn render<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -188,7 +188,7 @@ impl Screen for AlarmScreen {
 // -- List view ---------------------------------------------------------------
 
 impl AlarmScreen {
-    fn render_list<D: DrawTarget<Color = Rgb565>>(
+    fn render_list<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, ctx: &RenderCtx,
     ) {
         let active_count = data.config.alarms.entries.iter().filter(|e| e.enabled).count();
@@ -215,7 +215,7 @@ impl AlarmScreen {
         );
     }
 
-    fn render_row<D: DrawTarget<Color = Rgb565>>(
+    fn render_row<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, entry_idx: usize, scroll: i32,
     ) {
         let entry = &data.config.alarms.entries[entry_idx];
@@ -351,7 +351,7 @@ impl AlarmScreen {
 // -- Edit view ---------------------------------------------------------------
 
 impl AlarmScreen {
-    fn render_edit<D: DrawTarget<Color = Rgb565>>(
+    fn render_edit<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, index: usize,
     ) {
         let mut tele_buf: heapless::String<8> = heapless::String::new();
@@ -469,7 +469,7 @@ fn day_chip_rects() -> [Rectangle; 7] {
 
 /// Draw one day chip - chamfered border + matching label colour.
 /// Active chips wear the accent; inactive chips read as steel.
-fn day_chip<D: DrawTarget<Color = Rgb565>>(
+fn day_chip<D: BlendTarget>(
     display: &mut D, rect: Rectangle, label: &str, active: bool,
 ) {
     let color = if active { ACCENT } else { theme::STEEL_2 };

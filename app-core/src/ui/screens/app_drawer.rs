@@ -17,13 +17,13 @@
 //! so the grid geometry stays complete even with fewer than 9 apps.
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     prelude::Primitive,
     primitives::{PrimitiveStyle, Rectangle},
     Drawable,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 use heapless::String;
 use core::fmt::Write;
 
@@ -36,7 +36,7 @@ use crate::ui::widgets::{home_indicator, status_bar, tile, STATUS_BAR_H};
 //
 // Tile icons are held as an `IconKind` enum rather than a generic
 // function pointer because the glyph functions are generic over
-// `DrawTarget` and `DrawTarget` isn't object-safe (generic methods).
+// `BlendTarget` and `BlendTarget` isn't object-safe (generic methods).
 // The enum lets a const tile table exist while still dispatching to
 // the right concrete glyph in `render`.
 
@@ -52,12 +52,12 @@ enum IconKind {
     Empty,
 }
 
-fn draw_icon<D: DrawTarget<Color = Rgb565>>(
+fn draw_icon<D: BlendTarget>(
     display: &mut D,
     kind: IconKind,
     cx: i32, cy: i32,
     radius: i32,
-    color: Rgb565,
+    color: Color,
 ) {
     match kind {
         IconKind::Clock     => glyphs::clock(display, cx, cy, radius, color),
@@ -85,7 +85,7 @@ fn draw_icon<D: DrawTarget<Color = Rgb565>>(
 struct TileDef {
     target: Option<ScreenId>,
     caption: &'static str,
-    border: Rgb565,
+    border: Color,
     icon: IconKind,
 }
 
@@ -155,7 +155,7 @@ impl AppDrawerScreen {
 }
 
 impl Screen for AppDrawerScreen {
-    fn render<D: DrawTarget<Color = Rgb565>>(
+    fn render<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,

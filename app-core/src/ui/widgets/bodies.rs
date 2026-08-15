@@ -6,13 +6,13 @@
 //! use them standalone on a bare rect.
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::Point,
-    pixelcolor::Rgb565,
     prelude::Primitive,
     primitives::{Line, PrimitiveStyle, Rectangle},
     Drawable,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 
 use crate::ui::{fonts, theme};
 
@@ -33,11 +33,11 @@ pub const ROW_ICON_COL_W: i32 = 40;
 /// callers pick a variant and the renderer picks the draw code.
 pub enum RowControl<'a> {
     /// Right-pointing chevron. Signals "tap to navigate".
-    Chevron(Rgb565),
+    Chevron(Color),
     /// Toggle switch (on/off state).
     Toggle(bool),
     /// Short inline text (e.g. `STABLE`, `14/32K`).
-    Inline(&'a str, Rgb565),
+    Inline(&'a str, Color),
 }
 
 /// Draw one settings-style row inside `rect`.
@@ -51,13 +51,13 @@ pub fn row<D, F>(
     display: &mut D,
     rect: Rectangle,
     icon: F,
-    icon_color: Rgb565,
+    icon_color: Color,
     label: &str,
     control: RowControl,
 )
 where
-    D: DrawTarget<Color = Rgb565>,
-    F: FnOnce(&mut D, i32, i32, Rgb565),
+    D: BlendTarget,
+    F: FnOnce(&mut D, i32, i32, Color),
 {
     let x = rect.top_left.x;
     let y = rect.top_left.y;

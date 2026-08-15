@@ -13,13 +13,13 @@
 //!   used by every full-app screen.
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     prelude::Primitive,
     primitives::{Line, PrimitiveStyle, Rectangle},
     Drawable,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 
 use crate::ui::{fonts, glyphs, theme};
 use crate::ui::types::SystemData;
@@ -56,12 +56,12 @@ pub const HOME_INDICATOR_H: i32 = 2;
 /// ```
 /// The hairline sits on the bottom pixel of the rect so a screen can
 /// line content up directly below.
-pub fn header<D: DrawTarget<Color = Rgb565>>(
+pub fn header<D: BlendTarget>(
     display: &mut D,
     rect: Rectangle,
     title: &str,
     right_text: &str,
-    accent: Rgb565,
+    accent: Color,
 ) {
     let x = rect.top_left.x;
     let y = rect.top_left.y;
@@ -137,12 +137,12 @@ pub fn header_icon_hit(x: u16, y: u16, header_rect: Rectangle) -> bool {
 /// as separated from screen content below. `x_inset` pulls the
 /// left/right content away from the bezel arc; the bar itself spans
 /// full screen width so the hairline reaches edge to edge.
-pub fn status_bar<D: DrawTarget<Color = Rgb565>>(
+pub fn status_bar<D: BlendTarget>(
     display: &mut D,
     y: i32,
     time_text: &str,
     battery_pct: Option<u8>,
-    tint: Rgb565,
+    tint: Color,
     x_inset: i32,
 ) {
     use core::fmt::Write;
@@ -192,10 +192,10 @@ pub fn status_bar<D: DrawTarget<Color = Rgb565>>(
 /// Draw the bottom home-indicator bar - a short, thin signal-colored
 /// line centered horizontally at `y`. Every full-screen app / overlay
 /// uses this as a passive "base of the screen" marker.
-pub fn home_indicator<D: DrawTarget<Color = Rgb565>>(
+pub fn home_indicator<D: BlendTarget>(
     display: &mut D,
     y: i32,
-    tint: Rgb565,
+    tint: Color,
 ) {
     let cx = theme::SCREEN_W as i32 / 2;
     Rectangle::new(
@@ -251,12 +251,12 @@ pub const fn app_header_rect() -> Rectangle {
 /// The home indicator is *always* signal-red regardless of the
 /// per-screen `accent`, matching the design spec's rule that it's a
 /// system-level "base of the screen" marker, not a per-app element.
-pub fn draw_app_chrome<D: DrawTarget<Color = Rgb565>>(
+pub fn draw_app_chrome<D: BlendTarget>(
     display: &mut D,
     data: &SystemData,
     title: &str,
     telemetry: &str,
-    accent: Rgb565,
+    accent: Color,
 ) {
     use core::fmt::Write;
     let mut time_buf: heapless::String<8> = heapless::String::new();

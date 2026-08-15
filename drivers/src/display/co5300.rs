@@ -39,6 +39,7 @@ use embedded_graphics_core::{
     Pixel,
 };
 
+use super::blend::{self, BlendTarget};
 use super::qspi::QspiWrite;
 
 /// Display resolution (panel H0198S005AMT005_V0_195).
@@ -448,6 +449,98 @@ impl<'fb, B, RST> CO5300<'fb, B, RST> {
             let idx = (y_local as usize * WIDTH as usize + x as usize) * 2;
             self.framebuffer[idx]     = (color >> 8) as u8;
             self.framebuffer[idx + 1] = (color & 0xFF) as u8;
+        }
+    }
+
+    /// Clip a panel-absolute rectangle against the FB window. Returns
+    /// `(cx0, cx1, cy0, cy1)` in *panel* coordinates, or `None` when
+    /// the rect misses the FB entirely. Shared by the blend fills.
+    fn clip_rect(&self, x: i32, y: i32, w: i32, h: i32) -> Option<(i32, i32, i32, i32)> {
+        let ty = self.tile_y as i32;
+        let cx0 = x.max(0);
+        let cx1 = (x + w).min(WIDTH as i32);
+        let cy0 = y.max(ty);
+        let cy1 = (y + h).min(ty + self.fb_rows as i32);
+        if cx0 >= cx1 || cy0 >= cy1 { None } else { Some((cx0, cx1, cy0, cy1)) }
+    }
+
+    /// Read the packed RGB565 value at FB byte offset `idx`.
+    fn fb_read(&self, idx: usize) -> u16 {
+        ((self.framebuffer[idx] as u16) << 8) | self.framebuffer[idx + 1] as u16
+    }
+
+    /// Write a packed RGB565 value at FB byte offset `idx`.
+    fn fb_write(&mut self, idx: usize, px: u16) {
+        self.framebuffer[idx]     = (px >> 8) as u8;
+        self.framebuffer[idx + 1] = (px & 0xFF) as u8;
+    }
+}
+
+// ---- BlendTarget (read-modify-write drawing) --------------------------------
+
+impl<'fb, B, RST> BlendTarget for CO5300<'fb, B, RST> {
+    fn blend_pixel(&mut self, x: i32, y: i32, color: Rgb565, alpha: u8) {
+        if alpha == 0 { return; }
+        let y_local = y - self.tile_y as i32;
+        if x < 0 || x >= WIDTH as i32 || y_local < 0 || y_local >= self.fb_rows as i32 {
+            return;
+        }
+        let src = blend::pack565(color);
+        let idx = (y_local as usize * WIDTH as usize + x as usize) * 2;
+        let px = if alpha == 255 { src } else { blend::blend565(self.fb_read(idx), src, alpha) };
+        self.fb_write(idx, px);
+    }
+
+    fn fill_vgradient(&mut self, x: i32, y: i32, w: i32, h: i32, top: Rgb565, bottom: Rgb565) {
+        let Some((cx0, cx1, cy0, cy1)) = self.clip_rect(x, y, w, h) else { return };
+        let (tr, tg, tb) = blend::expand565(blend::pack565(top));
+        let (br, bg, bb) = blend::expand565(blend::pack565(bottom));
+        let den = (h - 1).max(1) as u32;
+        let ty = self.tile_y as i32;
+        for py in cy0..cy1 {
+            // Ramp position from the *panel-absolute* rect top, so the
+            // gradient is seamless across tile boundaries.
+            let num = (py - y) as u32;
+            let r8 = blend::lerp8(tr, br, num, den);
+            let g8 = blend::lerp8(tg, bg, num, den);
+            let b8 = blend::lerp8(tb, bb, num, den);
+            // Bayer thresholds repeat every 4 columns: precompute this
+            // row's 4 candidate pixels, then tile them across the span.
+            let brow = &blend::BAYER4[(py & 3) as usize];
+            let pats: [u16; 4] = core::array::from_fn(|i| {
+                blend::dither565(r8, g8, b8, brow[i])
+            });
+            let row_base = (py - ty) as usize * WIDTH as usize;
+            for px in cx0..cx1 {
+                let p = pats[(px & 3) as usize];
+                self.fb_write((row_base + px as usize) * 2, p);
+            }
+        }
+    }
+
+    fn fill_blend(&mut self, x: i32, y: i32, w: i32, h: i32, color: Rgb565, alpha: u8) {
+        if alpha == 0 { return; }
+        if alpha == 255 {
+            // Opaque degenerates to the plain fill (row-memcpy fast path).
+            if let Some((cx0, cx1, cy0, cy1)) = self.clip_rect(x, y, w, h) {
+                self.fill_solid(
+                    cx0 as u16, cy0 as u16,
+                    (cx1 - cx0) as u16, (cy1 - cy0) as u16,
+                    blend::pack565(color),
+                );
+            }
+            return;
+        }
+        let Some((cx0, cx1, cy0, cy1)) = self.clip_rect(x, y, w, h) else { return };
+        let src = blend::pack565(color);
+        let ty = self.tile_y as i32;
+        for py in cy0..cy1 {
+            let row_base = (py - ty) as usize * WIDTH as usize;
+            for px in cx0..cx1 {
+                let idx = (row_base + px as usize) * 2;
+                let blended = blend::blend565(self.fb_read(idx), src, alpha);
+                self.fb_write(idx, blended);
+            }
         }
     }
 }

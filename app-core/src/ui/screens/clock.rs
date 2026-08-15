@@ -32,13 +32,12 @@
 //! zeros on numerals, no em-dashes.
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     prelude::Primitive,
     primitives::{PrimitiveStyle, Rectangle},
     Drawable,
 };
+use crate::ui::types::BlendTarget;
 use heapless::String;
 use core::fmt::Write;
 use u8g2_fonts::FontRenderer;
@@ -164,7 +163,7 @@ impl ClockScreen {
 }
 
 impl Screen for ClockScreen {
-    fn render<D: DrawTarget<Color = Rgb565>>(
+    fn render<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -278,7 +277,7 @@ fn rect_hit(rect: Rectangle, x: u16, y: u16) -> bool {
 
 // -- Draw helpers -----------------------------------------------------------
 
-fn draw_swipe_hint<D: DrawTarget<Color = Rgb565>>(display: &mut D) {
+fn draw_swipe_hint<D: BlendTarget>(display: &mut D) {
     // 2px bar, 36px wide, centered horizontally. Cyan at 55% opacity
     // in the spec - we render at full saturation because embedded-
     // graphics has no blending and a dimmer cyan would just look
@@ -293,7 +292,7 @@ fn draw_swipe_hint<D: DrawTarget<Color = Rgb565>>(display: &mut D) {
     .draw(display).ok();
 }
 
-fn draw_telemetry_strip<D: DrawTarget<Color = Rgb565>>(
+fn draw_telemetry_strip<D: BlendTarget>(
     display: &mut D, data: &SystemData,
 ) {
     let font = fonts::caption();
@@ -327,7 +326,7 @@ fn draw_telemetry_strip<D: DrawTarget<Color = Rgb565>>(
     );
 }
 
-fn draw_hero_numerals<D: DrawTarget<Color = Rgb565>>(
+fn draw_hero_numerals<D: BlendTarget>(
     display: &mut D, data: &SystemData,
 ) {
     let mega: FontRenderer = FontRenderer::new::<fonts::Mega>();
@@ -342,7 +341,7 @@ fn draw_hero_numerals<D: DrawTarget<Color = Rgb565>>(
     fonts::draw_centered(display, &mega, mm.as_str(), cx, HERO_MM_TOP, theme::BONE);
 }
 
-fn draw_meta_row<D: DrawTarget<Color = Rgb565>>(
+fn draw_meta_row<D: BlendTarget>(
     display: &mut D, data: &SystemData,
 ) {
     let font = fonts::caption();
@@ -384,7 +383,7 @@ fn draw_meta_row<D: DrawTarget<Color = Rgb565>>(
 /// Last-fix coordinates on their own line below the meta row - only
 /// on boards where steps occupy the meta row's right-hand slot AND
 /// a GPS exists. Chrome like the meta readout it descends from.
-fn draw_gps_row<D: DrawTarget<Color = Rgb565>>(
+fn draw_gps_row<D: BlendTarget>(
     display: &mut D, data: &SystemData,
 ) {
     if !(data.capabilities.steps && data.capabilities.gps) {
@@ -425,7 +424,7 @@ fn write_coord(buf: &mut String<32>, label: &str, v_e7: i32) {
     );
 }
 
-fn draw_bottom_tiles<D: DrawTarget<Color = Rgb565>>(
+fn draw_bottom_tiles<D: BlendTarget>(
     display: &mut D, data: &SystemData,
 ) {
     let [left, right] = layout::bottom_tile_row::<2>();

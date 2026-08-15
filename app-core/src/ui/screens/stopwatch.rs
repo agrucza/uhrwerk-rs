@@ -34,11 +34,11 @@ use core::fmt::Write;
 
 use embassy_time::{Duration, Instant};
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     primitives::Rectangle,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 
 use crate::events::SystemEvent;
 use crate::ui::{fonts, layout, theme};
@@ -52,7 +52,7 @@ use crate::ui::widgets::{
 
 /// Per-screen accent. Stopwatch reads as "running / live / active",
 /// which lines up with the spec's RUN/CALL green semantics.
-const ACCENT: Rgb565 = theme::GREEN;
+const ACCENT: Color = theme::GREEN;
 
 /// Static system-code shown in the header's right-telemetry slot.
 const TELEMETRY: &str = "STW.0001";
@@ -143,7 +143,7 @@ impl StopwatchScreen {
 }
 
 impl Screen for StopwatchScreen {
-    fn render<D: DrawTarget<Color = Rgb565>>(
+    fn render<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,

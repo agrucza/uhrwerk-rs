@@ -26,8 +26,10 @@
 //! ```
 
 use embedded_graphics::{
-    draw_target::DrawTarget, geometry::Point, pixelcolor::Rgb565, primitives::Rectangle,
+    geometry::Point, primitives::Rectangle,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 
 use crate::events::SystemEvent;
 use crate::ui::layout;
@@ -157,9 +159,9 @@ pub fn action_row_rects() -> (Rectangle, Rectangle) {
 /// picker view. Cancel is always `Ghost`; Set takes the screen's
 /// `accent`. Returns the rects so the event handler can hit-test
 /// against the same slots without recomputing them.
-pub fn render_action_row<D: DrawTarget<Color = Rgb565>>(
+pub fn render_action_row<D: BlendTarget>(
     display: &mut D,
-    accent: Rgb565,
+    accent: Color,
 ) -> (Rectangle, Rectangle) {
     let (cancel, set) = action_row_rects();
     chamfered_button(display, cancel, "CANCEL", ButtonVariant::Ghost, accent);

@@ -19,13 +19,12 @@
 //! disabled-button rule: visual state and hit-test always agree).
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     prelude::Primitive,
     primitives::{PrimitiveStyle, Rectangle},
     Drawable,
 };
+use crate::ui::types::BlendTarget;
 use heapless::String;
 
 use crate::events::SystemEvent;
@@ -287,7 +286,7 @@ impl Keyboard {
 
     // -- render --------------------------------------------------------------
 
-    pub fn render<D: DrawTarget<Color = Rgb565>>(&self, display: &mut D) {
+    pub fn render<D: BlendTarget>(&self, display: &mut D) {
         self.render_field(display);
 
         let rows = layer_rows(self.layer);
@@ -331,7 +330,7 @@ impl Keyboard {
         draw_key(display, done_rect(), "DONE", done_style);
     }
 
-    fn render_field<D: DrawTarget<Color = Rgb565>>(&self, display: &mut D) {
+    fn render_field<D: BlendTarget>(&self, display: &mut D) {
         let rect = field_rect();
         Rectangle::new(rect.top_left, rect.size)
             .into_styled(PrimitiveStyle::with_fill(theme::BG))
@@ -408,7 +407,7 @@ enum KeyStyle {
     Ghost,
 }
 
-fn draw_key<D: DrawTarget<Color = Rgb565>>(
+fn draw_key<D: BlendTarget>(
     display: &mut D,
     rect: Rectangle,
     label: &str,

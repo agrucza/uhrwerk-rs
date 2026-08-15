@@ -1,9 +1,7 @@
 //! Core UI types - Screen trait, actions, and shared data.
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     primitives::Rectangle,
 };
 
@@ -14,6 +12,12 @@ use embedded_graphics::{
 pub use crate::events::{
     NUM_SELF_TESTS, SelfTestId, SelfTestResult, SystemEvent,
 };
+
+// The render-target capability trait every `Screen::render` is bound
+// on. Defined next to the display driver (the one implementor);
+// re-exported here so UI code imports it from the same place as the
+// rest of the render types and never names the drivers crate.
+pub use drivers::display::{BlendClipped, BlendTarget};
 
 // -- Display power-management state ------------------------------------------
 
@@ -1023,7 +1027,7 @@ pub trait Screen {
     /// outside this tile. Screens without that optimization opportunity
     /// (clock face, dial-shaped views) ignore the field and let the
     /// driver's per-pixel clip handle out-of-tile writes.
-    fn render<D: DrawTarget<Color = Rgb565>>(
+    fn render<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,

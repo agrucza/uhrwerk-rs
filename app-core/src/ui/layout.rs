@@ -235,7 +235,7 @@ impl VStack {
 ///
 /// // In render:
 /// // ... draw fixed chrome ...
-/// let mut clipped = display.clipped(&viewport_rect);
+/// let mut clipped = BlendClipped::new(display, &viewport_rect);
 /// // ... draw scrollable content with y - scroll.offset() ...
 /// ```
 #[derive(Debug, Default)]

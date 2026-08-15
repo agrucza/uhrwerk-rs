@@ -38,13 +38,13 @@
 //! [`SetBrightness`]: Action::SetBrightness
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     prelude::Primitive,
     primitives::{PrimitiveStyle, Rectangle},
     Drawable,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 use heapless::String;
 use core::fmt::Write;
 
@@ -77,8 +77,8 @@ enum TileIcon {
     Lock,
 }
 
-fn draw_tile_icon<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D, kind: TileIcon, cx: i32, cy: i32, color: Rgb565,
+fn draw_tile_icon<D: BlendTarget>(
+    display: &mut D, kind: TileIcon, cx: i32, cy: i32, color: Color,
 ) {
     let r = 9;
     match kind {
@@ -227,7 +227,7 @@ impl QuickAccessScreen {
 }
 
 impl Screen for QuickAccessScreen {
-    fn render<D: DrawTarget<Color = Rgb565>>(
+    fn render<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,

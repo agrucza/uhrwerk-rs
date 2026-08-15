@@ -21,11 +21,11 @@
 use core::fmt::Write;
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     primitives::Rectangle,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 
 use crate::events::{SwipeDir, SystemEvent};
 use crate::ui::{fonts, layout, theme};
@@ -40,7 +40,7 @@ use crate::ui::widgets::{
 
 /// Per-screen accent. Yellow == warning per spec ("ALERTS" header
 /// is yellow-tinted).
-const ACCENT: Rgb565 = theme::YELLOW;
+const ACCENT: Color = theme::YELLOW;
 
 /// Side margin matching the alarm list rows.
 const SIDE_MARGIN: i32 = 14;
@@ -99,7 +99,7 @@ impl NotificationsScreen {
 }
 
 impl Screen for NotificationsScreen {
-    fn render<D: DrawTarget<Color = Rgb565>>(
+    fn render<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -279,7 +279,7 @@ fn snooze_hint_rect(row: Rectangle) -> Rectangle {
 
 // -- Row rendering -----------------------------------------------------------
 
-fn render_row<D: DrawTarget<Color = Rgb565>>(
+fn render_row<D: BlendTarget>(
     display: &mut D, n: &Notification, row_idx: usize, scroll: i32,
 ) {
     let rect = row_rect(row_idx, scroll);
@@ -341,7 +341,7 @@ fn render_row<D: DrawTarget<Color = Rgb565>>(
 // -- Layout helpers ----------------------------------------------------------
 
 /// Severity → border / label / badge colour.
-fn severity_color(sev: NotificationSeverity) -> Rgb565 {
+fn severity_color(sev: NotificationSeverity) -> Color {
     match sev {
         NotificationSeverity::Critical => theme::SIGNAL,
         NotificationSeverity::Warning  => theme::YELLOW,

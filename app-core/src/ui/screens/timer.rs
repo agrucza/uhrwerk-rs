@@ -32,11 +32,11 @@ use core::fmt::Write;
 
 use embassy_time::{Duration, Instant};
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     primitives::Rectangle,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 
 use crate::events::SystemEvent;
 use crate::ui::{fonts, layout, theme};
@@ -54,7 +54,7 @@ use crate::ui::widgets::{
 /// Per-screen accent. Orange = "data stream / dynamic" per the spec;
 /// also differentiates Timer (counting down) from Stopwatch (green,
 /// counting up).
-const ACCENT: Rgb565 = theme::ORANGE;
+const ACCENT: Color = theme::ORANGE;
 
 /// Static system-code shown in the header's right-telemetry slot.
 const TELEMETRY: &str = "TMR.0001";
@@ -248,7 +248,7 @@ impl TimerScreen {
     /// and colon separators. Flashes accent↔danger during the
     /// post-clamp warning so the user sees the cap was applied
     /// before they tap Set again.
-    fn picker_accent(&self) -> Rgb565 {
+    fn picker_accent(&self) -> Color {
         if self.flash_ticks == 0 {
             return ACCENT;
         }
@@ -258,7 +258,7 @@ impl TimerScreen {
 }
 
 impl Screen for TimerScreen {
-    fn render<D: DrawTarget<Color = Rgb565>>(
+    fn render<D: BlendTarget>(
         &self,
         display: &mut D,
         data: &SystemData,
@@ -345,7 +345,7 @@ impl Screen for TimerScreen {
 // -- Main view ---------------------------------------------------------------
 
 impl TimerScreen {
-    fn render_main<D: DrawTarget<Color = Rgb565>>(&self, display: &mut D, data: &SystemData) {
+    fn render_main<D: BlendTarget>(&self, display: &mut D, data: &SystemData) {
         draw_app_chrome(display, data, "TIMER", TELEMETRY, ACCENT);
 
         // -- Readout panel -------------------------------------------------
@@ -491,7 +491,7 @@ impl TimerScreen {
 // -- Picker view -------------------------------------------------------------
 
 impl TimerScreen {
-    fn render_picker<D: DrawTarget<Color = Rgb565>>(&self, display: &mut D, data: &SystemData) {
+    fn render_picker<D: BlendTarget>(&self, display: &mut D, data: &SystemData) {
         draw_app_chrome(display, data, "SET TIMER", TELEMETRY, ACCENT);
 
         // Wheels are the readout - their selection cells already

@@ -38,7 +38,7 @@ u8g2-fonts = "0.7.2"
 # structs (e.g. `ChargerPhase`, `RtcDateTime`, `ImuData`). `defmt`
 # default is disabled so optional logging doesn't leak into host
 # builds.
-drivers = { path = "../drivers", default-features = false, features = ["pmu", "rtc", "imu", "touch"] }
+drivers = { path = "../drivers", default-features = false, features = ["pmu", "rtc", "imu", "touch", "display"] }
 
 [dev-dependencies]
 # Register a mock time driver so host tests that exercise code

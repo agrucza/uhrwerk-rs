@@ -9,6 +9,7 @@
 //!   `draw_app_chrome` convenience helper.
 //! * [`controls`] - interactive primitives: `toggle`, `slider`,
 //!   `chamfered_button`.
+//! * [`gauge`] - anti-aliased ring gauge (`ring_gauge`).
 //! * [`scrollable`] - smooth-scroll body + scrollbar helper.
 //! * [`wheel`] - vertical scroll-wheel column for bounded-integer
 //!   picking. Composed into multi-column [`picker`]s for HH:MM,
@@ -21,6 +22,7 @@ pub mod bodies;
 pub mod chrome;
 pub mod containers;
 pub mod controls;
+pub mod gauge;
 pub mod keyboard;
 pub mod picker;
 pub mod scrollable;
@@ -34,6 +36,7 @@ pub use chrome::{
     STATUS_BAR_H,
 };
 pub use containers::{chamfered_panel, info_tile, tag_label, tile, NOTCH, TAG_LABEL_H};
+pub use gauge::ring_gauge;
 pub use keyboard::{Keyboard, KeyboardResult};
 pub use controls::{
     chamfered_button, slider, slider_value_from_x, toggle, ButtonVariant,

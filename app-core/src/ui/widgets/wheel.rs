@@ -17,13 +17,13 @@
 use core::fmt::Write;
 
 use embedded_graphics::{
-    draw_target::DrawTarget,
     geometry::{Point, Size},
-    pixelcolor::Rgb565,
     prelude::Primitive,
     primitives::{Line, PrimitiveStyle, Rectangle},
     Drawable,
 };
+use crate::ui::types::BlendTarget;
+use crate::ui::theme::Color;
 
 use crate::ui::{fonts, theme};
 
@@ -198,10 +198,10 @@ impl Wheel {
         &self,
         display: &mut D,
         rect: Rectangle,
-        accent: Rgb565,
+        accent: Color,
         mut format: F,
     ) where
-        D: DrawTarget<Color = Rgb565>,
+        D: BlendTarget,
         F: FnMut(i32, &mut heapless::String<16>),
     {
         let cy = rect.top_left.y + rect.size.height as i32 / 2;
