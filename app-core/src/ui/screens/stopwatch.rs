@@ -30,7 +30,6 @@
 //! Hoisting it into `SystemData` for cross-screen persistence is a
 //! future change when the use case shows up.
 
-use core::fmt::Write;
 
 use embassy_time::{Duration, Instant};
 use embedded_graphics::{
@@ -41,7 +40,7 @@ use crate::ui::types::BlendTarget;
 use crate::ui::theme::Color;
 
 use crate::events::SystemEvent;
-use crate::ui::{fonts, layout, theme};
+use crate::ui::{fmt, fonts, layout, theme};
 use crate::ui::types::{Action, DirtyRegion, RenderCtx, Screen, StopwatchState, SystemData};
 use crate::ui::widgets::{
     app_chrome_back_hit, chamfered_button, chamfered_panel, draw_app_chrome,
@@ -163,13 +162,8 @@ impl Screen for StopwatchScreen {
             NOTCH,
         );
 
-        let elapsed = data.stopwatch.elapsed();
-        let total_secs = elapsed.as_secs();
-        let hours   = (total_secs / 3600).min(99);
-        let minutes = (total_secs / 60) % 60;
-        let seconds = total_secs % 60;
-        let mut buf: heapless::String<12> = heapless::String::new();
-        let _ = write!(buf, "{:02}:{:02}:{:02}", hours, minutes, seconds);
+        let total_secs = data.stopwatch.elapsed().as_secs();
+        let buf = fmt::hms(total_secs);
 
         // Centre vertically inside the panel below the tag-label
         // band so the numerals don't sit on top of "ELAPSED".

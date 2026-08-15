@@ -28,7 +28,7 @@ use core::fmt::Write;
 
 use crate::config::GpsTrackingCadence;
 use crate::data::GpsSyncState;
-use crate::ui::{fonts, glyphs, layout, theme};
+use crate::ui::{fmt, fonts, glyphs, layout, theme};
 use crate::ui::types::{
     Action, RenderCtx, Screen, SelfTestId, SelfTestResult, SystemData, SystemEvent,
 };
@@ -254,7 +254,11 @@ fn has_gps(data: &SystemData) -> bool {
 
 fn clock_value(data: &SystemData) -> String<20> {
     let mut buf = String::new();
-    let _ = write!(buf, "{:02}:{:02}:{:02}", data.time.hour, data.time.minute, data.time.second);
+    let _ = buf.push_str(
+        fmt::hms_parts(
+            data.time.hour as u64, data.time.minute as u64, data.time.second as u64,
+        ).as_str(),
+    );
     buf
 }
 
@@ -852,9 +856,9 @@ impl SettingsScreen {
     ) {
         draw_header(display, data, "CLOCK", theme::ACCENT, ctx);
 
-        let mut time_buf: String<12> = String::new();
-        let _ = write!(time_buf, "{:02}:{:02}:{:02}",
-            data.time.hour, data.time.minute, data.time.second);
+        let time_buf = fmt::hms_parts(
+            data.time.hour as u64, data.time.minute as u64, data.time.second as u64,
+        );
         draw_clock_panel(display, clock_panel_rect(0), "TIME", time_buf.as_str());
 
         let mut date_buf: String<12> = String::new();
@@ -1534,12 +1538,7 @@ impl SettingsScreen {
             theme::INFO,
             NOTCH,
         );
-        let mut up_buf: String<16> = String::new();
-        let up = data.uptime_secs;
-        let _ = write!(
-            up_buf, "{:02}:{:02}:{:02}",
-            up / 3600, (up % 3600) / 60, up % 60,
-        );
+        let up_buf = fmt::hms(data.uptime_secs as u64);
         fonts::draw_centered_in_rect(
             display, &fonts::value(),
             up_buf.as_str(), uptime_rect, theme::FG,
@@ -1559,12 +1558,7 @@ impl SettingsScreen {
             theme::INFO,
             NOTCH,
         );
-        let mut act_buf: String<16> = String::new();
-        let act = data.active_secs;
-        let _ = write!(
-            act_buf, "{:02}:{:02}:{:02}",
-            act / 3600, (act % 3600) / 60, act % 60,
-        );
+        let act_buf = fmt::hms(data.active_secs as u64);
         fonts::draw_centered_in_rect(
             display, &fonts::value(),
             act_buf.as_str(), active_rect, theme::FG,

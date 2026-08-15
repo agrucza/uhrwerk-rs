@@ -28,7 +28,6 @@
 //! flashes orange↔red so the user can confirm the cap before
 //! committing.
 
-use core::fmt::Write;
 
 use embassy_time::{Duration, Instant};
 use embedded_graphics::{
@@ -39,7 +38,7 @@ use crate::ui::types::BlendTarget;
 use crate::ui::theme::Color;
 
 use crate::events::SystemEvent;
-use crate::ui::{fonts, layout, theme};
+use crate::ui::{fmt, fonts, layout, theme};
 use crate::ui::types::{Action, DirtyRegion, RenderCtx, Screen, SystemData, TimerState};
 use crate::data::TimeData;
 use crate::ui::widgets::{
@@ -362,8 +361,7 @@ impl TimerScreen {
             NOTCH,
         );
 
-        let mut buf: heapless::String<12> = heapless::String::new();
-        format_duration(data.timer.remaining(), &mut buf);
+        let buf = fmt::hms(data.timer.remaining().as_secs());
 
         let inner_rect = Rectangle::new(
             Point::new(
@@ -619,12 +617,4 @@ fn rect_hit(rect: Rectangle, x: u16, y: u16) -> bool {
         && py < ry + rect.size.height as i32
 }
 
-/// Format a duration as `HH:MM:SS` into the provided buffer.
-fn format_duration(d: Duration, buf: &mut heapless::String<12>) {
-    let total_secs = d.as_secs();
-    let h = (total_secs / 3600).min(99);
-    let m = (total_secs / 60) % 60;
-    let s = total_secs % 60;
-    let _ = write!(buf, "{:02}:{:02}:{:02}", h, m, s);
-}
 

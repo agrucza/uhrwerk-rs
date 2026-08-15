@@ -164,7 +164,7 @@ pub fn header_icon_hit(x: u16, y: u16, header_rect: Rectangle) -> bool {
 pub fn status_bar<D: BlendTarget>(
     display: &mut D,
     y: i32,
-    time_text: &str,
+    time: &crate::data::TimeData,
     battery_pct: Option<u8>,
     tint: Color,
     x_inset: i32,
@@ -176,7 +176,7 @@ pub fn status_bar<D: BlendTarget>(
 
     let font = fonts::caption();
     fonts::draw_at(
-        display, &font, time_text,
+        display, &font, crate::ui::fmt::hm(time.hour, time.minute).as_str(),
         x_inset, y + 3,
         tint,
     );
@@ -242,8 +242,59 @@ pub fn home_indicator<D: BlendTarget>(
 // path per visual concept - a cross-cutting change (like the
 // safe-area seam) must never have to chase per-screen copies again.
 
+/// Overlay chrome - the counterpart of [`draw_app_chrome`] for the
+/// overlay screens (app drawer, quick access): tinted status bar,
+/// big left title + muted right caption on the shared
+/// [`OVERLAY_TITLE_Y`] band (corner-aware pads), and the standard
+/// home indicator. No chevron header, no hairline - that's the
+/// overlays' deliberate look.
+pub fn draw_overlay_chrome<D: BlendTarget>(
+    display: &mut D,
+    data: &SystemData,
+    title: &str,
+    right_caption: &str,
+    tint: Color,
+    pad: i32,
+    ctx: &crate::ui::types::RenderCtx,
+) {
+    let top = data.safe_area.top;
+    if ctx.intersects_y(APP_STATUS_Y + top, APP_STATUS_Y + top + STATUS_BAR_H) {
+        status_bar(
+            display,
+            APP_STATUS_Y + top,
+            &data.time,
+            data.power.battery_percent,
+            tint,
+            APP_STATUS_X_INSET,
+        );
+    }
+    if ctx.intersects_y(OVERLAY_TITLE_Y - 8, OVERLAY_TITLE_Y + 24) {
+        let panel_h = theme::SCREEN_H as i32;
+        let left_pad = data.safe_area.left_pad(pad, OVERLAY_TITLE_Y + 4, panel_h);
+        let right_pad = data.safe_area.right_pad(pad, OVERLAY_TITLE_Y + 4, panel_h);
+        fonts::draw_at(
+            display, &fonts::value(), title,
+            left_pad, OVERLAY_TITLE_Y - 8,
+            tint,
+        );
+        fonts::draw_right(
+            display, &fonts::caption(), right_caption,
+            theme::SCREEN_W as i32 - right_pad, OVERLAY_TITLE_Y,
+            theme::FG_MUTED,
+        );
+    }
+    if ctx.intersects_y(APP_HOME_BAR_Y, APP_HOME_BAR_Y + HOME_INDICATOR_H) {
+        home_indicator(display, APP_HOME_BAR_Y, theme::ACCENT);
+    }
+}
+
 /// Y of the top status bar in standard app chrome.
 pub const APP_STATUS_Y: i32 = 0;
+
+/// Anchor row of an overlay's title band (drawer, quick access):
+/// title ink top sits at `OVERLAY_TITLE_Y - 8`, the right caption's
+/// top at `OVERLAY_TITLE_Y`.
+pub const OVERLAY_TITLE_Y: i32 = APP_STATUS_Y + STATUS_BAR_H + 26;
 
 /// Horizontal inset for status-bar content. Picked to keep the time
 /// glyph and battery glyphs clear of the bezel arc at the status
@@ -287,22 +338,16 @@ pub fn draw_app_chrome<D: BlendTarget>(
     accent: Color,
     ctx: &crate::ui::types::RenderCtx,
 ) {
-    use core::fmt::Write;
     // The three pieces sit at fixed y-positions; skip each one's
     // setup work (string format, glyph lookup) when this tile's
     // y-range can't contain it - the driver would reject every
     // write per-pixel anyway.
     let top = data.safe_area.top;
     if ctx.intersects_y(APP_STATUS_Y + top, APP_STATUS_Y + top + STATUS_BAR_H) {
-        let mut time_buf: heapless::String<8> = heapless::String::new();
-        let _ = write!(
-            &mut time_buf,
-            "{:02}:{:02}", data.time.hour, data.time.minute,
-        );
         status_bar(
             display,
             APP_STATUS_Y + top,
-            time_buf.as_str(),
+            &data.time,
             data.power.battery_percent,
             accent,
             APP_STATUS_X_INSET,

@@ -36,7 +36,7 @@ use crate::ui::types::BlendTarget;
 use crate::ui::theme::Color;
 
 use crate::events::SystemEvent;
-use crate::ui::{fonts, layout, theme};
+use crate::ui::{fmt, fonts, layout, theme};
 use crate::ui::types::{
     Action, AlarmEntry, RenderCtx, Screen, SystemData, MAX_ALARMS,
 };
@@ -227,7 +227,7 @@ impl AlarmScreen {
         // Time block, left-aligned.
         let time_color = if entry.enabled { ACCENT } else { theme::FG_DIM };
         let mut time_buf: heapless::String<8> = heapless::String::new();
-        let _ = write!(time_buf, "{:02}:{:02}", entry.hour, entry.minute);
+        let _ = time_buf.push_str(fmt::hm(entry.hour, entry.minute).as_str());
         let time_y = rect.top_left.y + (rect.size.height as i32 - 24) / 2;
         fonts::draw_at(
             display, &fonts::value(),

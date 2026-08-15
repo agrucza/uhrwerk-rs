@@ -31,10 +31,10 @@ pub mod wheel;
 pub use bodies::{row, RowControl, ROW_H};
 pub use chrome::{
     app_chrome_back_hit, app_header_rect, corner_safe_header_rect, draw_app_chrome,
-    header, header_icon_hit,
+    draw_overlay_chrome, header, header_icon_hit,
     home_indicator, status_bar,
-    APP_CONTENT_TOP, APP_HEADER_TOP, APP_HOME_BAR_Y, APP_STATUS_Y, HEADER_H,
-    HOME_INDICATOR_H,
+    APP_CONTENT_TOP, APP_HEADER_TOP, APP_HOME_BAR_Y, APP_STATUS_X_INSET, APP_STATUS_Y,
+    HEADER_H, HOME_INDICATOR_H, OVERLAY_TITLE_Y,
     STATUS_BAR_H,
 };
 pub use containers::{chamfered_panel, info_tile, tag_label, tile, NOTCH, TAG_LABEL_H};

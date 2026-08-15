@@ -28,9 +28,9 @@ use heapless::String;
 use core::fmt::Write;
 
 use crate::events::{SwipeDir, SystemEvent};
-use crate::ui::{fonts, glyphs, theme};
+use crate::ui::{glyphs, theme};
 use crate::ui::types::{Action, RenderCtx, Screen, ScreenId, SystemData};
-use crate::ui::widgets::{home_indicator, status_bar, tile, STATUS_BAR_H};
+use crate::ui::widgets::{draw_overlay_chrome, tile, APP_HOME_BAR_Y, OVERLAY_TITLE_Y};
 
 // -- Icon dispatch -----------------------------------------------------------
 //
@@ -108,20 +108,11 @@ const TILES: [TileDef; 9] = [
 
 // -- Layout constants --------------------------------------------------------
 
-/// Y of the top status bar. Bar ends at STATUS_Y + STATUS_BAR_H = 18.
-const STATUS_Y: i32 = 0;
-/// Horizontal inset for the status bar content so time / battery clear
-/// the bezel arc at y~3..15.
-const STATUS_X_INSET: i32 = 85;
-
-const HEADER_Y: i32 = STATUS_Y + STATUS_BAR_H + 26;
-const GRID_TOP: i32 = HEADER_Y + 34;
+const GRID_TOP: i32 = OVERLAY_TITLE_Y + 34;
 const GRID_PAD_X: i32 = 24;
 const GRID_GAP: i32 = 8;
 
-/// Y of the bottom home-indicator bar.
-const HOME_BAR_Y: i32 = theme::SCREEN_H as i32 - 18;
-const GRID_BOTTOM: i32 = HOME_BAR_Y - 24;
+const GRID_BOTTOM: i32 = APP_HOME_BAR_Y - 24;
 
 fn tile_rect(row: usize, col: usize) -> Rectangle {
     let total_w = theme::SCREEN_W as i32 - GRID_PAD_X * 2;
@@ -159,49 +150,16 @@ impl Screen for AppDrawerScreen {
         &self,
         display: &mut D,
         data: &SystemData,
-        _ctx: &RenderCtx,
+        ctx: &RenderCtx,
     ) {
-        // Top status bar: HH:MM on the left, signal / BT / battery % on
-        // the right, signal-red tint.
-        let mut time_buf: heapless::String<8> = heapless::String::new();
-        let _ = core::fmt::Write::write_fmt(
-            &mut time_buf,
-            format_args!("{:02}:{:02}", data.time.hour, data.time.minute),
-        );
-        status_bar(
-            display,
-            STATUS_Y + data.safe_area.top,
-            time_buf.as_str(),
-            data.power.battery_percent,
-            theme::ACCENT,
-            STATUS_X_INSET,
-        );
-        // Header row, padded clear of the case's top corner arcs
-        // (no-op on boards without corner data).
-        // Sampled at the title ink's vertical center: the case arc
-        // recedes fast across the text's height and glyph corners are
-        // naturally empty, so the center row is the honest constraint
-        // - sampling the top row pushed the header ~20 px further in
-        // than the case requires (visibly misaligned with the grid).
-        let panel_h = theme::SCREEN_H as i32;
-        let mid_y = HEADER_Y + 4;
-        let left_pad = GRID_PAD_X.max(data.safe_area.left_inset_at(mid_y, panel_h) + 2);
-        let right_pad = GRID_PAD_X.max(data.safe_area.right_inset_at(mid_y, panel_h) + 2);
-        let font_title = fonts::value();
-        fonts::draw_at(
-            display, &font_title,
-            "APPS",
-            left_pad, HEADER_Y - 8,
-            theme::ACCENT,
-        );
         let installed = TILES.iter().filter(|t| t.target.is_some()).count();
         let mut buf: String<16> = String::new();
         let _ = write!(buf, "{:02} INSTALLED", installed);
-        fonts::draw_right(
-            display, &fonts::caption(),
-            buf.as_str(),
-            theme::SCREEN_W as i32 - right_pad, HEADER_Y,
-            theme::FG_MUTED,
+        draw_overlay_chrome(
+            display, data,
+            "APPS", buf.as_str(),
+            theme::ACCENT, GRID_PAD_X,
+            ctx,
         );
 
         // 3x3 tile grid. The tile whose `target` matches the
@@ -248,7 +206,6 @@ impl Screen for AppDrawerScreen {
             );
         }
 
-        home_indicator(display, HOME_BAR_Y, theme::ACCENT);
     }
 
     fn on_event(&mut self, event: &SystemEvent, _data: &mut SystemData) -> Action {

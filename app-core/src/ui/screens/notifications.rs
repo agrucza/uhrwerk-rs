@@ -34,6 +34,7 @@ use crate::ui::types::{
     SystemData,
 };
 use crate::ui::widgets::{
+    APP_STATUS_X_INSET,
     corner_safe_header_rect,
     app_chrome_back_hit, app_header_rect, chamfered_panel, handle_scroll_drag, header,
     render_scrolled, status_bar, APP_CONTENT_TOP, APP_HOME_BAR_Y, SCROLLBAR_GUTTER,
@@ -113,17 +114,13 @@ impl Screen for NotificationsScreen {
         // Status bar + header only - no home indicator. Notifications
         // closes via swipe-left, so the bottom-of-screen swipe-up
         // indicator that other apps show would mislead the user.
-        let mut time_buf: heapless::String<8> = heapless::String::new();
-        let _ = write!(
-            time_buf, "{:02}:{:02}", data.time.hour, data.time.minute,
-        );
         status_bar(
             display,
             data.safe_area.top,
-            time_buf.as_str(),
+            &data.time,
             data.power.battery_percent,
             ACCENT,
-            85,
+            APP_STATUS_X_INSET,
         );
         header(
             display,

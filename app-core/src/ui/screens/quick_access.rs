@@ -52,8 +52,8 @@ use crate::events::{SwipeDir, SystemEvent};
 use crate::ui::{fonts, glyphs, theme};
 use crate::ui::types::{Action, RenderCtx, Screen, ScreenId, SystemData};
 use crate::ui::widgets::{
-    chamfered_panel, home_indicator, slider, slider_value_from_x, status_bar,
-    NOTCH, SLIDER_BAR_H, STATUS_BAR_H,
+    chamfered_panel, draw_overlay_chrome, slider, slider_value_from_x,
+    NOTCH, OVERLAY_TITLE_Y, SLIDER_BAR_H,
 };
 
 /// Slider lower bound for brightness. The hardware can render
@@ -150,23 +150,14 @@ const TILES: [TileDef; 8] = [
 
 const PAD_X: i32 = 22;
 
-/// Y of the top status bar.
-const STATUS_Y: i32 = 0;
-/// Horizontal inset for status-bar content around the bezel arc.
-const STATUS_X_INSET: i32 = 85;
-
-const HEADER_Y: i32 = STATUS_Y + STATUS_BAR_H + 26;
-
 /// Brightness bar block.
-const BRIGHT_LABEL_Y: i32 = HEADER_Y + 46;
+const BRIGHT_LABEL_Y: i32 = OVERLAY_TITLE_Y + 46;
 const BRIGHT_BAR_Y:   i32 = BRIGHT_LABEL_Y + 26;
 
 /// Toggle grid: 4 tiles per row, 2 rows.
 const TOGGLE_TOP: i32 = BRIGHT_BAR_Y + 54;
 const TOGGLE_GAP: i32 = 6;
 
-/// Bottom indicator bar.
-const HOME_BAR_Y: i32 = theme::SCREEN_H as i32 - 18;
 
 fn bright_bar_rect() -> Rectangle {
     Rectangle::new(
@@ -231,43 +222,13 @@ impl Screen for QuickAccessScreen {
         &self,
         display: &mut D,
         data: &SystemData,
-        _ctx: &RenderCtx,
+        ctx: &RenderCtx,
     ) {
-        // Top status bar with cyan tint per the spec (Quick Access is
-        // a cyan-accent overlay).
-        let mut time_buf: heapless::String<8> = heapless::String::new();
-        let _ = core::fmt::Write::write_fmt(
-            &mut time_buf,
-            format_args!("{:02}:{:02}", data.time.hour, data.time.minute),
-        );
-        status_bar(
-            display,
-            STATUS_Y + data.safe_area.top,
-            time_buf.as_str(),
-            data.power.battery_percent,
-            theme::INFO,
-            STATUS_X_INSET,
-        );
-        // Header, padded clear of the case's top corner arcs
-        // (no-op on boards without corner data).
-        // Sampled at the title ink's vertical center (see app_drawer:
-        // top-row sampling over-insets against the receding arc).
-        let panel_h = theme::SCREEN_H as i32;
-        let mid_y = HEADER_Y + 4;
-        let left_pad = PAD_X.max(data.safe_area.left_inset_at(mid_y, panel_h) + 2);
-        let right_pad = PAD_X.max(data.safe_area.right_inset_at(mid_y, panel_h) + 2);
-        let font_title = fonts::value();
-        fonts::draw_at(
-            display, &font_title,
-            "QUICK.ACCESS",
-            left_pad, HEADER_Y - 8,
-            theme::INFO,
-        );
-        fonts::draw_right(
-            display, &fonts::caption(),
-            "v PULL",
-            theme::SCREEN_W as i32 - right_pad, HEADER_Y,
-            theme::FG_MUTED,
+        draw_overlay_chrome(
+            display, data,
+            "QUICK.ACCESS", "v PULL",
+            theme::INFO, PAD_X,
+            ctx,
         );
 
         // Brightness label - the slider widget handles its own value
@@ -338,7 +299,6 @@ impl Screen for QuickAccessScreen {
             );
         }
 
-        home_indicator(display, HOME_BAR_Y, theme::ACCENT);
     }
 
     fn on_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {

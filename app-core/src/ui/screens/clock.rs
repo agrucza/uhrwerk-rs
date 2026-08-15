@@ -41,7 +41,7 @@ use heapless::String;
 use core::fmt::Write;
 
 use crate::events::SystemEvent;
-use crate::ui::{fonts, glyphs, layout, theme};
+use crate::ui::{fmt, fonts, glyphs, layout, theme};
 use crate::ui::types::{Action, DirtyRegion, RenderCtx, Screen, ScreenId, SystemData};
 use crate::ui::widgets::info_tile;
 
@@ -298,6 +298,11 @@ fn draw_telemetry_strip<D: BlendTarget>(
     // The strip sits inside the case's top corner arcs on some
     // devices - widen the pads to whatever the aperture needs at
     // this height (no-ops on boards without corner data).
+    // HARDWARE-VERIFIED CLEARANCE - do not "unify" onto the +2
+    // helper margin: the telemetry strip sits higher in the corner
+    // arc than the overlay titles, and the +2 margin clips on the
+    // T-Watch case (regressed once, 2026-08-15). The +6 here is the
+    // flash-verified value.
     let panel_h = theme::SCREEN_H as i32;
     let left_pad = PAD_X.max(data.safe_area.left_inset_at(TELE_Y + 6, panel_h) + 6);
     let right_pad = PAD_X.max(data.safe_area.right_inset_at(TELE_Y + 6, panel_h) + 6);
@@ -446,7 +451,7 @@ fn draw_bottom_tiles<D: BlendTarget>(
     ) {
         Some(idx) => {
             let entry = &data.config.alarms.entries[idx];
-            let _ = write!(alarm_buf, "{:02}:{:02}", entry.hour, entry.minute);
+            let _ = alarm_buf.push_str(fmt::hm(entry.hour, entry.minute).as_str());
             alarm_buf.as_str()
         }
         None => "OFF",

@@ -68,6 +68,19 @@ impl SafeArea {
         self.left + self.corner_extra(y, panel_h)
     }
 
+    /// Corner-aware left padding for a text run whose ink centers
+    /// on row `y`: the design padding `base`, widened to clear the
+    /// case plus a 2 px margin. Boards without case data return
+    /// `base` unchanged.
+    pub fn left_pad(&self, base: i32, y: i32, panel_h: i32) -> i32 {
+        base.max(self.left_inset_at(y, panel_h) + 2)
+    }
+
+    /// Right-edge counterpart of [`Self::left_pad`].
+    pub fn right_pad(&self, base: i32, y: i32, panel_h: i32) -> i32 {
+        base.max(self.right_inset_at(y, panel_h) + 2)
+    }
+
     /// Right-edge counterpart of [`Self::left_inset_at`].
     pub fn right_inset_at(&self, y: i32, panel_h: i32) -> i32 {
         self.right + self.corner_extra(y, panel_h)

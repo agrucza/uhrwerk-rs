@@ -1,3 +1,4 @@
+pub mod fmt;
 pub mod theme;
 pub mod layout;
 pub mod primitives;
