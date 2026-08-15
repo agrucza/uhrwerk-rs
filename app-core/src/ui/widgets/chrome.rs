@@ -85,12 +85,9 @@ pub fn header<D: BlendTarget>(
     ).into_styled(stroke).draw(display).ok();
 
     let title_font = fonts::value();
-    let title_dim = title_font
-        .get_rendered_dimensions(title, Point::zero(),
-            u8g2_fonts::types::VerticalPosition::Top)
-        .ok()
-        .and_then(|d| d.bounding_box);
-    let title_h = title_dim.map(|b| b.size.height as i32).unwrap_or(18);
+    let title_h = fonts::measure_bbox(&title_font, title)
+        .map(|b| b.size.height as i32)
+        .unwrap_or(18);
     let title_top = y + (h - title_h) / 2;
     fonts::draw_at(
         display, &title_font, title,

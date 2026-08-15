@@ -15,6 +15,11 @@ Home Assistant voice assistant (Wyoming over TCP).
 - `firmware-hal` - shared display HAL (CO5300 QSPI AMOLED)
 - `drivers` - chip drivers (feature-gated)
 - `firmware-s3` / `firmware-c6` / `firmware-twatch-ultra` - board bins
+- `tools/fontbake` - host tool baking the UI's glyph atlases from
+  `assets/fonts/` (run `cargo run -p fontbake` after font changes)
+
+UI typography: [Inter](https://github.com/rsms/inter), SIL Open Font
+License 1.1 - license text in `assets/fonts/LICENSE.txt`.
 
 ## Hardware status
 

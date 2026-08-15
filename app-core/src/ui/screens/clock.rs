@@ -7,8 +7,7 @@
 //!    cue for the swipe-down-from-top edge gesture (routed by the
 //!    Model into Quick Access).
 //! 3. Stacked numerals: HH in signal red, MM directly below in bone.
-//!    Both rendered in the geometric `Mega` (logisoso78) face, digits
-//!    only. Meta row beneath: `:SS` in cyan + a chrome readout -
+//!    Both rendered in the `mega` role (78 px digits), digits only. Meta row beneath: `:SS` in cyan + a chrome readout -
 //!    today's step count on step-capable boards, else the last GPS
 //!    fix on GPS boards, else the spec's static `LAT .. LON ..`
 //!    filler. Boards with steps AND GPS get the fix coordinates on
@@ -40,7 +39,6 @@ use embedded_graphics::{
 use crate::ui::types::BlendTarget;
 use heapless::String;
 use core::fmt::Write;
-use u8g2_fonts::FontRenderer;
 
 use crate::events::SystemEvent;
 use crate::ui::{fonts, glyphs, layout, theme};
@@ -329,7 +327,7 @@ fn draw_telemetry_strip<D: BlendTarget>(
 fn draw_hero_numerals<D: BlendTarget>(
     display: &mut D, data: &SystemData,
 ) {
-    let mega: FontRenderer = FontRenderer::new::<fonts::Mega>();
+    let mega = fonts::mega();
     let cx = theme::SCREEN_W as i32 / 2;
 
     let mut hh: String<4> = String::new();

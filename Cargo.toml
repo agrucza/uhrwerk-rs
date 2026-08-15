@@ -8,6 +8,7 @@ members = [
     "firmware-s3",
     "firmware-c6",
     "firmware-twatch-ultra",
+    "tools/fontbake",
 ]
 # firmware-c6 is excluded from default-members so `cargo build
 # --workspace` at the root (which runs under the `esp` Xtensa

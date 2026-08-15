@@ -1,7 +1,7 @@
 //! Non-text drawing primitives shared across screens.
 //!
-//! Text rendering lives in `crate::ui::fonts` (u8g2-fonts wrapped
-//! around embedded-graphics). This module is purely shape primitives.
+//! Text rendering lives in `crate::ui::fonts` (baked Inter alpha
+//! atlases). This module is purely shape primitives.
 //!
 //! - `rounded_panel` - rounded rectangle with optional fill and 1 px
 //!   border. Building block for scrollbar tracks/thumbs and the

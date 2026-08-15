@@ -31,9 +31,6 @@ embassy-time = "0.5.1"
 # Static collections used by UI nav stack / screen state.
 heapless = "0.9.2"
 
-# U8g2 font wrapper for embedded-graphics. UI renders use this.
-u8g2-fonts = "0.7.2"
-
 # Driver-side value types carried inside system events and snapshot
 # structs (e.g. `ChargerPhase`, `RtcDateTime`, `ImuData`). `defmt`
 # default is disabled so optional logging doesn't leak into host

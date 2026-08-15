@@ -1,0 +1,13 @@
+[package]
+name    = "fontbake"
+version = "0.1.0"
+edition = "2021"
+
+# Host-side glyph baker - rasterizes the Inter TTFs in assets/fonts/
+# into the committed alpha atlases under app-core/src/ui/fonts/gen/.
+# Not a default workspace member; run explicitly with
+# `cargo run -p fontbake` from the repo root after changing a font,
+# size, or charset.
+
+[dependencies]
+fontdue = "0.9"
