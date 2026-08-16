@@ -7,13 +7,15 @@
 //!    cue for the swipe-down-from-top edge gesture (routed by the
 //!    Model into Quick Access).
 //! 3. Stacked numerals: HH in signal red, MM directly below in bone.
-//!    Both rendered in the `mega` role (78 px digits), digits only. Meta row beneath: `:SS` in cyan + a chrome readout -
-//!    today's step count on step-capable boards, else the last GPS
-//!    fix on GPS boards, else the spec's static `LAT .. LON ..`
-//!    filler. Boards with steps AND GPS get the fix coordinates on
-//!    their own line below the meta row (last outdoor sync, not
-//!    live - the receiver is rail-gated between sessions).
-//! 4. Two chamfered info tiles at the bottom (via `info_tile` +
+//!    Both rendered in the `mega` role (78 px digits), digits only.
+//!    Meta row beneath: `:SS` in cyan + the last GPS fix on GPS
+//!    boards (last outdoor sync, not live - the receiver is
+//!    rail-gated between sessions), else the spec's static
+//!    `LAT .. LON ..` filler.
+//! 4. Steps ring on step-capable boards: a cyan ring gauge centered
+//!    in the band between the meta row and the bottom tiles, today's
+//!    count inside, filled against the daily step goal.
+//! 5. Two chamfered info tiles at the bottom (via `info_tile` +
 //!    `layout::bottom_tile_row::<2>()`):
 //!    - left: yellow border, bell glyph, next enabled alarm time
 //!      (`HH:MM`) or `OFF` if none, suffix `ALARM`.
@@ -43,7 +45,7 @@ use core::fmt::Write;
 use crate::events::SystemEvent;
 use crate::ui::{fmt, fonts, glyphs, layout, theme};
 use crate::ui::types::{Action, DirtyRegion, RenderCtx, Screen, ScreenId, SystemData};
-use crate::ui::widgets::info_tile;
+use crate::ui::widgets::{info_tile, ring_gauge};
 
 // -- Geometry ---------------------------------------------------------------
 
@@ -67,12 +69,20 @@ const HERO_HH_TOP: i32 = 120;
 /// stacked block.
 const HERO_STACK_GAP: i32 = 72;
 const HERO_MM_TOP: i32 = HERO_HH_TOP + HERO_STACK_GAP;
-/// Y of the meta row (:SS + steps/coords readout) under the MM
-/// glyphs.
+/// Y of the meta row (:SS + coords readout) under the MM glyphs.
 const META_Y: i32 = HERO_MM_TOP + 84;
-/// Y of the last-fix coordinates line, rendered only on boards
-/// where steps occupy the meta row's right-hand slot.
-const GPS_Y: i32 = META_Y + 28;
+
+/// Steps ring - centered in the band between the meta row's ink
+/// (ends ~286) and the bottom tile row (starts at 400): the ring
+/// spans y 299..387, 13 px of air on each side, with the count and
+/// STEPS caption inside.
+const RING_CX: i32 = theme::SCREEN_W as i32 / 2;
+const RING_CY: i32 = 343;
+const RING_R: i32 = 44;
+const RING_TH: i32 = 7;
+/// Daily goal the ring fills against. Constant - not yet a config
+/// entry.
+const DAILY_STEP_GOAL: u32 = 10_000;
 
 // -- Dirty-region rectangles -------------------------------------------------
 //
@@ -98,15 +108,15 @@ const HERO_MM_RECT: Rectangle = Rectangle::new(
     Point::new(0, HERO_MM_TOP - 10),
     Size::new(theme::SCREEN_W as u32, 88),
 );
-/// Meta row: `:SS` and the steps/coords readout.
+/// Meta row: `:SS` and the coords readout.
 const META_RECT: Rectangle = Rectangle::new(
     Point::new(0, META_Y - 8),
     Size::new(theme::SCREEN_W as u32, 36),
 );
-/// Last-fix coordinates line below the meta row.
-const GPS_RECT: Rectangle = Rectangle::new(
-    Point::new(0, GPS_Y - 8),
-    Size::new(theme::SCREEN_W as u32, 36),
+/// Steps ring, count and caption included.
+const RING_RECT: Rectangle = Rectangle::new(
+    Point::new(RING_CX - RING_R - 4, RING_CY - RING_R - 4),
+    Size::new((RING_R * 2 + 8) as u32, (RING_R * 2 + 8) as u32),
 );
 /// Bottom tile row (alarm + timer info tiles).
 const BOTTOM_RECT: Rectangle = Rectangle::new(
@@ -165,16 +175,16 @@ impl Screen for ClockScreen {
         &self,
         display: &mut D,
         data: &SystemData,
-        _ctx: &RenderCtx,
+        ctx: &RenderCtx,
     ) {
         // Clock face widgets are fixed-position; the driver clips
-        // per-pixel for the current tile, so we don't gain anything
-        // from acting on `ctx` here.
+        // per-pixel for the current tile, so only the ring (whose
+        // widget clips itself per tile) takes `ctx`.
         draw_telemetry_strip(display, data);
         draw_swipe_hint(display, data.safe_area.top);
         draw_hero_numerals(display, data);
         draw_meta_row(display, data);
-        draw_gps_row(display, data);
+        draw_steps_ring(display, ctx, data);
         draw_bottom_tiles(display, data);
     }
 
@@ -210,10 +220,10 @@ impl Screen for ClockScreen {
             region.add(BOTTOM_RECT);
         }
         if prev.steps != data.steps_today {
-            region.add(META_RECT);
+            region.add(RING_RECT);
         }
         if prev.fix != data.gps_fix {
-            region.add(GPS_RECT);
+            region.add(META_RECT);
         }
         region
     }
@@ -367,15 +377,11 @@ fn draw_meta_row<D: BlendTarget>(
 
     // Measure the seconds glyph width so we can place it and the
     // right-hand string side-by-side, separated by a fixed gap.
-    // Steps on step-capable boards (the last fix then gets its own
-    // line - see draw_gps_row), else the last GPS fix, else the
-    // spec's static LAT/LON filler.
+    // The last GPS fix on GPS boards, else the spec's static
+    // LAT/LON filler. Steps live in the ring below (draw_steps_ring).
     let ss_w = fonts::measure_width(&font, ss.as_str());
     let mut right_buf: String<32> = String::new();
-    let coords: &str = if data.capabilities.steps {
-        let _ = write!(right_buf, "{} STEPS", data.steps_today);
-        right_buf.as_str()
-    } else if data.capabilities.gps {
+    let coords: &str = if data.capabilities.gps {
         write_coords(&mut right_buf, data.gps_fix);
         right_buf.as_str()
     } else {
@@ -394,20 +400,40 @@ fn draw_meta_row<D: BlendTarget>(
         left_x + ss_w + gap, META_Y, theme::FG_MUTED);
 }
 
-/// Last-fix coordinates on their own line below the meta row - only
-/// on boards where steps occupy the meta row's right-hand slot AND
-/// a GPS exists. Chrome like the meta readout it descends from.
-fn draw_gps_row<D: BlendTarget>(
-    display: &mut D, data: &SystemData,
+/// Daily steps ring - step-capable boards only. Cyan progress on a
+/// dark track, filled against [`DAILY_STEP_GOAL`]; the count sits
+/// inside in the value role with a STEPS caption beneath it.
+fn draw_steps_ring<D: BlendTarget>(
+    display: &mut D, ctx: &RenderCtx, data: &SystemData,
 ) {
-    if !(data.capabilities.steps && data.capabilities.gps) {
+    if !data.capabilities.steps {
         return;
     }
-    let font = fonts::caption();
-    let mut buf: String<32> = String::new();
-    write_coords(&mut buf, data.gps_fix);
-    let cx = theme::SCREEN_W as i32 / 2;
-    fonts::draw_centered(display, &font, buf.as_str(), cx, GPS_Y, theme::FG_MUTED);
+    ring_gauge(
+        display, ctx,
+        RING_CX, RING_CY, RING_R, RING_TH,
+        data.steps_today.min(DAILY_STEP_GOAL), DAILY_STEP_GOAL,
+        theme::INFO,
+        Some(theme::SURFACE_3),
+    );
+
+    // Count: raw below 10k, then "12.3K" - five raw digits at the
+    // value size would collide with the ring's inner edge (74 px).
+    let mut buf: String<8> = String::new();
+    let steps = data.steps_today;
+    if steps < 10_000 {
+        let _ = write!(buf, "{}", steps);
+    } else {
+        let _ = write!(buf, "{}.{}K", steps / 1000, (steps % 1000) / 100);
+    }
+    fonts::draw_centered(
+        display, &fonts::value(), buf.as_str(),
+        RING_CX, RING_CY - 20, theme::FG,
+    );
+    fonts::draw_centered(
+        display, &fonts::caption(), "STEPS",
+        RING_CX, RING_CY + 10, theme::FG_MUTED,
+    );
 }
 
 /// `LAT 51.2334  LON 6.7832` from the last fix, dashes before the
