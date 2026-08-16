@@ -65,15 +65,18 @@ const AUTO_LOCK_OPTIONS: &[AutoLockOption] = &[
 // -- Settings chrome helpers -------------------------------------------------
 
 
-const HDR_TOP: i32 = widgets::APP_HEADER_TOP;
 const HDR_H: i32 = widgets::HEADER_H;
-/// Y of the bottom home-indicator bar.
-const HOME_BAR_Y: i32 = widgets::APP_HOME_BAR_Y;
 
-/// Header rect shared by every settings sub-view (the shared
-/// app-chrome header rect).
-fn hdr_rect() -> Rectangle {
-    widgets::app_header_rect()
+/// Top row of the settings content area (below the shared header),
+/// derived from the device safe area.
+fn rows_top(safe: &crate::data::SafeArea) -> i32 {
+    widgets::app_content_top(safe)
+}
+
+/// Top y for every leaf sub-view's first slot. Sits below the
+/// header hairline with breathing room.
+fn leaf_top_y(safe: &crate::data::SafeArea) -> i32 {
+    rows_top(safe) + 18
 }
 
 /// Draw the full Settings chrome: top status bar (tinted by `accent`,
@@ -94,7 +97,6 @@ fn draw_header<D: BlendTarget>(
 }
 
 /// Y of the first row below the settings header.
-const ROWS_TOP: i32 = HDR_TOP + HDR_H + 8;
 
 /// Rect for the Nth row in the settings Index / Storage sub-index,
 /// adjusted by the current scroll offset. `scroll = 0` returns the
@@ -102,8 +104,8 @@ const ROWS_TOP: i32 = HDR_TOP + HDR_H + 8;
 /// (rows below come into view). Width leaves a [`SCROLLBAR_GUTTER`]
 /// inset on the right so the row's right-aligned controls have room
 /// before the scrollbar.
-fn row_rect(index: usize, scroll: i32) -> Rectangle {
-    let y = ROWS_TOP + index as i32 * ROW_H - scroll;
+fn row_rect(index: usize, scroll: i32, safe: &crate::data::SafeArea) -> Rectangle {
+    let y = rows_top(safe) + index as i32 * ROW_H - scroll;
     Rectangle::new(
         Point::new(0, y),
         Size::new(
@@ -114,8 +116,8 @@ fn row_rect(index: usize, scroll: i32) -> Rectangle {
 }
 
 /// Hit test the back chevron in the settings Nightwatch header.
-fn header_back_hit(x: u16, y: u16) -> bool {
-    header_icon_hit(x, y, hdr_rect())
+fn header_back_hit(x: u16, y: u16, safe: &crate::data::SafeArea) -> bool {
+    header_icon_hit(x, y, widgets::app_header_rect(safe))
 }
 
 // -- View enum ---------------------------------------------------------------
@@ -498,8 +500,10 @@ const IMU_TESTS: &[ImuTestRow] = &[
 
 /// Top y of the wheel picker in time/date entry views, vertically
 /// centred between the header bottom and the action row.
-const PICKER_TOP: i32 = HDR_TOP + HDR_H + 8
-    + (layout::BOTTOM_TILE_Y - (HDR_TOP + HDR_H + 8) - WHEEL_TOTAL_H) / 2;
+fn picker_top(safe: &crate::data::SafeArea) -> i32 {
+    let ct = rows_top(safe);
+    ct + (layout::BOTTOM_TILE_Y - ct - WHEEL_TOTAL_H) / 2
+}
 
 /// Width of one wheel column in the time/date picker.
 const PICKER_COL_W: i32 = 72;
@@ -656,21 +660,21 @@ impl SettingsScreen {
         draw_header(display, data, "SETTINGS", theme::ACCENT, ctx);
         render_scrolled(
             display, self.index_scroll.offset(),
-            index_viewport_rect(), index_content_h(data), theme::ACCENT, ctx,
+            index_viewport_rect(&data.safe_area), index_content_h(data), theme::ACCENT, ctx,
             |clipped, scroll| render_rows(clipped, data, INDEX_ROWS, scroll, ctx),
         );
     }
 
     fn index_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 Action::Back
             }
             SystemEvent::Tap { x, y } => {
                 if let Some(action) = row_hit(
                     *x, *y, INDEX_ROWS, data,
                     self.index_scroll.offset(),
-                    &index_viewport_rect(),
+                    &index_viewport_rect(&data.safe_area),
                     &mut self.view,
                 ) {
                     // Opening the mic-test view starts capture: the
@@ -686,7 +690,7 @@ impl SettingsScreen {
                 Action::None
             }
             SystemEvent::TouchPressed { .. } | SystemEvent::TouchReleased => {
-                let viewport_h = index_viewport_rect().size.height as i32;
+                let viewport_h = index_viewport_rect(&data.safe_area).size.height as i32;
                 if handle_scroll_drag(
                     &mut self.index_scroll, event, viewport_h, index_content_h(data),
                 ) {
@@ -701,9 +705,9 @@ impl SettingsScreen {
 
 /// Visible-row viewport rect for the index. Spans from just below
 /// the header hairline to just above the home-indicator bar.
-fn index_viewport_rect() -> Rectangle {
-    let top = ROWS_TOP;
-    let bot = HOME_BAR_Y - 4;
+fn index_viewport_rect(safe: &crate::data::SafeArea) -> Rectangle {
+    let top = rows_top(safe);
+    let bot = widgets::app_home_bar_y(safe) - 4;
     Rectangle::new(
         Point::new(0, top),
         Size::new(theme::SCREEN_W as u32, (bot - top) as u32),
@@ -732,7 +736,7 @@ fn render_rows<D: BlendTarget>(
         if !(r.visible)(data) {
             continue;
         }
-        let rect = row_rect(pos, scroll);
+        let rect = row_rect(pos, scroll, &data.safe_area);
         pos += 1;
         // Skip rows whose y-range falls entirely outside this tile.
         // This is where the tile-aware optimization lives: without it,
@@ -795,7 +799,7 @@ fn row_hit(
         if !(r.visible)(data) {
             continue;
         }
-        let rect = row_rect(pos, scroll);
+        let rect = row_rect(pos, scroll, &data.safe_area);
         pos += 1;
         if !rect.contains(pt) { continue; }
         return Some(match r.kind {
@@ -812,14 +816,16 @@ fn row_hit(
 // -- Clock sub-view (time + date panels) -------------------------------------
 
 /// Y of the first clock metric panel below the settings header.
-const CLOCK_PANEL_TOP: i32 = HDR_TOP + HDR_H + 12;
+fn clock_panel_top(safe: &crate::data::SafeArea) -> i32 {
+    widgets::app_header_top(safe) + HDR_H + 12
+}
 /// Height of one clock metric panel.
 const CLOCK_PANEL_H: i32 = 84;
 /// Vertical gap between the two clock metric panels.
 const CLOCK_PANEL_GAP: i32 = 12;
 
-fn clock_panel_rect(slot: usize) -> Rectangle {
-    let y = CLOCK_PANEL_TOP + slot as i32 * (CLOCK_PANEL_H + CLOCK_PANEL_GAP);
+fn clock_panel_rect(slot: usize, safe: &crate::data::SafeArea) -> Rectangle {
+    let y = clock_panel_top(safe) + slot as i32 * (CLOCK_PANEL_H + CLOCK_PANEL_GAP);
     let x = layout::VSTACK_SIDE_MARGIN;
     let w = theme::SCREEN_W as i32 - layout::VSTACK_SIDE_MARGIN * 2;
     Rectangle::new(
@@ -859,12 +865,12 @@ impl SettingsScreen {
         let time_buf = fmt::hms_parts(
             data.time.hour as u64, data.time.minute as u64, data.time.second as u64,
         );
-        draw_clock_panel(display, clock_panel_rect(0), "TIME", time_buf.as_str());
+        draw_clock_panel(display, clock_panel_rect(0, &data.safe_area), "TIME", time_buf.as_str());
 
         let mut date_buf: String<12> = String::new();
         let _ = write!(date_buf, "{:02}.{:02}.{:04}",
             data.time.day, data.time.month, data.time.year);
-        draw_clock_panel(display, clock_panel_rect(1), "DATE", date_buf.as_str());
+        draw_clock_panel(display, clock_panel_rect(1, &data.safe_area), "DATE", date_buf.as_str());
     }
 
     fn clock_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
@@ -872,7 +878,7 @@ impl SettingsScreen {
             // Keep the display fresh.
             SystemEvent::TimeUpdated { .. } => Action::Redraw,
 
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Index;
                 Action::Redraw
             }
@@ -886,7 +892,7 @@ impl SettingsScreen {
             }
             SystemEvent::Tap { x, y } => {
                 let p = Point::new(*x as i32, *y as i32);
-                if clock_panel_rect(0).contains(p) {
+                if clock_panel_rect(0, &data.safe_area).contains(p) {
                     // Open time picker, seed from current time.
                     let t = &data.time;
                     self.time_picker.wheels[0].set_value(t.hour as i32);
@@ -894,7 +900,7 @@ impl SettingsScreen {
                     self.time_picker.wheels[2].set_value(t.second as i32);
                     self.view = SettingsView::TimeEntry;
                     Action::Redraw
-                } else if clock_panel_rect(1).contains(p) {
+                } else if clock_panel_rect(1, &data.safe_area).contains(p) {
                     // Open date picker, seed from current date. Set
                     // month + year first, then re-clamp day range
                     // before assigning day so it's always valid.
@@ -917,8 +923,8 @@ impl SettingsScreen {
 // -- Wi-Fi sub-view ----------------------------------------------------------
 
 /// The passphrase panel - single source for render and hit-test.
-fn wifi_panel_rect() -> Rectangle {
-    let mut s = layout::VStack::new(LEAF_TOP_Y);
+fn wifi_panel_rect(safe: &crate::data::SafeArea) -> Rectangle {
+    let mut s = layout::VStack::new(leaf_top_y(safe));
     s.slot(80)
 }
 
@@ -928,7 +934,7 @@ impl SettingsScreen {
     ) {
         draw_header(display, data, "WIFI", theme::ACCENT, ctx);
 
-        let panel = wifi_panel_rect();
+        let panel = wifi_panel_rect(&data.safe_area);
         chamfered_panel(display, panel, NOTCH, theme::BORDER, 1);
         tag_label(
             display,
@@ -969,9 +975,9 @@ impl SettingsScreen {
         );
     }
 
-    fn wifi_event(&mut self, event: &SystemEvent, _data: &mut SystemData) -> Action {
+    fn wifi_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Index;
                 Action::Redraw
             }
@@ -984,7 +990,7 @@ impl SettingsScreen {
                 Action::Redraw
             }
             SystemEvent::Tap { x, y } => {
-                if rect_hit(wifi_panel_rect(), *x, *y) {
+                if rect_hit(wifi_panel_rect(&data.safe_area), *x, *y) {
                     self.wifi_passphrase_keyboard.seed(self.wifi_draft.as_str());
                     self.view = SettingsView::WifiPassphrase;
                     Action::Redraw
@@ -1004,11 +1010,11 @@ impl SettingsScreen {
     }
 
     fn wifi_passphrase_event(
-        &mut self, event: &SystemEvent, _data: &mut SystemData,
+        &mut self, event: &SystemEvent, data: &mut SystemData,
     ) -> Action {
         // Header back = cancel: the draft stays what it was.
         if let SystemEvent::Tap { x, y } = event {
-            if header_back_hit(*x, *y) {
+            if header_back_hit(*x, *y, &data.safe_area) {
                 self.view = SettingsView::Wifi;
                 return Action::Redraw;
             }
@@ -1040,7 +1046,7 @@ impl SettingsScreen {
     ) {
         draw_header(display, data, "SET TIME", theme::ACCENT, ctx);
 
-        let cells = picker_cell_rects();
+        let cells = picker_cell_rects(&data.safe_area);
         self.time_picker.wheels[0].render(display, cells[0], theme::ACCENT, fmt_2digit);
         self.time_picker.wheels[1].render(display, cells[1], theme::ACCENT, fmt_2digit);
         self.time_picker.wheels[2].render(display, cells[2], theme::ACCENT, fmt_2digit);
@@ -1051,7 +1057,7 @@ impl SettingsScreen {
 
     fn time_entry_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Clock;
                 Action::Redraw
             }
@@ -1076,14 +1082,14 @@ impl SettingsScreen {
                     };
                 }
 
-                let cells = picker_cell_rects();
+                let cells = picker_cell_rects(&data.safe_area);
                 if self.time_picker.handle_event(event, &cells) {
                     return Action::Redraw;
                 }
                 Action::None
             }
             SystemEvent::TouchPressed { .. } | SystemEvent::TouchReleased => {
-                let cells = picker_cell_rects();
+                let cells = picker_cell_rects(&data.safe_area);
                 if self.time_picker.handle_event(event, &cells) {
                     return Action::Redraw;
                 }
@@ -1102,7 +1108,7 @@ impl SettingsScreen {
     ) {
         draw_header(display, data, "SET DATE", theme::ACCENT, ctx);
 
-        let cells = picker_cell_rects();
+        let cells = picker_cell_rects(&data.safe_area);
         self.date_picker.wheels[0].render(display, cells[0], theme::ACCENT, fmt_2digit);
         self.date_picker.wheels[1].render(display, cells[1], theme::ACCENT, fmt_2digit);
         // Year wheel has 4-digit values - format unpadded to fit
@@ -1117,7 +1123,7 @@ impl SettingsScreen {
 
     fn date_entry_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Clock;
                 Action::Redraw
             }
@@ -1142,7 +1148,7 @@ impl SettingsScreen {
                     };
                 }
 
-                let cells = picker_cell_rects();
+                let cells = picker_cell_rects(&data.safe_area);
                 if self.date_picker.handle_event(event, &cells) {
                     self.refresh_date_day_range();
                     return Action::Redraw;
@@ -1150,7 +1156,7 @@ impl SettingsScreen {
                 Action::None
             }
             SystemEvent::TouchPressed { .. } | SystemEvent::TouchReleased => {
-                let cells = picker_cell_rects();
+                let cells = picker_cell_rects(&data.safe_area);
                 if self.date_picker.handle_event(event, &cells) {
                     self.refresh_date_day_range();
                     return Action::Redraw;
@@ -1216,8 +1222,8 @@ struct MotionLayout {
     content_h: i32,
 }
 
-fn motion_layout(scroll: i32, has_steps: bool) -> MotionLayout {
-    let mut s = layout::VStack::new(LEAF_TOP_Y - scroll);
+fn motion_layout(scroll: i32, has_steps: bool, safe: &crate::data::SafeArea) -> MotionLayout {
+    let mut s = layout::VStack::new(leaf_top_y(safe) - scroll);
 
     let r0 = s.slot(MOTION_READOUT_H); s.gap(MOTION_READOUT_GAP);
     let r1 = s.slot(MOTION_READOUT_H); s.gap(MOTION_READOUT_GAP);
@@ -1242,7 +1248,7 @@ fn motion_layout(scroll: i32, has_steps: bool) -> MotionLayout {
     s.gap(MOTION_TEST_PANEL_BTN_GAP);
     let b1 = s.slot(MOTION_TEST_BUTTON_H);
 
-    let content_h = s.cursor_y() + scroll - LEAF_TOP_Y;
+    let content_h = s.cursor_y() + scroll - leaf_top_y(safe);
     MotionLayout {
         readouts: [r0, r1, r2, r3, r4, r5, r6, r7],
         readout_count: if has_steps { 8 } else { 7 },
@@ -1252,10 +1258,10 @@ fn motion_layout(scroll: i32, has_steps: bool) -> MotionLayout {
 }
 
 /// Visible viewport for MOTION's scrollable area: from the row of
-/// section content (LEAF_TOP_Y) down to just above the home bar.
-fn motion_viewport_rect() -> Rectangle {
-    let top = LEAF_TOP_Y;
-    let bot = HOME_BAR_Y - 4;
+/// section content (leaf_top_y) down to just above the home bar.
+fn motion_viewport_rect(safe: &crate::data::SafeArea) -> Rectangle {
+    let top = leaf_top_y(safe);
+    let bot = widgets::app_home_bar_y(safe) - 4;
     Rectangle::new(
         Point::new(0, top),
         Size::new(theme::SCREEN_W as u32, (bot - top) as u32),
@@ -1327,10 +1333,10 @@ impl SettingsScreen {
         draw_header(display, data, "MOTION", theme::ACCENT, ctx);
 
         let scroll = self.imu_scroll.offset();
-        let layout = motion_layout(scroll, data.capabilities.steps);
+        let layout = motion_layout(scroll, data.capabilities.steps, &data.safe_area);
 
         render_scrolled(
-            display, scroll, motion_viewport_rect(), layout.content_h, theme::ACCENT, ctx,
+            display, scroll, motion_viewport_rect(&data.safe_area), layout.content_h, theme::ACCENT, ctx,
             |clipped, _| {
                 // Live readouts.
                 let mut value_buf: heapless::String<12> = heapless::String::new();
@@ -1400,7 +1406,7 @@ impl SettingsScreen {
                 Action::Redraw
             }
 
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Index;
                 Action::Redraw
             }
@@ -1415,8 +1421,8 @@ impl SettingsScreen {
 
             // Drag scroll for the live + self-tests stack.
             SystemEvent::TouchPressed { .. } | SystemEvent::TouchReleased => {
-                let layout = motion_layout(0, data.capabilities.steps);
-                let viewport_h = motion_viewport_rect().size.height as i32;
+                let layout = motion_layout(0, data.capabilities.steps, &data.safe_area);
+                let viewport_h = motion_viewport_rect(&data.safe_area).size.height as i32;
                 if handle_scroll_drag(
                     &mut self.imu_scroll, event, viewport_h, layout.content_h,
                 ) {
@@ -1428,7 +1434,7 @@ impl SettingsScreen {
             // Self-test button tap.
             SystemEvent::Tap { x, y } => {
                 let scroll = self.imu_scroll.offset();
-                let layout = motion_layout(scroll, data.capabilities.steps);
+                let layout = motion_layout(scroll, data.capabilities.steps, &data.safe_area);
                 let pt = Point::new(*x as i32, *y as i32);
                 for (i, test) in IMU_TESTS.iter().enumerate() {
                     let (_, button_rect) = layout.tests[i];
@@ -1461,7 +1467,7 @@ impl SettingsScreen {
         // percent/voltage centered inside.
         let panel_w = theme::SCREEN_W as i32 - 56;
         let panel_x = (theme::SCREEN_W as i32 - panel_w) / 2;
-        let panel_y = ROWS_TOP + 18;
+        let panel_y = rows_top(&data.safe_area) + 18;
         let panel_h = 60i32;
         let panel_rect = Rectangle::new(
             Point::new(panel_x, panel_y),
@@ -1591,9 +1597,9 @@ impl SettingsScreen {
         );
     }
 
-    fn battery_event(&mut self, event: &SystemEvent, _data: &mut SystemData) -> Action {
+    fn battery_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Index;
                 Action::Redraw
             }
@@ -1643,7 +1649,7 @@ impl SettingsScreen {
 
     fn storage_index_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Index;
                 Action::Redraw
             }
@@ -1658,7 +1664,7 @@ impl SettingsScreen {
             SystemEvent::Tap { x, y } => {
                 if let Some(action) = row_hit(
                     *x, *y, STORAGE_INDEX_ROWS, data,
-                    0, &index_viewport_rect(),
+                    0, &index_viewport_rect(&data.safe_area),
                     &mut self.view,
                 ) {
                     return action;
@@ -1687,7 +1693,7 @@ impl SettingsScreen {
         let panel_w = theme::SCREEN_W as i32 - margin * 2;
         let panel_h = 120i32;
         let panel_rect = Rectangle::new(
-            Point::new(margin, ROWS_TOP + 24),
+            Point::new(margin, rows_top(&data.safe_area) + 24),
             Size::new(panel_w as u32, panel_h as u32),
         );
         // Symmetric chamfered panel (Nightwatch default - TL + BR both cut).
@@ -1722,9 +1728,9 @@ impl SettingsScreen {
         );
     }
 
-    fn storage_flash_event(&mut self, event: &SystemEvent, _data: &mut SystemData) -> Action {
+    fn storage_flash_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Storage;
                 Action::Redraw
             }
@@ -1754,7 +1760,7 @@ impl SettingsScreen {
         // Status: chamfered tag-labelled panel. Border + tag tint
         // tracks online/offline (green/signal). Read-only - the
         // button below triggers the probe.
-        let (status_rect, probe_rect) = storage_sd_slots();
+        let (status_rect, probe_rect) = storage_sd_slots(&data.safe_area);
         let (accent, status_text) = if data.storage.sd_online {
             (theme::OK, "ONLINE")
         } else {
@@ -1783,9 +1789,9 @@ impl SettingsScreen {
         );
     }
 
-    fn storage_sd_event(&mut self, event: &SystemEvent, _data: &mut SystemData) -> Action {
+    fn storage_sd_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Storage;
                 Action::Redraw
             }
@@ -1799,7 +1805,7 @@ impl SettingsScreen {
             }
             SystemEvent::Tap { x, y } => {
                 let pt = Point::new(*x as i32, *y as i32);
-                let (_, probe_rect) = storage_sd_slots();
+                let (_, probe_rect) = storage_sd_slots(&data.safe_area);
                 if probe_rect.contains(pt) {
                     return Action::InitSd;
                 }
@@ -1822,7 +1828,7 @@ impl SettingsScreen {
 
         // Warning panel: signal-bordered chamfered panel with a
         // RESTORE tag. Body explains what the action does.
-        let (warn_rect, cancel_rect, primary_rect) = confirmation_slots();
+        let (warn_rect, cancel_rect, primary_rect) = confirmation_slots(&data.safe_area);
         chamfered_panel(display, warn_rect, NOTCH, theme::ACCENT, 1);
         tag_label(
             display,
@@ -1869,7 +1875,7 @@ impl SettingsScreen {
         data: &mut SystemData,
     ) -> Action {
         match event {
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Storage;
                 Action::Redraw
             }
@@ -1883,7 +1889,7 @@ impl SettingsScreen {
             }
             SystemEvent::Tap { x, y } => {
                 let pt = Point::new(*x as i32, *y as i32);
-                let (_, cancel_rect, primary_rect) = confirmation_slots();
+                let (_, cancel_rect, primary_rect) = confirmation_slots(&data.safe_area);
                 if cancel_rect.contains(pt) {
                     self.view = SettingsView::Storage;
                     return Action::Redraw;
@@ -1912,7 +1918,7 @@ impl SettingsScreen {
 
         // Warning panel: danger-tinted chamfered panel with PURGE
         // tag and irreversible-action copy.
-        let (warn_rect, cancel_rect, primary_rect) = confirmation_slots();
+        let (warn_rect, cancel_rect, primary_rect) = confirmation_slots(&data.safe_area);
         chamfered_panel(display, warn_rect, NOTCH, theme::DANGER, 1);
         tag_label(
             display,
@@ -1939,9 +1945,9 @@ impl SettingsScreen {
         );
     }
 
-    fn storage_factory_reset_event(&mut self, event: &SystemEvent, _data: &mut SystemData) -> Action {
+    fn storage_factory_reset_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Storage;
                 Action::Redraw
             }
@@ -1955,7 +1961,7 @@ impl SettingsScreen {
             }
             SystemEvent::Tap { x, y } => {
                 let pt = Point::new(*x as i32, *y as i32);
-                let (_, cancel_rect, primary_rect) = confirmation_slots();
+                let (_, cancel_rect, primary_rect) = confirmation_slots(&data.safe_area);
                 if cancel_rect.contains(pt) {
                     self.view = SettingsView::Storage;
                     return Action::Redraw;
@@ -1983,7 +1989,7 @@ impl SettingsScreen {
     ) {
         draw_header(display, data, "DISPLAY", theme::ACCENT, ctx);
 
-        let slots = display_slots();
+        let slots = display_slots(&data.safe_area);
         let always_on = data.config.display.always_on;
 
         // Brightness panel: tag-labelled chamfered panel with the
@@ -2057,7 +2063,7 @@ impl SettingsScreen {
 
     fn display_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Index;
                 Action::Redraw
             }
@@ -2073,7 +2079,7 @@ impl SettingsScreen {
             SystemEvent::TouchPressed { x, y } => {
                 let max_pct = data.config.display.max_brightness_pct();
                 if let Some(v) = slider_value_from_x(
-                    display_slots().brightness_bar,
+                    display_slots(&data.safe_area).brightness_bar,
                     *x as i32, *y as i32,
                     BRIGHT_MIN_PCT, max_pct,
                 ) {
@@ -2085,7 +2091,7 @@ impl SettingsScreen {
             }
             SystemEvent::Tap { x, y } => {
                 let pt = Point::new(*x as i32, *y as i32);
-                let slots = display_slots();
+                let slots = display_slots(&data.safe_area);
                 let always_on = data.config.display.always_on;
 
                 // Auto-lock buttons: rejected when always_on is on
@@ -2130,7 +2136,7 @@ impl SettingsScreen {
         ctx: &RenderCtx,
     ) {
         draw_header(display, data, title, theme::ACCENT, ctx);
-        let mut s = layout::VStack::new(LEAF_TOP_Y);
+        let mut s = layout::VStack::new(leaf_top_y(&data.safe_area));
         let panel = s.slot(80);
         chamfered_panel(display, panel, NOTCH, theme::BORDER, 1);
         tag_label(
@@ -2163,7 +2169,7 @@ impl SettingsScreen {
     ) {
         draw_header(display, data, "MIC TEST", theme::ACCENT, ctx);
 
-        let (panel, tones_rect, loop_rect) = mic_test_slots();
+        let (panel, tones_rect, loop_rect) = mic_test_slots(&data.safe_area);
         chamfered_panel(display, panel, NOTCH, theme::BORDER, 1);
         tag_label(
             display, panel.top_left.x, panel.top_left.y,
@@ -2222,15 +2228,15 @@ impl SettingsScreen {
     /// (Leaving Settings by any other path is caught by the model's
     /// `mic_test` safety net.) TONES / LOOP taps drive the speaker
     /// tests; `TonesDone` restarts the meter the sweep paused.
-    fn mic_test_event(&mut self, event: &SystemEvent, _data: &mut SystemData) -> Action {
+    fn mic_test_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Index;
                 self.mic_loopback = false;
                 Action::StopMicTest
             }
             SystemEvent::Tap { x, y } => {
-                let (_, tones_rect, loop_rect) = mic_test_slots();
+                let (_, tones_rect, loop_rect) = mic_test_slots(&data.safe_area);
                 if rect_hit(tones_rect, *x, *y) {
                     return Action::PlayToneTest;
                 }
@@ -2273,7 +2279,7 @@ impl SettingsScreen {
         ctx: &RenderCtx,
     ) {
         draw_header(display, data, "GPS", theme::ACCENT, ctx);
-        let slots = gps_slots();
+        let slots = gps_slots(&data.safe_area);
 
         // Session status: state line + the field lesson as a hint
         // (low-e window glazing blocks GNSS outright - sessions need
@@ -2407,12 +2413,12 @@ impl SettingsScreen {
 
     fn gps_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Index;
                 Action::Redraw
             }
             SystemEvent::Tap { x, y } => {
-                let slots = gps_slots();
+                let slots = gps_slots(&data.safe_area);
                 if rect_hit(slots.sync_btn, *x, *y) {
                     // Visually disabled while syncing - the tap must
                     // die here too, not just look dead.
@@ -2457,9 +2463,9 @@ impl SettingsScreen {
         }
     }
 
-    fn stub_event(&mut self, event: &SystemEvent, _data: &mut SystemData) -> Action {
+    fn stub_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
-            SystemEvent::Tap { x, y } if header_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Index;
                 Action::Redraw
             }
@@ -2480,13 +2486,13 @@ impl SettingsScreen {
 
 /// Per-column rects for the time/date wheel picker, centered horizontally
 /// inside the SCREEN_W band.
-fn picker_cell_rects() -> [Rectangle; 3] {
+fn picker_cell_rects(safe: &crate::data::SafeArea) -> [Rectangle; 3] {
     let start_x = (theme::SCREEN_W as i32 - PICKER_TOTAL_W) / 2;
     core::array::from_fn(|i| {
         Rectangle::new(
             Point::new(
                 start_x + i as i32 * (PICKER_COL_W + PICKER_GAP),
-                PICKER_TOP,
+                picker_top(safe),
             ),
             Size::new(PICKER_COL_W as u32, WHEEL_TOTAL_H as u32),
         )
@@ -2583,15 +2589,12 @@ fn format_result(
 // geometry - no chance of the event-side hit-test rect drifting from
 // the render-side draw rect.
 
-/// Top y for every leaf sub-view's first slot. Sits below the
-/// header hairline with breathing room.
-const LEAF_TOP_Y: i32 = ROWS_TOP + 18;
 
 // -- Storage SD: status panel + single full-width action button ------------
 
 /// Storage-SD sub-view rects: (status_panel, action_button).
-fn storage_sd_slots() -> (Rectangle, Rectangle) {
-    let mut s = layout::VStack::new(LEAF_TOP_Y);
+fn storage_sd_slots(safe: &crate::data::SafeArea) -> (Rectangle, Rectangle) {
+    let mut s = layout::VStack::new(leaf_top_y(safe));
     let panel = s.slot(100);
     s.gap(18);
     let button = s.slot(36);
@@ -2603,8 +2606,8 @@ fn storage_sd_slots() -> (Rectangle, Rectangle) {
 /// Restore / Factory-Reset sub-view rects: (warning_panel, cancel,
 /// primary). Same layout for both; they differ only in colors and
 /// labels.
-fn confirmation_slots() -> (Rectangle, Rectangle, Rectangle) {
-    let mut s = layout::VStack::new(LEAF_TOP_Y);
+fn confirmation_slots(safe: &crate::data::SafeArea) -> (Rectangle, Rectangle, Rectangle) {
+    let mut s = layout::VStack::new(leaf_top_y(safe));
     let panel = s.slot(100);
     s.gap(18);
     let (cancel, primary) = s.pair(36, 12);
@@ -2614,8 +2617,8 @@ fn confirmation_slots() -> (Rectangle, Rectangle, Rectangle) {
 /// MicTest sub-view layout: (level panel, TONES button, LOOP button).
 /// Shared by render and hit-testing so the tap targets always match
 /// what's drawn.
-fn mic_test_slots() -> (Rectangle, Rectangle, Rectangle) {
-    let mut s = layout::VStack::new(LEAF_TOP_Y);
+fn mic_test_slots(safe: &crate::data::SafeArea) -> (Rectangle, Rectangle, Rectangle) {
+    let mut s = layout::VStack::new(leaf_top_y(safe));
     let panel = s.slot(96);
     s.gap(18);
     let (tones, loop_b) = s.pair(36, 12);
@@ -2656,8 +2659,8 @@ const TRACKING_CADENCES: [(&str, GpsTrackingCadence); 4] = [
     ("60S", GpsTrackingCadence::Every60s),
 ];
 
-fn gps_slots() -> GpsSlots {
-    let mut s = layout::VStack::new(LEAF_TOP_Y);
+fn gps_slots(safe: &crate::data::SafeArea) -> GpsSlots {
+    let mut s = layout::VStack::new(leaf_top_y(safe));
     let status_panel = s.slot(96);
     s.gap(18);
     let sync_btn = s.slot(44);
@@ -2725,9 +2728,9 @@ struct DisplaySlots {
     always_on_row: Rectangle,
 }
 
-fn display_slots() -> DisplaySlots {
+fn display_slots(safe: &crate::data::SafeArea) -> DisplaySlots {
     // Top section: margined VStack for the two chamfered panels.
-    let mut top = layout::VStack::new(LEAF_TOP_Y);
+    let mut top = layout::VStack::new(leaf_top_y(safe));
     let brightness_panel = top.slot(70);
     top.gap(14);
     let auto_lock_panel = top.slot(80);

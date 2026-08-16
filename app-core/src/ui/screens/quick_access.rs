@@ -53,7 +53,7 @@ use crate::ui::{fonts, glyphs, theme};
 use crate::ui::types::{Action, RenderCtx, Screen, ScreenId, SystemData};
 use crate::ui::widgets::{
     chamfered_panel, draw_overlay_chrome, slider, slider_value_from_x,
-    NOTCH, OVERLAY_TITLE_Y, SLIDER_BAR_H,
+    overlay_title_y, NOTCH, SLIDER_BAR_H,
 };
 
 /// Slider lower bound for brightness. The hardware can render
@@ -151,17 +151,23 @@ const TILES: [TileDef; 8] = [
 const PAD_X: i32 = 22;
 
 /// Brightness bar block.
-const BRIGHT_LABEL_Y: i32 = OVERLAY_TITLE_Y + 46;
-const BRIGHT_BAR_Y:   i32 = BRIGHT_LABEL_Y + 26;
+fn bright_label_y(safe: &crate::data::SafeArea) -> i32 {
+    overlay_title_y(safe) + 46
+}
+fn bright_bar_y(safe: &crate::data::SafeArea) -> i32 {
+    bright_label_y(safe) + 26
+}
 
 /// Toggle grid: 4 tiles per row, 2 rows.
-const TOGGLE_TOP: i32 = BRIGHT_BAR_Y + 54;
+fn toggle_top(safe: &crate::data::SafeArea) -> i32 {
+    bright_bar_y(safe) + 54
+}
 const TOGGLE_GAP: i32 = 6;
 
 
-fn bright_bar_rect() -> Rectangle {
+fn bright_bar_rect(safe: &crate::data::SafeArea) -> Rectangle {
     Rectangle::new(
-        Point::new(PAD_X, BRIGHT_BAR_Y),
+        Point::new(PAD_X, bright_bar_y(safe)),
         Size::new(
             (theme::SCREEN_W as i32 - PAD_X * 2) as u32,
             SLIDER_BAR_H as u32,
@@ -176,12 +182,12 @@ fn tile_size() -> i32 {
     (total_w - TOGGLE_GAP * 3) / 4
 }
 
-fn toggle_rect(idx: usize) -> Rectangle {
+fn toggle_rect(idx: usize, safe: &crate::data::SafeArea) -> Rectangle {
     let row = idx / 4;
     let col = idx % 4;
     let s = tile_size();
     let x = PAD_X + col as i32 * (s + TOGGLE_GAP);
-    let y = TOGGLE_TOP + row as i32 * (s + TOGGLE_GAP);
+    let y = toggle_top(safe) + row as i32 * (s + TOGGLE_GAP);
     Rectangle::new(Point::new(x, y), Size::new(s as u32, s as u32))
 }
 
@@ -237,7 +243,7 @@ impl Screen for QuickAccessScreen {
         fonts::draw_at(
             display, &fonts::caption(),
             "BRIGHTNESS",
-            PAD_X, BRIGHT_LABEL_Y,
+            PAD_X, bright_label_y(&data.safe_area),
             theme::INFO,
         );
 
@@ -249,14 +255,14 @@ impl Screen for QuickAccessScreen {
         let mut label: String<8> = String::new();
         let _ = write!(label, "{:02}%", brightness);
         slider(
-            display, bright_bar_rect(),
+            display, bright_bar_rect(&data.safe_area),
             brightness, BRIGHT_MIN_PCT, max_pct,
             Some(label.as_str()),
         );
 
         // Tile grid.
         for (i, t) in TILES.iter().enumerate() {
-            let rect = toggle_rect(i);
+            let rect = toggle_rect(i, &data.safe_area);
             let on = match t.kind {
                 TileKind::Toggle { is_on, .. } => is_on(data),
                 TileKind::Momentary { .. }     => false,
@@ -318,7 +324,7 @@ impl Screen for QuickAccessScreen {
             SystemEvent::TouchPressed { x, y } => {
                 let max_pct = data.config.display.max_brightness_pct();
                 if let Some(v) = slider_value_from_x(
-                    bright_bar_rect(), *x as i32, *y as i32,
+                    bright_bar_rect(&data.safe_area), *x as i32, *y as i32,
                     BRIGHT_MIN_PCT, max_pct,
                 ) {
                     if v != Self::brightness_pct(data) {
@@ -339,13 +345,13 @@ impl Screen for QuickAccessScreen {
                 let max_pct = data.config.display.max_brightness_pct();
                 // Ignore taps that land on the brightness bar.
                 if slider_value_from_x(
-                    bright_bar_rect(), *x as i32, *y as i32,
+                    bright_bar_rect(&data.safe_area), *x as i32, *y as i32,
                     BRIGHT_MIN_PCT, max_pct,
                 ).is_some() {
                     return Action::None;
                 }
                 for (i, t) in TILES.iter().enumerate() {
-                    if !toggle_rect(i).contains(pt) { continue; }
+                    if !toggle_rect(i, &data.safe_area).contains(pt) { continue; }
                     return match t.kind {
                         TileKind::Toggle { action, .. } => action,
                         TileKind::Momentary { action }  => action,

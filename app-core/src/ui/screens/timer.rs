@@ -45,7 +45,7 @@ use crate::ui::widgets::{
     action_row_rects, app_chrome_back_hit, chamfered_button, chamfered_panel,
     draw_app_chrome, fmt_2digit, render_action_row, tag_label, ButtonVariant,
     Picker, Wheel,
-    APP_CONTENT_TOP, NOTCH, STATUS_BAR_H, TAG_LABEL_H, WHEEL_TOTAL_H,
+    app_content_top, NOTCH, STATUS_BAR_H, TAG_LABEL_H, WHEEL_TOTAL_H,
 };
 
 // -- Constants ---------------------------------------------------------------
@@ -69,13 +69,17 @@ const READOUT_BUTTON_GAP: i32 = 8;
 
 /// Y of the readout panel's top edge - vertically centred between
 /// the header bottom and the action row.
-const READOUT_TOP: i32 = APP_CONTENT_TOP
-    + (layout::BOTTOM_TILE_Y - READOUT_BUTTON_GAP - APP_CONTENT_TOP - READOUT_H) / 2;
+fn readout_top(safe: &crate::data::SafeArea) -> i32 {
+    let ct = app_content_top(safe);
+    ct + (layout::BOTTOM_TILE_Y - READOUT_BUTTON_GAP - ct - READOUT_H) / 2
+}
 
 /// Top y of the wheel picker. Centered between the header bottom
 /// and the action row.
-const PICKER_TOP: i32 = APP_CONTENT_TOP
-    + (layout::BOTTOM_TILE_Y - APP_CONTENT_TOP - WHEEL_TOTAL_H) / 2;
+fn picker_top(safe: &crate::data::SafeArea) -> i32 {
+    let ct = app_content_top(safe);
+    ct + (layout::BOTTOM_TILE_Y - ct - WHEEL_TOTAL_H) / 2
+}
 
 /// Width of one wheel column. Three columns plus two gaps span
 /// roughly the same horizontal real estate as the readout panel.
@@ -111,19 +115,23 @@ const FLASH_TOTAL_TICKS: u8 = FLASH_PHASE_TICKS * 4;
 /// Top status bar - `HH:MM` + battery%. Repaints on the minute roll
 /// or a battery-percent change so the clock stays live while the
 /// timer counts down.
-const STATUS_RECT: Rectangle = Rectangle::new(
-    Point::new(0, 0),
-    Size::new(theme::SCREEN_W as u32, (STATUS_BAR_H + 4) as u32),
-);
+fn status_rect(safe: &crate::data::SafeArea) -> Rectangle {
+    Rectangle::new(
+        Point::new(0, 0),
+        Size::new(theme::SCREEN_W as u32, (safe.top + STATUS_BAR_H + 4) as u32),
+    )
+}
 /// Readout panel - the `HH:MM:SS` hero numerals. Repaints when the
 /// displayed second changes. Same geometry as [`readout_rect`].
-const READOUT_RECT: Rectangle = Rectangle::new(
-    Point::new(SIDE_MARGIN, READOUT_TOP),
-    Size::new(
-        (theme::SCREEN_W as i32 - SIDE_MARGIN * 2) as u32,
-        READOUT_H as u32,
-    ),
-);
+fn readout_rect(safe: &crate::data::SafeArea) -> Rectangle {
+    Rectangle::new(
+        Point::new(SIDE_MARGIN, readout_top(safe)),
+        Size::new(
+            (theme::SCREEN_W as i32 - SIDE_MARGIN * 2) as u32,
+            READOUT_H as u32,
+        ),
+    )
+}
 /// Bottom action row - START/PAUSE/RESUME label and the RESET button
 /// variant. Repaints only on a run-state edge or the zero<->non-zero
 /// edge, not every second.
@@ -315,7 +323,7 @@ impl Screen for TimerScreen {
 
         let mut region = DirtyRegion::empty();
         if prev.remaining_secs != data.timer.remaining().as_secs() {
-            region.add(READOUT_RECT);
+            region.add(readout_rect(&data.safe_area));
         }
         let zero = data.timer.remaining().as_secs() == 0;
         if prev.running != data.timer.is_running() || prev.zero != zero {
@@ -324,7 +332,7 @@ impl Screen for TimerScreen {
         if prev.minute != data.time.minute
             || prev.battery_pct != data.power.battery_percent
         {
-            region.add(STATUS_RECT);
+            region.add(status_rect(&data.safe_area));
         }
         region
     }
@@ -349,7 +357,7 @@ impl TimerScreen {
 
         // -- Readout panel -------------------------------------------------
         let panel_color = ACCENT;
-        let panel = readout_rect();
+        let panel = readout_rect(&data.safe_area);
         chamfered_panel(display, panel, NOTCH, panel_color, 1);
         let tag_text = "REMAINING";
         tag_label(
@@ -420,13 +428,13 @@ impl TimerScreen {
             }
 
             // Header back chevron: pop the nav stack.
-            SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y, &data.safe_area) => {
                 Action::Back
             }
 
             // Tap the readout panel (when not running) → picker.
             SystemEvent::Tap { x, y }
-                if !data.timer.is_running() && rect_hit(readout_rect(), *x, *y) =>
+                if !data.timer.is_running() && rect_hit(readout_rect(&data.safe_area), *x, *y) =>
             {
                 self.seed_picker_from(data.timer.remaining());
                 self.view = TimerView::Picker;
@@ -497,7 +505,7 @@ impl TimerScreen {
         // during the post-clamp warning so the user sees the cap
         // was applied before re-pressing Set.
         let accent = self.picker_accent();
-        let cells = picker_cell_rects();
+        let cells = picker_cell_rects(&data.safe_area);
         self.picker.wheels[0].render(display, cells[0], accent, fmt_2digit);
         self.picker.wheels[1].render(display, cells[1], accent, fmt_2digit);
         self.picker.wheels[2].render(display, cells[2], accent, fmt_2digit);
@@ -532,7 +540,7 @@ impl TimerScreen {
             }
 
             // Header chevron == CANCEL: discard and return to Main.
-            SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y, &data.safe_area) => {
                 self.flash_ticks = 0;
                 self.force_full_next = true;
                 self.view = TimerView::Main;
@@ -565,7 +573,7 @@ impl TimerScreen {
                 }
 
                 // Picker tap-step (above/below center band).
-                let cells = picker_cell_rects();
+                let cells = picker_cell_rects(&data.safe_area);
                 if self.picker.handle_event(event, &cells) {
                     return Action::Redraw;
                 }
@@ -574,7 +582,7 @@ impl TimerScreen {
 
             // Drag scroll on the wheels.
             SystemEvent::TouchPressed { .. } | SystemEvent::TouchReleased => {
-                let cells = picker_cell_rects();
+                let cells = picker_cell_rects(&data.safe_area);
                 if self.picker.handle_event(event, &cells) {
                     return Action::Redraw;
                 }
@@ -587,13 +595,13 @@ impl TimerScreen {
 }
 
 /// Per-column rects for the HH:MM:SS wheel picker, centred horizontally.
-fn picker_cell_rects() -> [Rectangle; 3] {
+fn picker_cell_rects(safe: &crate::data::SafeArea) -> [Rectangle; 3] {
     let start_x = (theme::SCREEN_W as i32 - PICKER_TOTAL_W) / 2;
     core::array::from_fn(|i| {
         Rectangle::new(
             Point::new(
                 start_x + i as i32 * (PICKER_COL_W + PICKER_GAP),
-                PICKER_TOP,
+                picker_top(safe),
             ),
             Size::new(PICKER_COL_W as u32, WHEEL_TOTAL_H as u32),
         )
@@ -602,9 +610,7 @@ fn picker_cell_rects() -> [Rectangle; 3] {
 
 // -- Helpers -----------------------------------------------------------------
 
-fn readout_rect() -> Rectangle {
-    READOUT_RECT
-}
+
 
 fn rect_hit(rect: Rectangle, x: u16, y: u16) -> bool {
     let px = x as i32;

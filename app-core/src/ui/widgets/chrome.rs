@@ -158,9 +158,12 @@ pub fn header_icon_hit(x: u16, y: u16, header_rect: Rectangle) -> bool {
 /// (signal default, cyan on Quick Access, yellow on Notifications, ...).
 ///
 /// A 1 px hairline in `tint` runs along the bottom so the bar reads
-/// as separated from screen content below. `x_inset` pulls the
-/// left/right content away from the bezel arc; the bar itself spans
-/// full screen width so the hairline reaches edge to edge.
+/// as separated from screen content below. `x_inset` is the design
+/// inset for the left/right content; the bar sits at the very top of
+/// the corner arcs, so both sides additionally widen to whatever the
+/// device's safe area demands at the text row (no-op on zero-inset
+/// boards). The bar itself spans full screen width so the hairline
+/// reaches edge to edge.
 pub fn status_bar<D: BlendTarget>(
     display: &mut D,
     y: i32,
@@ -168,16 +171,29 @@ pub fn status_bar<D: BlendTarget>(
     battery_pct: Option<u8>,
     tint: Color,
     x_inset: i32,
+    safe: &crate::data::SafeArea,
 ) {
     use core::fmt::Write;
     let screen_w = theme::SCREEN_W as i32;
     let h = STATUS_BAR_H;
     let cy = y + h / 2;
+    let panel_h = theme::SCREEN_H as i32;
+    // Text row center: text top is y + 3, caption ink is ~10 px.
+    let ink_mid = y + 8;
+    // Angle margin beyond the straight-on corner model: the case lip
+    // sweeps inward at wrist viewing angles, so the status bar needs
+    // more clearance than left_pad's 2 px. Calibrated on-wrist via
+    // the 2026-08-16 ruler flash. No-op on zero-inset boards.
+    const STATUS_ANGLE_MARGIN: i32 = 8;
+    let left_x =
+        x_inset.max(safe.left_inset_at(ink_mid, panel_h) + STATUS_ANGLE_MARGIN);
+    let right_x = screen_w
+        - x_inset.max(safe.right_inset_at(ink_mid, panel_h) + STATUS_ANGLE_MARGIN);
 
     let font = fonts::caption();
     fonts::draw_at(
         display, &font, crate::ui::fmt::hm(time.hour, time.minute).as_str(),
-        x_inset, y + 3,
+        left_x, y + 3,
         tint,
     );
 
@@ -190,7 +206,6 @@ pub fn status_bar<D: BlendTarget>(
         let _ = buf.push_str("--");
     }
     let pct_w = fonts::measure_width(&font, buf.as_str());
-    let right_x = screen_w - x_inset;
 
     fonts::draw_at(
         display, &font, buf.as_str(),
@@ -266,59 +281,75 @@ pub fn draw_overlay_chrome<D: BlendTarget>(
             data.power.battery_percent,
             tint,
             APP_STATUS_X_INSET,
+            &data.safe_area,
         );
     }
-    if ctx.intersects_y(OVERLAY_TITLE_Y - 8, OVERLAY_TITLE_Y + 24) {
+    let title_y = overlay_title_y(&data.safe_area);
+    if ctx.intersects_y(title_y - 8, title_y + 24) {
         let panel_h = theme::SCREEN_H as i32;
-        let left_pad = data.safe_area.left_pad(pad, OVERLAY_TITLE_Y + 4, panel_h);
-        let right_pad = data.safe_area.right_pad(pad, OVERLAY_TITLE_Y + 4, panel_h);
+        let left_pad = data.safe_area.left_pad(pad, title_y + 4, panel_h);
+        let right_pad = data.safe_area.right_pad(pad, title_y + 4, panel_h);
         fonts::draw_at(
             display, &fonts::value(), title,
-            left_pad, OVERLAY_TITLE_Y - 8,
+            left_pad, title_y - 8,
             tint,
         );
         fonts::draw_right(
             display, &fonts::caption(), right_caption,
-            theme::SCREEN_W as i32 - right_pad, OVERLAY_TITLE_Y,
+            theme::SCREEN_W as i32 - right_pad, title_y,
             theme::FG_MUTED,
         );
     }
-    if ctx.intersects_y(APP_HOME_BAR_Y, APP_HOME_BAR_Y + HOME_INDICATOR_H) {
-        home_indicator(display, APP_HOME_BAR_Y, theme::ACCENT);
+    let bar_y = app_home_bar_y(&data.safe_area);
+    if ctx.intersects_y(bar_y, bar_y + HOME_INDICATOR_H) {
+        home_indicator(display, bar_y, theme::ACCENT);
     }
 }
 
-/// Y of the top status bar in standard app chrome.
+/// Y of the top status bar in standard app chrome (before the
+/// per-device top inset is applied).
 pub const APP_STATUS_Y: i32 = 0;
 
+// The rest of the top stack DERIVES from the device's safe area:
+// the case lip is a raised wall, so its occlusion moves with viewing
+// angle - the declared insets are comfort values for real angles,
+// and everything below the status bar follows them. Boards with a
+// zero safe area get exactly the legacy constants.
+
+/// Top of the app header bar: status bar (shifted by the top inset)
+/// plus an 8 px gap.
+pub fn app_header_top(safe: &crate::data::SafeArea) -> i32 {
+    APP_STATUS_Y + safe.top + STATUS_BAR_H + 8
+}
+
+/// First content row below the app header.
+pub fn app_content_top(safe: &crate::data::SafeArea) -> i32 {
+    app_header_top(safe) + HEADER_H + 8
+}
+
+/// Y of the bottom home-indicator bar, lifted by the bottom inset.
+pub fn app_home_bar_y(safe: &crate::data::SafeArea) -> i32 {
+    theme::SCREEN_H as i32 - 18 - safe.bottom
+}
+
 /// Anchor row of an overlay's title band (drawer, quick access):
-/// title ink top sits at `OVERLAY_TITLE_Y - 8`, the right caption's
-/// top at `OVERLAY_TITLE_Y`.
-pub const OVERLAY_TITLE_Y: i32 = APP_STATUS_Y + STATUS_BAR_H + 26;
+/// title ink top sits at `overlay_title_y - 8`, the right caption's
+/// top at `overlay_title_y`.
+pub fn overlay_title_y(safe: &crate::data::SafeArea) -> i32 {
+    APP_STATUS_Y + safe.top + STATUS_BAR_H + 26
+}
 
 /// Horizontal inset for status-bar content. Picked to keep the time
 /// glyph and battery glyphs clear of the bezel arc at the status
 /// bar's y-band.
 pub const APP_STATUS_X_INSET: i32 = 85;
 
-/// Top of the Nightwatch header bar in standard app chrome. Sits
-/// 8 px below the status bar so the two read as separated rather
-/// than adjacent.
-pub const APP_HEADER_TOP: i32 = APP_STATUS_Y + STATUS_BAR_H + 8;
-
-/// Y of the bottom home-indicator bar in standard app chrome.
-pub const APP_HOME_BAR_Y: i32 = theme::SCREEN_H as i32 - 18;
-
-/// Y at which content rows / panels can start below the standard
-/// app header (header bottom + 8 px breathing room).
-pub const APP_CONTENT_TOP: i32 = APP_HEADER_TOP + HEADER_H + 8;
-
 /// Header rect used by [`draw_app_chrome`] and back-chevron hit
 /// testing. Full screen width; the header widget pads its own
 /// content away from the bezel arc internally.
-pub const fn app_header_rect() -> Rectangle {
+pub fn app_header_rect(safe: &crate::data::SafeArea) -> Rectangle {
     Rectangle::new(
-        Point::new(0, APP_HEADER_TOP),
+        Point::new(0, app_header_top(safe)),
         Size::new(theme::SCREEN_W as u32, HEADER_H as u32),
     )
 }
@@ -351,22 +382,25 @@ pub fn draw_app_chrome<D: BlendTarget>(
             data.power.battery_percent,
             accent,
             APP_STATUS_X_INSET,
+            &data.safe_area,
         );
     }
-    if ctx.intersects_y(APP_HEADER_TOP, APP_HEADER_TOP + HEADER_H) {
+    let hdr_top = app_header_top(&data.safe_area);
+    if ctx.intersects_y(hdr_top, hdr_top + HEADER_H) {
         header(
             display,
-            corner_safe_header_rect(app_header_rect(), &data.safe_area),
+            corner_safe_header_rect(app_header_rect(&data.safe_area), &data.safe_area),
             title, telemetry, accent,
         );
     }
-    if ctx.intersects_y(APP_HOME_BAR_Y, APP_HOME_BAR_Y + HOME_INDICATOR_H) {
-        home_indicator(display, APP_HOME_BAR_Y, theme::ACCENT);
+    let bar_y = app_home_bar_y(&data.safe_area);
+    if ctx.intersects_y(bar_y, bar_y + HOME_INDICATOR_H) {
+        home_indicator(display, bar_y, theme::ACCENT);
     }
 }
 
 /// Hit test for the back chevron of the standard app chrome.
-pub fn app_chrome_back_hit(x: u16, y: u16) -> bool {
-    header_icon_hit(x, y, app_header_rect())
+pub fn app_chrome_back_hit(x: u16, y: u16, safe: &crate::data::SafeArea) -> bool {
+    header_icon_hit(x, y, app_header_rect(safe))
 }
 

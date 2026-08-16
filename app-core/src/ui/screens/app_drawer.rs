@@ -30,7 +30,7 @@ use core::fmt::Write;
 use crate::events::{SwipeDir, SystemEvent};
 use crate::ui::{glyphs, theme};
 use crate::ui::types::{Action, RenderCtx, Screen, ScreenId, SystemData};
-use crate::ui::widgets::{draw_overlay_chrome, tile, APP_HOME_BAR_Y, OVERLAY_TITLE_Y};
+use crate::ui::widgets::{app_home_bar_y, draw_overlay_chrome, overlay_title_y, tile};
 
 // -- Icon dispatch -----------------------------------------------------------
 //
@@ -108,20 +108,24 @@ const TILES: [TileDef; 9] = [
 
 // -- Layout constants --------------------------------------------------------
 
-const GRID_TOP: i32 = OVERLAY_TITLE_Y + 34;
+fn grid_top(safe: &crate::data::SafeArea) -> i32 {
+    overlay_title_y(safe) + 34
+}
 const GRID_PAD_X: i32 = 24;
 const GRID_GAP: i32 = 8;
 
-const GRID_BOTTOM: i32 = APP_HOME_BAR_Y - 24;
+fn grid_bottom(safe: &crate::data::SafeArea) -> i32 {
+    app_home_bar_y(safe) - 24
+}
 
-fn tile_rect(row: usize, col: usize) -> Rectangle {
+fn tile_rect(row: usize, col: usize, safe: &crate::data::SafeArea) -> Rectangle {
     let total_w = theme::SCREEN_W as i32 - GRID_PAD_X * 2;
     let tile_w = (total_w - GRID_GAP * 2) / 3;
-    let total_h = GRID_BOTTOM - GRID_TOP;
+    let total_h = grid_bottom(safe) - grid_top(safe);
     let tile_h = (total_h - GRID_GAP * 2) / 3;
 
     let x = GRID_PAD_X + col as i32 * (tile_w + GRID_GAP);
-    let y = GRID_TOP + row as i32 * (tile_h + GRID_GAP);
+    let y = grid_top(safe) + row as i32 * (tile_h + GRID_GAP);
     Rectangle::new(
         Point::new(x, y),
         Size::new(tile_w as u32, tile_h as u32),
@@ -171,7 +175,7 @@ impl Screen for AppDrawerScreen {
         for (i, t) in TILES.iter().enumerate() {
             let row = i / 3;
             let col = i % 3;
-            let rect = tile_rect(row, col);
+            let rect = tile_rect(row, col, &data.safe_area);
 
             let is_active = t.target == Some(self.previous);
 
@@ -208,7 +212,7 @@ impl Screen for AppDrawerScreen {
 
     }
 
-    fn on_event(&mut self, event: &SystemEvent, _data: &mut SystemData) -> Action {
+    fn on_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
             SystemEvent::PowerButtonLong => Action::Shutdown,
 
@@ -224,7 +228,7 @@ impl Screen for AppDrawerScreen {
                 for (i, t) in TILES.iter().enumerate() {
                     let row = i / 3;
                     let col = i % 3;
-                    if !tile_rect(row, col).contains(pt) { continue; }
+                    if !tile_rect(row, col, &data.safe_area).contains(pt) { continue; }
                     if let Some(target) = t.target {
                         return Action::SwitchScreen(target);
                     }

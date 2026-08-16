@@ -37,7 +37,8 @@ use crate::ui::widgets::{
     APP_STATUS_X_INSET,
     corner_safe_header_rect,
     app_chrome_back_hit, app_header_rect, chamfered_panel, handle_scroll_drag, header,
-    render_scrolled, status_bar, APP_CONTENT_TOP, APP_HOME_BAR_Y, SCROLLBAR_GUTTER,
+    app_content_top, app_home_bar_y, render_scrolled, status_bar,
+    SCROLLBAR_GUTTER,
 };
 
 /// Per-screen accent. Yellow == warning per spec ("ALERTS" header
@@ -121,20 +122,21 @@ impl Screen for NotificationsScreen {
             data.power.battery_percent,
             ACCENT,
             APP_STATUS_X_INSET,
+            &data.safe_area,
         );
         header(
             display,
-            corner_safe_header_rect(app_header_rect(), &data.safe_area),
+            corner_safe_header_rect(app_header_rect(&data.safe_area), &data.safe_area),
             "ALERTS", tele.as_str(), ACCENT,
         );
 
         if data.notifications.entries.is_empty() {
             // Empty state: centered caption inside the content band.
             let body = Rectangle::new(
-                Point::new(0, APP_CONTENT_TOP),
+                Point::new(0, app_content_top(&data.safe_area)),
                 Size::new(
                     theme::SCREEN_W as u32,
-                    (APP_HOME_BAR_Y - APP_CONTENT_TOP) as u32,
+                    (app_home_bar_y(&data.safe_area) - app_content_top(&data.safe_area)) as u32,
                 ),
             );
             fonts::draw_centered_in_rect(
@@ -151,13 +153,13 @@ impl Screen for NotificationsScreen {
         render_scrolled(
             display,
             self.list_scroll.offset(),
-            list_viewport_rect(),
+            list_viewport_rect(&data.safe_area),
             list_content_h(entries.len()),
             ACCENT,
             ctx,
             |clipped, scroll| {
                 for (row_idx, n) in entries.iter().rev().enumerate() {
-                    render_row(clipped, n, row_idx, scroll);
+                    render_row(clipped, n, row_idx, scroll, &data.safe_area);
                 }
             },
         );
@@ -168,7 +170,7 @@ impl Screen for NotificationsScreen {
             SystemEvent::PowerButtonLong => Action::Shutdown,
 
             // Header chevron == back.
-            SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y) => Action::Back,
+            SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y, &data.safe_area) => Action::Back,
 
             // Swipe-left starting on an alarm row snoozes that row.
             // Anywhere else (header, gaps, timer rows) closes the
@@ -202,7 +204,7 @@ impl Screen for NotificationsScreen {
 
             // Drag scroll on the list.
             SystemEvent::TouchPressed { .. } | SystemEvent::TouchReleased => {
-                let viewport_h = list_viewport_rect().size.height as i32;
+                let viewport_h = list_viewport_rect(&data.safe_area).size.height as i32;
                 let content_h = list_content_h(data.notifications.entries.len());
                 if handle_scroll_drag(
                     &mut self.list_scroll, event, viewport_h, content_h,
@@ -221,7 +223,7 @@ impl Screen for NotificationsScreen {
                 if let Some(vec_idx) = vec_index_at_y(py, data, scroll) {
                     let entry = &data.notifications.entries[vec_idx];
                     let row_idx = data.notifications.entries.len() - 1 - vec_idx;
-                    let row = row_rect(row_idx, scroll);
+                    let row = row_rect(row_idx, scroll, &data.safe_area);
                     let on_snooze_hint = entry.source == NotificationSource::Alarm
                         && rect_hit(snooze_hint_rect(row), px, py);
                     let gesture = if on_snooze_hint {
@@ -283,8 +285,9 @@ fn snooze_hint_rect(row: Rectangle) -> Rectangle {
 
 fn render_row<D: BlendTarget>(
     display: &mut D, n: &Notification, row_idx: usize, scroll: i32,
+    safe: &crate::data::SafeArea,
 ) {
-    let rect = row_rect(row_idx, scroll);
+    let rect = row_rect(row_idx, scroll, safe);
     let color = severity_color(n.severity);
 
     chamfered_panel(display, rect, ROW_NOTCH, color, 1);
@@ -354,8 +357,8 @@ fn severity_color(sev: NotificationSeverity) -> Color {
 
 /// Rect for the row at display index `row_idx` (0 = newest, top of
 /// list), shifted by the scroll offset.
-fn row_rect(row_idx: usize, scroll: i32) -> Rectangle {
-    let y = APP_CONTENT_TOP + LIST_TOP_PAD + row_idx as i32 * ROW_STEP - scroll;
+fn row_rect(row_idx: usize, scroll: i32, safe: &crate::data::SafeArea) -> Rectangle {
+    let y = app_content_top(safe) + LIST_TOP_PAD + row_idx as i32 * ROW_STEP - scroll;
     Rectangle::new(
         Point::new(SIDE_MARGIN, y),
         Size::new(
@@ -367,9 +370,9 @@ fn row_rect(row_idx: usize, scroll: i32) -> Rectangle {
 
 /// Visible viewport rect for the row list. Spans from just below
 /// the header hairline to just above the home indicator.
-fn list_viewport_rect() -> Rectangle {
-    let top = APP_CONTENT_TOP;
-    let bot = APP_HOME_BAR_Y - 4;
+fn list_viewport_rect(safe: &crate::data::SafeArea) -> Rectangle {
+    let top = app_content_top(safe);
+    let bot = app_home_bar_y(safe) - 4;
     Rectangle::new(
         Point::new(0, top),
         Size::new(theme::SCREEN_W as u32, (bot - top) as u32),
@@ -389,14 +392,14 @@ fn vec_index_at_y(y: i32, data: &SystemData, scroll: i32) -> Option<usize> {
     if entries.is_empty() {
         return None;
     }
-    let viewport = list_viewport_rect();
+    let viewport = list_viewport_rect(&data.safe_area);
     if y < viewport.top_left.y
         || y >= viewport.top_left.y + viewport.size.height as i32
     {
         return None;
     }
     for row_idx in 0..entries.len() {
-        let r = row_rect(row_idx, scroll);
+        let r = row_rect(row_idx, scroll, &data.safe_area);
         let ry = r.top_left.y;
         if y >= ry && y < ry + r.size.height as i32 {
             // Display row 0 = last vec entry (newest first).

@@ -199,7 +199,12 @@ impl Screen for ClockScreen {
             region.add(HERO_HH_RECT);
         }
         if prev.day != data.time.day || prev.month != data.time.month {
-            region.add(TELEMETRY_RECT);
+            // The strip renders shifted down by the device's top
+            // inset; grow the region accordingly so the repaint
+            // covers it on inset boards.
+            let mut r = TELEMETRY_RECT;
+            r.size.height += data.safe_area.top as u32;
+            region.add(r);
         }
         if prev.timer_secs != data.timer.remaining().as_secs() {
             region.add(BOTTOM_RECT);
@@ -295,24 +300,23 @@ fn draw_telemetry_strip<D: BlendTarget>(
 ) {
     let font = fonts::caption();
 
-    // The strip sits inside the case's top corner arcs on some
-    // devices - widen the pads to whatever the aperture needs at
-    // this height (no-ops on boards without corner data).
-    // HARDWARE-VERIFIED CLEARANCE - do not "unify" onto the +2
-    // helper margin: the telemetry strip sits higher in the corner
-    // arc than the overlay titles, and the +2 margin clips on the
-    // T-Watch case (regressed once, 2026-08-15). The +6 here is the
-    // flash-verified value.
+    // The strip is the face's topmost element: it shifts down by the
+    // device's top inset (angle clearance for the raised case lip),
+    // and its side pads widen to clear the corner arcs at that
+    // height. HARDWARE-VERIFIED CLEARANCE - do not "unify" onto the
+    // +2 helper margin: the +2 margin clipped on the T-Watch case
+    // (regressed once, 2026-08-15); +6 is the flash-verified value.
     let panel_h = theme::SCREEN_H as i32;
-    let left_pad = PAD_X.max(data.safe_area.left_inset_at(TELE_Y + 6, panel_h) + 6);
-    let right_pad = PAD_X.max(data.safe_area.right_inset_at(TELE_Y + 6, panel_h) + 6);
+    let tele_y = TELE_Y + data.safe_area.top;
+    let left_pad = PAD_X.max(data.safe_area.left_inset_at(tele_y + 6, panel_h) + 6);
+    let right_pad = PAD_X.max(data.safe_area.right_inset_at(tele_y + 6, panel_h) + 6);
 
     // Left: SYS-ID code. Static filler per the spec - no real
     // telemetry to report yet.
     fonts::draw_at(
         display, &font,
         "SYS-ID 232.29CB.98B",
-        left_pad, TELE_Y,
+        left_pad, tele_y,
         theme::INFO,
     );
 
@@ -331,7 +335,7 @@ fn draw_telemetry_strip<D: BlendTarget>(
     fonts::draw_right(
         display, &font,
         buf.as_str(),
-        theme::SCREEN_W as i32 - right_pad, TELE_Y,
+        theme::SCREEN_W as i32 - right_pad, tele_y,
         theme::FG_MUTED,
     );
 }

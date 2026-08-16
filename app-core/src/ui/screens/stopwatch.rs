@@ -44,7 +44,7 @@ use crate::ui::{fmt, fonts, layout, theme};
 use crate::ui::types::{Action, DirtyRegion, RenderCtx, Screen, StopwatchState, SystemData};
 use crate::ui::widgets::{
     app_chrome_back_hit, chamfered_button, chamfered_panel, draw_app_chrome,
-    tag_label, ButtonVariant, APP_CONTENT_TOP, NOTCH, STATUS_BAR_H, TAG_LABEL_H,
+    tag_label, app_content_top, ButtonVariant, NOTCH, STATUS_BAR_H, TAG_LABEL_H,
 };
 
 // -- Constants ---------------------------------------------------------------
@@ -72,8 +72,10 @@ const READOUT_BUTTON_GAP: i32 = 8;
 /// Y of the readout panel's top edge - vertically centred between
 /// the header bottom and the action row top so the panel sits in
 /// the optical middle of the bezel-safe band.
-const READOUT_TOP: i32 = APP_CONTENT_TOP
-    + (layout::BOTTOM_TILE_Y - READOUT_BUTTON_GAP - APP_CONTENT_TOP - READOUT_H) / 2;
+fn readout_top(safe: &crate::data::SafeArea) -> i32 {
+    let ct = app_content_top(safe);
+    ct + (layout::BOTTOM_TILE_Y - READOUT_BUTTON_GAP - ct - READOUT_H) / 2
+}
 
 // -- Dirty rects -------------------------------------------------------------
 //
@@ -84,19 +86,23 @@ const READOUT_TOP: i32 = APP_CONTENT_TOP
 /// Top status bar - `HH:MM` + battery%. Repaints on the minute roll or
 /// a battery-percent change so the clock stays live while the
 /// stopwatch counts.
-const STATUS_RECT: Rectangle = Rectangle::new(
-    Point::new(0, 0),
-    Size::new(theme::SCREEN_W as u32, (STATUS_BAR_H + 4) as u32),
-);
+fn status_rect(safe: &crate::data::SafeArea) -> Rectangle {
+    Rectangle::new(
+        Point::new(0, 0),
+        Size::new(theme::SCREEN_W as u32, (safe.top + STATUS_BAR_H + 4) as u32),
+    )
+}
 /// Readout panel - the `HH:MM:SS` hero numerals. Repaints when the
 /// displayed second changes.
-const READOUT_RECT: Rectangle = Rectangle::new(
-    Point::new(SIDE_MARGIN, READOUT_TOP),
-    Size::new(
-        (theme::SCREEN_W as i32 - SIDE_MARGIN * 2) as u32,
-        READOUT_H as u32,
-    ),
-);
+fn readout_rect(safe: &crate::data::SafeArea) -> Rectangle {
+    Rectangle::new(
+        Point::new(SIDE_MARGIN, readout_top(safe)),
+        Size::new(
+            (theme::SCREEN_W as i32 - SIDE_MARGIN * 2) as u32,
+            READOUT_H as u32,
+        ),
+    )
+}
 /// Bottom action row - START/PAUSE label and the RESET button variant.
 /// Repaints only on a run-state edge or the zero<->non-zero edge, not
 /// every second.
@@ -151,7 +157,7 @@ impl Screen for StopwatchScreen {
         draw_app_chrome(display, data, "STOPWATCH", TELEMETRY, ACCENT, ctx);
 
         // -- Readout panel -------------------------------------------------
-        let panel = READOUT_RECT;
+        let panel = readout_rect(&data.safe_area);
         chamfered_panel(display, panel, NOTCH, ACCENT, 1);
         tag_label(
             display,
@@ -227,7 +233,7 @@ impl Screen for StopwatchScreen {
             }
 
             // Header back chevron: pop the nav stack.
-            SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y, &data.safe_area) => {
                 Action::Back
             }
 
@@ -277,7 +283,7 @@ impl Screen for StopwatchScreen {
 
         let mut region = DirtyRegion::empty();
         if prev.elapsed_secs != data.stopwatch.elapsed().as_secs() {
-            region.add(READOUT_RECT);
+            region.add(readout_rect(&data.safe_area));
         }
         let zero = data.stopwatch.elapsed().as_secs() == 0;
         if prev.running != data.stopwatch.is_running() || prev.zero != zero {
@@ -286,7 +292,7 @@ impl Screen for StopwatchScreen {
         if prev.minute != data.time.minute
             || prev.battery_pct != data.power.battery_percent
         {
-            region.add(STATUS_RECT);
+            region.add(status_rect(&data.safe_area));
         }
         region
     }

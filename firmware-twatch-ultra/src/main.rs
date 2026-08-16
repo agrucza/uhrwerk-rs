@@ -498,14 +498,20 @@ impl Bringup for TwatchUltraBringup {
         app_core::data::Capabilities { gps: true, steps: true }
     }
 
-    /// The watch case's molded lip overhangs the panel: bezel-ruler
-    /// probe 2026-08-15 measured ~5-8 px swallowed on the top and
-    /// both sides, ~1-4 px at the bottom (the Waveshare boards'
-    /// printed-glass bezels mask nothing that matters and keep the
-    /// zero default).
+    /// The watch case's molded lip overhangs the panel: the
+    /// bezel-ruler probe (2026-08-15) measured ~5-8 px swallowed on
+    /// top and sides, ~1-4 px at the bottom. The lip is a raised
+    /// wall, so at real wrist viewing angles its occlusion sweeps
+    /// further in HORIZONTALLY - the top band's content loses its
+    /// left/right ends near the corners (user-observed). So: top and
+    /// bottom stay at the measured minimums (vertical positions
+    /// unchanged), while LEFT/RIGHT carry angle-comfort values that
+    /// pull top-band content inward from the corners. (The Waveshare
+    /// boards' bezels are printed on the glass - no parallax - and
+    /// keep the zero default.)
     fn safe_area(&self) -> app_core::data::SafeArea {
         app_core::data::SafeArea {
-            top: 8, bottom: 4, left: 8, right: 8,
+            top: 8, bottom: 4, left: 16, right: 16,
             // Derived from the clock-telemetry clipping (~42 px
             // intrusion at y=34): a circular arc of r=112 inside
             // the visible glass reproduces it.

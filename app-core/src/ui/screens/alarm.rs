@@ -44,7 +44,7 @@ use crate::ui::widgets::{
     action_row_rects, app_chrome_back_hit, chamfered_panel, draw_app_chrome, fmt_2digit,
     handle_scroll_drag, render_action_row, render_scrolled, tag_label, toggle,
     Picker, Wheel,
-    APP_CONTENT_TOP, APP_HOME_BAR_Y, NOTCH,
+    app_content_top, app_home_bar_y, NOTCH,
     TOGGLE_H, TOGGLE_W, WHEEL_TOTAL_H,
 };
 
@@ -80,7 +80,9 @@ const ROW_STEP: i32 = ROW_H + ROW_GAP;
 // -- Edit view layout --------------------------------------------------------
 
 /// Top y of the day-chip row.
-const DAY_ROW_TOP: i32 = APP_CONTENT_TOP + 18;
+fn day_row_top(safe: &crate::data::SafeArea) -> i32 {
+    app_content_top(safe) + 18
+}
 
 /// Height of one day chip.
 const DAY_CHIP_H: i32 = 24;
@@ -109,7 +111,9 @@ const DAY_BIT: [u8; 7] = [1, 2, 3, 4, 5, 6, 0];
 
 /// Top y of the HH:MM wheel picker. Picks up below the day chip
 /// row with comfortable breathing room.
-const PICKER_TOP: i32 = APP_CONTENT_TOP + 90;
+fn picker_top(safe: &crate::data::SafeArea) -> i32 {
+    app_content_top(safe) + 90
+}
 
 /// Width of one wheel column.
 const PICKER_COL_W: i32 = 80;
@@ -203,7 +207,7 @@ impl AlarmScreen {
         render_scrolled(
             display,
             self.list_scroll.offset(),
-            list_viewport_rect(),
+            list_viewport_rect(&data.safe_area),
             list_content_h(),
             ACCENT,
             ctx,
@@ -219,7 +223,7 @@ impl AlarmScreen {
         &self, display: &mut D, data: &SystemData, entry_idx: usize, scroll: i32,
     ) {
         let entry = &data.config.alarms.entries[entry_idx];
-        let rect = row_rect(entry_idx, scroll);
+        let rect = row_rect(entry_idx, scroll, &data.safe_area);
 
         let border = if entry.enabled { ACCENT } else { theme::BORDER };
         chamfered_panel(display, rect, NOTCH, border, 1);
@@ -291,7 +295,7 @@ impl AlarmScreen {
 
     fn list_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
-            SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y, &data.safe_area) => {
                 Action::Back
             }
 
@@ -299,7 +303,7 @@ impl AlarmScreen {
             // helper so screen code stays focused on hit-testing
             // rather than re-implementing scroll mechanics.
             SystemEvent::TouchPressed { .. } | SystemEvent::TouchReleased => {
-                let viewport_h = list_viewport_rect().size.height as i32;
+                let viewport_h = list_viewport_rect(&data.safe_area).size.height as i32;
                 if handle_scroll_drag(
                     &mut self.list_scroll, event, viewport_h, list_content_h(),
                 ) {
@@ -310,7 +314,7 @@ impl AlarmScreen {
 
             SystemEvent::Tap { x, y } => {
                 let scroll = self.list_scroll.offset();
-                let viewport = list_viewport_rect();
+                let viewport = list_viewport_rect(&data.safe_area);
                 let py = *y as i32;
                 if py < viewport.top_left.y
                     || py >= viewport.top_left.y + viewport.size.height as i32
@@ -318,7 +322,7 @@ impl AlarmScreen {
                     return Action::None;
                 }
                 for idx in 0..MAX_ALARMS {
-                    let rect = row_rect(idx, scroll);
+                    let rect = row_rect(idx, scroll, &data.safe_area);
                     if !rect_hit(rect, *x, *y) { continue; }
 
                     // Toggle hit zone: rightmost ~60 px so the user
@@ -359,14 +363,14 @@ impl AlarmScreen {
         draw_app_chrome(display, data, "EDIT ALARM", tele_buf.as_str(), ACCENT, ctx);
 
         // Day chip row.
-        let chips = day_chip_rects();
+        let chips = day_chip_rects(&data.safe_area);
         for (i, rect) in chips.iter().enumerate() {
             let active = (self.edit_days & (1 << DAY_BIT[i])) != 0;
             day_chip(display, *rect, DAY_LABELS[i], active);
         }
 
         // HH:MM wheel picker.
-        let cells = picker_cell_rects();
+        let cells = picker_cell_rects(&data.safe_area);
         self.time_picker.wheels[0].render(display, cells[0], ACCENT, fmt_2digit);
         self.time_picker.wheels[1].render(display, cells[1], ACCENT, fmt_2digit);
 
@@ -394,7 +398,7 @@ impl AlarmScreen {
         match event {
             // Header chevron: discard edit, return to list. Same as
             // tapping CANCEL.
-            SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y) => {
+            SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y, &data.safe_area) => {
                 self.view = AlarmView::List;
                 Action::Redraw
             }
@@ -402,7 +406,7 @@ impl AlarmScreen {
             SystemEvent::Tap { x, y } => {
                 // Day chips first - small targets with the highest
                 // mis-tap risk if the wheel below catches them.
-                let chips = day_chip_rects();
+                let chips = day_chip_rects(&data.safe_area);
                 for (i, rect) in chips.iter().enumerate() {
                     if rect_hit(*rect, *x, *y) {
                         self.edit_days ^= 1 << DAY_BIT[i];
@@ -430,7 +434,7 @@ impl AlarmScreen {
                 }
 
                 // Picker tap-step (above/below center band).
-                let cells = picker_cell_rects();
+                let cells = picker_cell_rects(&data.safe_area);
                 if self.time_picker.handle_event(event, &cells) {
                     return Action::Redraw;
                 }
@@ -439,7 +443,7 @@ impl AlarmScreen {
 
             // Drag scroll on the wheels.
             SystemEvent::TouchPressed { .. } | SystemEvent::TouchReleased => {
-                let cells = picker_cell_rects();
+                let cells = picker_cell_rects(&data.safe_area);
                 if self.time_picker.handle_event(event, &cells) {
                     return Action::Redraw;
                 }
@@ -453,14 +457,14 @@ impl AlarmScreen {
 
 /// Rect for each of the 7 day chips, evenly split across the
 /// content band with [`DAY_CHIP_GAP`] between them.
-fn day_chip_rects() -> [Rectangle; 7] {
+fn day_chip_rects(safe: &crate::data::SafeArea) -> [Rectangle; 7] {
     let inner_w = theme::SCREEN_W as i32 - SIDE_MARGIN * 2;
     let chip_w = (inner_w - 6 * DAY_CHIP_GAP) / 7;
     core::array::from_fn(|i| {
         Rectangle::new(
             Point::new(
                 SIDE_MARGIN + i as i32 * (chip_w + DAY_CHIP_GAP),
-                DAY_ROW_TOP,
+                day_row_top(safe),
             ),
             Size::new(chip_w as u32, DAY_CHIP_H as u32),
         )
@@ -478,15 +482,15 @@ fn day_chip<D: BlendTarget>(
 }
 
 /// Per-column rects for the HH:MM wheel picker, centred horizontally.
-fn picker_cell_rects() -> [Rectangle; 2] {
+fn picker_cell_rects(safe: &crate::data::SafeArea) -> [Rectangle; 2] {
     let start_x = (theme::SCREEN_W as i32 - PICKER_TOTAL_W) / 2;
     [
         Rectangle::new(
-            Point::new(start_x, PICKER_TOP),
+            Point::new(start_x, picker_top(safe)),
             Size::new(PICKER_COL_W as u32, WHEEL_TOTAL_H as u32),
         ),
         Rectangle::new(
-            Point::new(start_x + PICKER_COL_W + PICKER_GAP, PICKER_TOP),
+            Point::new(start_x + PICKER_COL_W + PICKER_GAP, picker_top(safe)),
             Size::new(PICKER_COL_W as u32, WHEEL_TOTAL_H as u32),
         ),
     ]
@@ -498,8 +502,8 @@ fn picker_cell_rects() -> [Rectangle; 2] {
 /// scrollable area, shifted by the current scroll offset. `scroll = 0`
 /// gives natural positioning; positive `scroll` moves rows upward as
 /// the user pulls up.
-fn row_rect(idx: usize, scroll: i32) -> Rectangle {
-    let y = APP_CONTENT_TOP + LIST_TOP_PAD + idx as i32 * ROW_STEP - scroll;
+fn row_rect(idx: usize, scroll: i32, safe: &crate::data::SafeArea) -> Rectangle {
+    let y = app_content_top(safe) + LIST_TOP_PAD + idx as i32 * ROW_STEP - scroll;
     Rectangle::new(
         Point::new(SIDE_MARGIN, y),
         Size::new(
@@ -513,9 +517,9 @@ fn row_rect(idx: usize, scroll: i32) -> Rectangle {
 /// the header hairline to just above the home-indicator bar; the row
 /// list renders into a clipped sub-target of this rect so off-screen
 /// rows are hardware-clipped.
-fn list_viewport_rect() -> Rectangle {
-    let top = APP_CONTENT_TOP;
-    let bot = APP_HOME_BAR_Y - 4;
+fn list_viewport_rect(safe: &crate::data::SafeArea) -> Rectangle {
+    let top = app_content_top(safe);
+    let bot = app_home_bar_y(safe) - 4;
     Rectangle::new(
         Point::new(0, top),
         Size::new(theme::SCREEN_W as u32, (bot - top) as u32),
