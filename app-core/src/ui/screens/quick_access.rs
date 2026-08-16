@@ -6,7 +6,8 @@
 //! stubs until their underlying drivers land.
 //!
 //! Layout (410x502 canvas):
-//! - Top row: `QUICK.ACCESS` title in cyan + `↓ PULL` telemetry hint.
+//! - Top band: centered `QUICK.ACCESS` title in cyan, centered
+//!   `^ CLOSE ^` swipe hint beneath it (overlay chrome).
 //! - Brightness section: `BRIGHTNESS` label and a clickable /
 //!   draggable horizontal slider with right-aligned value readout.
 //! - Toggle grid: 4 across x 2 rows = 8 tiles, each with an icon
@@ -151,8 +152,10 @@ const TILES: [TileDef; 8] = [
 const PAD_X: i32 = 22;
 
 /// Brightness bar block.
+// Title band grew a centered caption line beneath it - the section
+// stack starts below the caption's ink (title_y + 32).
 fn bright_label_y(safe: &crate::data::SafeArea) -> i32 {
-    overlay_title_y(safe) + 46
+    overlay_title_y(safe) + 56
 }
 fn bright_bar_y(safe: &crate::data::SafeArea) -> i32 {
     bright_label_y(safe) + 26
@@ -232,8 +235,8 @@ impl Screen for QuickAccessScreen {
     ) {
         draw_overlay_chrome(
             display, data,
-            "QUICK.ACCESS", "v PULL",
-            theme::INFO, PAD_X,
+            "QUICK.ACCESS", "^ CLOSE ^",
+            theme::INFO,
             ctx,
         );
 

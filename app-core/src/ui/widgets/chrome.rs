@@ -259,17 +259,18 @@ pub fn home_indicator<D: BlendTarget>(
 
 /// Overlay chrome - the counterpart of [`draw_app_chrome`] for the
 /// overlay screens (app drawer, quick access): tinted status bar,
-/// big left title + muted right caption on the shared
-/// [`OVERLAY_TITLE_Y`] band (corner-aware pads), and the standard
-/// home indicator. No chevron header, no hairline - that's the
-/// overlays' deliberate look.
+/// centered title with a muted centered caption beneath it on the
+/// shared [`overlay_title_y`] band, and the standard home
+/// indicator. No chevron header, no hairline - that's the overlays'
+/// deliberate look. Centered because overlays are transient sheets,
+/// not apps: no back chevron to anchor a left edge, and the center
+/// is immune to the case corner arcs on every board.
 pub fn draw_overlay_chrome<D: BlendTarget>(
     display: &mut D,
     data: &SystemData,
     title: &str,
-    right_caption: &str,
+    caption: &str,
     tint: Color,
-    pad: i32,
     ctx: &crate::ui::types::RenderCtx,
 ) {
     let top = data.safe_area.top;
@@ -285,18 +286,16 @@ pub fn draw_overlay_chrome<D: BlendTarget>(
         );
     }
     let title_y = overlay_title_y(&data.safe_area);
-    if ctx.intersects_y(title_y - 8, title_y + 24) {
-        let panel_h = theme::SCREEN_H as i32;
-        let left_pad = data.safe_area.left_pad(pad, title_y + 4, panel_h);
-        let right_pad = data.safe_area.right_pad(pad, title_y + 4, panel_h);
-        fonts::draw_at(
+    if ctx.intersects_y(title_y - 8, title_y + 34) {
+        let cx = theme::SCREEN_W as i32 / 2;
+        fonts::draw_centered(
             display, &fonts::value(), title,
-            left_pad, title_y - 8,
+            cx, title_y - 8,
             tint,
         );
-        fonts::draw_right(
-            display, &fonts::caption(), right_caption,
-            theme::SCREEN_W as i32 - right_pad, title_y,
+        fonts::draw_centered(
+            display, &fonts::caption(), caption,
+            cx, title_y + 22,
             theme::FG_MUTED,
         );
     }

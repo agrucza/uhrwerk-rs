@@ -8,7 +8,8 @@
 //! screen, not the drawer itself.
 //!
 //! Layout (410x502 canvas):
-//! - Top row: `APPS` title in signal red + `N INSTALLED` telemetry.
+//! - Top band: centered `APPS` title in signal red, centered
+//!   `N INSTALLED` telemetry beneath it (overlay chrome).
 //! - Middle: 3x3 grid of chamfered tiles (per-app accent border +
 //!   uppercase caption).
 //! - Bottom: 2px home-indicator bar in signal red, centered.
@@ -108,8 +109,10 @@ const TILES: [TileDef; 9] = [
 
 // -- Layout constants --------------------------------------------------------
 
+// Title band grew a centered caption line beneath it - the grid
+// starts below the caption's ink (title_y + 32) plus breathing room.
 fn grid_top(safe: &crate::data::SafeArea) -> i32 {
-    overlay_title_y(safe) + 34
+    overlay_title_y(safe) + 44
 }
 const GRID_PAD_X: i32 = 24;
 const GRID_GAP: i32 = 8;
@@ -162,7 +165,7 @@ impl Screen for AppDrawerScreen {
         draw_overlay_chrome(
             display, data,
             "APPS", buf.as_str(),
-            theme::ACCENT, GRID_PAD_X,
+            theme::ACCENT,
             ctx,
         );
 
