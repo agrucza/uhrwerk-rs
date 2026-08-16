@@ -117,6 +117,18 @@ fn bake(role: &Role, font_dir: &Path, out_dir: &Path) {
     let mut glyph_rows = String::new();
     let mut n_glyphs = 0usize;
 
+    // Tabular digits: every ASCII digit gets the role's widest digit
+    // advance with its ink centered in that cell, so ticking readouts
+    // (timers, clocks, counters) don't shift as digits change. The
+    // baked counterpart of `font-variant-numeric: tabular-nums` -
+    // Inter's own `tnum` feature lives in GSUB, which fontdue does
+    // not read.
+    let digit_adv: i32 = ('0'..='9')
+        .filter(|&c| font.lookup_glyph_index(c) != 0)
+        .map(|c| font.metrics(c, px).advance_width.round() as i32)
+        .max()
+        .unwrap_or(0);
+
     for &ch in &chars {
         // Chars the font has no mapping for fall to the notdef glyph;
         // skip those so the runtime's missing-glyph path handles them.
@@ -146,6 +158,12 @@ fn bake(role: &Role, font_dir: &Path, out_dir: &Path) {
         // Bitmap top relative to the baseline in y-down screen coords.
         let top = -(met.ymin + h as i32);
         let left = met.xmin;
+        // Widen digits to the tabular cell (see digit_adv above).
+        let (adv, left) = if ch.is_ascii_digit() {
+            (digit_adv, left + (digit_adv - adv) / 2)
+        } else {
+            (adv, left)
+        };
         if h > 0 {
             descent = descent.max((top + h as i32) as i16);
         }
