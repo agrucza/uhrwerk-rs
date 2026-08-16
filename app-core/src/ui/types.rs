@@ -317,10 +317,12 @@ pub enum TimerState {
     /// Counting down toward a deadline. The embassy Instant is
     /// resynced from RTC time on every TimeUpdated event.
     /// `target_secs` is the absolute target in seconds-since-midnight,
-    /// used for the RTC resync calculation.
-    Running { deadline: Instant, target_secs: u32 },
-    /// Paused with time remaining.
-    Paused { remaining: Duration },
+    /// used for the RTC resync calculation. `total_secs` is the
+    /// duration the countdown was started with - the 100% reference
+    /// for the timer dial, carried through pause/resume unchanged.
+    Running { deadline: Instant, target_secs: u32, total_secs: u32 },
+    /// Paused with time remaining. `total_secs` as in `Running`.
+    Paused { remaining: Duration, total_secs: u32 },
 }
 
 impl TimerState {
@@ -336,7 +338,18 @@ impl TimerState {
                     deadline.duration_since(now)
                 }
             }
-            Self::Paused { remaining } => *remaining,
+            Self::Paused { remaining, .. } => *remaining,
+        }
+    }
+
+    /// The countdown's 100% reference: the started-with duration
+    /// while running/paused, else the set duration (so an idle,
+    /// armed timer reads as full).
+    pub fn total_secs(&self) -> u64 {
+        match self {
+            Self::Idle { duration } => duration.as_secs(),
+            Self::Running { total_secs, .. }
+            | Self::Paused { total_secs, .. } => *total_secs as u64,
         }
     }
 

@@ -6,10 +6,12 @@
 //! - Standard app chrome: status bar (orange-tinted), Nightwatch
 //!   header `TIMER` + `TMR.0001` system-code, signal-red home
 //!   indicator at the bottom.
-//! - Readout panel: orange border, `REMAINING` tag-label TL,
-//!   hero-font `HH:MM:SS` centered. Tappable when not running to
-//!   open the picker. Expiry surfaces in the global Notifications
-//!   overlay - no in-screen flash.
+//! - Countdown dial: a large orange ring gauge that drains from
+//!   full as the countdown runs (remaining vs the started-with
+//!   total; an idle armed timer reads as full). Hero `HH:MM:SS`
+//!   inside with a `REMAINING` caption above it. Tappable when not
+//!   running to open the picker. Expiry surfaces in the global
+//!   Notifications overlay - no in-screen flash.
 //! - Action row: START / PAUSE / RESUME (Primary orange) and
 //!   RESET (Ghost steel when zero, Primary signal-red when there's
 //!   a duration set).
@@ -21,12 +23,12 @@
 //!   MM and SS wrap modularly.
 //! - `CANCEL | SET` action row.
 //!
-//! Tapping the readout in idle/paused opens the picker, seeded
+//! Tapping the dial in idle/paused opens the picker, seeded
 //! with the current duration. Tapping Set validates: if the
 //! chosen total exceeds [`MAX_TIMER_SECS`] the picker stays
-//! open, the wheels reset to the capped value, and the readout
-//! flashes orange↔red so the user can confirm the cap before
-//! committing.
+//! open, the wheels reset to the capped value, and the wheel
+//! accent flashes orange↔red so the user can confirm the cap
+//! before committing.
 
 
 use embassy_time::{Duration, Instant};
@@ -38,14 +40,14 @@ use crate::ui::types::BlendTarget;
 use crate::ui::theme::Color;
 
 use crate::events::SystemEvent;
-use crate::ui::{fmt, fonts, layout, theme};
+use crate::ui::{fonts, layout, theme};
 use crate::ui::types::{Action, DirtyRegion, RenderCtx, Screen, SystemData, TimerState};
 use crate::data::TimeData;
 use crate::ui::widgets::{
-    action_row_rects, app_chrome_back_hit, chamfered_button, chamfered_panel,
-    draw_app_chrome, fmt_2digit, render_action_row, tag_label, ButtonVariant,
+    action_row_rects, app_chrome_back_hit, chamfered_button,
+    draw_app_chrome, fmt_2digit, render_action_row, ring_gauge, ButtonVariant,
     Picker, Wheel,
-    app_content_top, NOTCH, STATUS_BAR_H, TAG_LABEL_H, WHEEL_TOTAL_H,
+    app_content_top, STATUS_BAR_H, WHEEL_TOTAL_H,
 };
 
 // -- Constants ---------------------------------------------------------------
@@ -58,20 +60,23 @@ const ACCENT: Color = theme::MEDIA;
 /// Static system-code shown in the header's right-telemetry slot.
 const TELEMETRY: &str = "TMR.0001";
 
-/// Side margin matching the readout panel in stopwatch / settings.
-const SIDE_MARGIN: i32 = layout::VSTACK_SIDE_MARGIN;
+/// Gap between the dial's bounding box and the action row.
+const DIAL_BUTTON_GAP: i32 = 8;
 
-/// Readout panel height.
-const READOUT_H: i32 = 130;
+/// Countdown dial - the main view's readout. Outer radius fills the
+/// content band (~322 px tall on the watch, 11 px air top and
+/// bottom). The hero readout sits inside the 280 px inner diameter;
+/// its adaptive format (see [`dial_readout`]) is at most ~240 px
+/// wide, leaving >= 17 px to the ring at the numeral rows.
+const DIAL_CX: i32 = theme::SCREEN_W as i32 / 2;
+const DIAL_R: i32 = 150;
+const DIAL_TH: i32 = 10;
 
-/// Gap between the readout's bottom edge and the action row.
-const READOUT_BUTTON_GAP: i32 = 8;
-
-/// Y of the readout panel's top edge - vertically centred between
-/// the header bottom and the action row.
-fn readout_top(safe: &crate::data::SafeArea) -> i32 {
+/// Y of the dial center - the middle of the band between the header
+/// bottom and the action row.
+fn dial_cy(safe: &crate::data::SafeArea) -> i32 {
     let ct = app_content_top(safe);
-    ct + (layout::BOTTOM_TILE_Y - READOUT_BUTTON_GAP - ct - READOUT_H) / 2
+    (ct + layout::BOTTOM_TILE_Y - DIAL_BUTTON_GAP) / 2
 }
 
 /// Top y of the wheel picker. Centered between the header bottom
@@ -81,8 +86,7 @@ fn picker_top(safe: &crate::data::SafeArea) -> i32 {
     ct + (layout::BOTTOM_TILE_Y - ct - WHEEL_TOTAL_H) / 2
 }
 
-/// Width of one wheel column. Three columns plus two gaps span
-/// roughly the same horizontal real estate as the readout panel.
+/// Width of one wheel column.
 const PICKER_COL_W: i32 = 72;
 
 /// Horizontal gap between columns - wide enough to hold the colon
@@ -121,15 +125,14 @@ fn status_rect(safe: &crate::data::SafeArea) -> Rectangle {
         Size::new(theme::SCREEN_W as u32, (safe.top + STATUS_BAR_H + 4) as u32),
     )
 }
-/// Readout panel - the `HH:MM:SS` hero numerals. Repaints when the
-/// displayed second changes. Same geometry as [`readout_rect`].
-fn readout_rect(safe: &crate::data::SafeArea) -> Rectangle {
+/// Dial bounding box - ring, hero numerals and caption included.
+/// Repaints when the displayed second changes (the arc endpoint and
+/// the numerals move together). Also the tap target for opening the
+/// picker.
+fn dial_rect(safe: &crate::data::SafeArea) -> Rectangle {
     Rectangle::new(
-        Point::new(SIDE_MARGIN, readout_top(safe)),
-        Size::new(
-            (theme::SCREEN_W as i32 - SIDE_MARGIN * 2) as u32,
-            READOUT_H as u32,
-        ),
+        Point::new(DIAL_CX - DIAL_R - 4, dial_cy(safe) - DIAL_R - 4),
+        Size::new((DIAL_R * 2 + 8) as u32, (DIAL_R * 2 + 8) as u32),
     )
 }
 /// Bottom action row - START/PAUSE/RESUME label and the RESET button
@@ -157,7 +160,7 @@ enum TimerView {
 /// full-redraw path.
 #[derive(Debug, Clone, Copy)]
 struct RenderedSnapshot {
-    /// Whole remaining seconds at last render - drives the readout.
+    /// Whole remaining seconds at last render - drives the dial.
     remaining_secs: u64,
     /// Timer was in the running state - drives the left button label.
     running: bool,
@@ -239,8 +242,10 @@ impl TimerScreen {
     }
 
     /// Set up the running state: compute target_secs from current
-    /// RTC time and arm the embassy deadline.
-    fn start_countdown(secs: u32, data: &mut SystemData) {
+    /// RTC time and arm the embassy deadline. `total` is the dial's
+    /// 100% reference - the set duration on START, the carried
+    /// original on RESUME.
+    fn start_countdown(secs: u32, total: u32, data: &mut SystemData) {
         let now_secs = data.time.hour as u32 * 3600
             + data.time.minute as u32 * 60
             + data.time.second as u32;
@@ -248,6 +253,7 @@ impl TimerScreen {
         data.timer = TimerState::Running {
             deadline: Instant::now() + Duration::from_secs(secs as u64),
             target_secs,
+            total_secs: total,
         };
     }
 
@@ -286,7 +292,7 @@ impl Screen for TimerScreen {
         // tick. Without this the embassy Instant drifts across light
         // sleep / RTC adjustment.
         if let SystemEvent::TimeUpdated { data: time } = event {
-            if let TimerState::Running { target_secs, .. } = data.timer {
+            if let TimerState::Running { target_secs, total_secs, .. } = data.timer {
                 let remaining = Self::remaining_from_rtc(target_secs, time);
                 if remaining == 0 {
                     data.timer = TimerState::Idle {
@@ -296,6 +302,7 @@ impl Screen for TimerScreen {
                     data.timer = TimerState::Running {
                         deadline: Instant::now() + Duration::from_secs(remaining as u64),
                         target_secs,
+                        total_secs,
                     };
                 }
                 return Action::Redraw;
@@ -323,7 +330,7 @@ impl Screen for TimerScreen {
 
         let mut region = DirtyRegion::empty();
         if prev.remaining_secs != data.timer.remaining().as_secs() {
-            region.add(readout_rect(&data.safe_area));
+            region.add(dial_rect(&data.safe_area));
         }
         let zero = data.timer.remaining().as_secs() == 0;
         if prev.running != data.timer.is_running() || prev.zero != zero {
@@ -355,35 +362,29 @@ impl TimerScreen {
     fn render_main<D: BlendTarget>(&self, display: &mut D, data: &SystemData, ctx: &RenderCtx) {
         draw_app_chrome(display, data, "TIMER", TELEMETRY, ACCENT, ctx);
 
-        // -- Readout panel -------------------------------------------------
-        let panel_color = ACCENT;
-        let panel = readout_rect(&data.safe_area);
-        chamfered_panel(display, panel, NOTCH, panel_color, 1);
-        let tag_text = "REMAINING";
-        tag_label(
-            display,
-            panel.top_left.x,
-            panel.top_left.y,
-            tag_text,
-            panel_color,
-            NOTCH,
+        // -- Countdown dial ------------------------------------------------
+        // Ring drains from full as the countdown runs: remaining vs
+        // the started-with total. Idle with a set duration reads as a
+        // full ring (armed); zero leaves just the track.
+        let remaining = data.timer.remaining().as_secs();
+        let total = data.timer.total_secs();
+        let cy = dial_cy(&data.safe_area);
+        ring_gauge(
+            display, ctx,
+            DIAL_CX, cy, DIAL_R, DIAL_TH,
+            remaining.min(total) as u32, total.max(1) as u32,
+            ACCENT,
+            Some(theme::SURFACE_3),
         );
 
-        let buf = fmt::hms(data.timer.remaining().as_secs());
-
-        let inner_rect = Rectangle::new(
-            Point::new(
-                panel.top_left.x,
-                panel.top_left.y + TAG_LABEL_H,
-            ),
-            Size::new(
-                panel.size.width,
-                panel.size.height - TAG_LABEL_H as u32,
-            ),
+        fonts::draw_centered(
+            display, &fonts::caption(), "REMAINING",
+            DIAL_CX, cy - 46, theme::FG_MUTED,
         );
-        fonts::draw_centered_in_rect(
-            display, &fonts::hero(),
-            buf.as_str(), inner_rect, panel_color,
+        let buf = dial_readout(remaining);
+        fonts::draw_centered(
+            display, &fonts::hero(), buf.as_str(),
+            DIAL_CX, cy - 24, ACCENT,
         );
 
         // -- Action row ----------------------------------------------------
@@ -391,7 +392,7 @@ impl TimerScreen {
 
         let run_label = match data.timer {
             TimerState::Running { .. } => "PAUSE",
-            TimerState::Paused { remaining } if remaining.as_ticks() > 0 => "RESUME",
+            TimerState::Paused { remaining, .. } if remaining.as_ticks() > 0 => "RESUME",
             _ => "START",
         };
         // START is meaningful only when there's a duration to run.
@@ -432,9 +433,9 @@ impl TimerScreen {
                 Action::Back
             }
 
-            // Tap the readout panel (when not running) → picker.
+            // Tap the dial (when not running) → picker.
             SystemEvent::Tap { x, y }
-                if !data.timer.is_running() && rect_hit(readout_rect(&data.safe_area), *x, *y) =>
+                if !data.timer.is_running() && rect_hit(dial_rect(&data.safe_area), *x, *y) =>
             {
                 self.seed_picker_from(data.timer.remaining());
                 self.view = TimerView::Picker;
@@ -447,22 +448,24 @@ impl TimerScreen {
                     match data.timer {
                         TimerState::Idle { duration } if duration.as_ticks() > 0 => {
                             let secs = duration.as_secs() as u32;
-                            Self::start_countdown(secs, data);
+                            Self::start_countdown(secs, secs, data);
                             Action::StartTimer { seconds: secs }
                         }
-                        TimerState::Running { deadline, .. } => {
+                        TimerState::Running { deadline, total_secs, .. } => {
                             let now = Instant::now();
                             let remaining = if now >= deadline {
                                 Duration::from_ticks(0)
                             } else {
                                 deadline.duration_since(now)
                             };
-                            data.timer = TimerState::Paused { remaining };
+                            data.timer = TimerState::Paused { remaining, total_secs };
                             Action::CancelTimer
                         }
-                        TimerState::Paused { remaining } if remaining.as_ticks() > 0 => {
+                        TimerState::Paused { remaining, total_secs }
+                            if remaining.as_ticks() > 0 =>
+                        {
                             let secs = remaining.as_secs() as u32;
-                            Self::start_countdown(secs, data);
+                            Self::start_countdown(secs, total_secs, data);
                             Action::StartTimer { seconds: secs }
                         }
                         // Idle@zero or Paused@zero - nothing to start.
@@ -610,6 +613,22 @@ fn picker_cell_rects(safe: &crate::data::SafeArea) -> [Rectangle; 3] {
 
 // -- Helpers -----------------------------------------------------------------
 
+/// Dial readout: `MM:SS` below one hour, `H:MM:SS` from one hour up
+/// (the picker caps hours at 4, so one digit always suffices). The
+/// full `HH:MM:SS` at hero size is wider than the dial's interior -
+/// hero digits are up to 42 px, 8 glyphs = 282 px vs 280 px inner
+/// diameter.
+fn dial_readout(secs: u64) -> heapless::String<12> {
+    use core::fmt::Write;
+    let mut buf: heapless::String<12> = heapless::String::new();
+    let (h, m, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
+    if h == 0 {
+        let _ = write!(buf, "{:02}:{:02}", m, s);
+    } else {
+        let _ = write!(buf, "{}:{:02}:{:02}", h, m, s);
+    }
+    buf
+}
 
 
 fn rect_hit(rect: Rectangle, x: u16, y: u16) -> bool {

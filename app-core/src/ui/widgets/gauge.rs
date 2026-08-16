@@ -66,6 +66,12 @@ fn isqrt64(v: u64) -> u32 {
 /// skip the square root". The AA band is ~1 px on each side of each
 /// edge.
 fn annulus_alpha(d2: i64, r_in: i32, r_out: i32) -> Option<u8> {
+    // Fully inside the hole: transparent without computing the root.
+    // Without this, every interior pixel pays the full isqrt - at
+    // dial radii that's tens of thousands of roots per repaint.
+    if r_in > 1 && d2 <= ((r_in - 1) as i64).pow(2) {
+        return None;
+    }
     // Fully inside both edges: opaque without computing the root.
     let inner_solid = if r_in > 0 { d2 >= ((r_in + 1) as i64).pow(2) } else { true };
     if inner_solid && d2 <= ((r_out - 1) as i64).pow(2) {
