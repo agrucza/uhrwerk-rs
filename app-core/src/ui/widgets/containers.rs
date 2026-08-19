@@ -194,6 +194,7 @@ pub fn tile<D, F>(
     icon: F,
     icon_color: Color,
     caption: &str,
+    caption_color: Color,
 )
 where
     D: BlendTarget,
@@ -214,7 +215,7 @@ where
     fonts::draw_centered(
         display, &font, caption,
         icon_cx, y + h - 18,
-        theme::FG,
+        caption_color,
     );
 }
 

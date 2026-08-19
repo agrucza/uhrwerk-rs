@@ -33,6 +33,7 @@ pub use chrome::{
     app_chrome_back_hit, app_content_top, app_header_rect, app_header_top,
     app_home_bar_y, corner_safe_header_rect, draw_app_chrome, draw_overlay_chrome,
     header, header_icon_hit, home_indicator, overlay_title_y, status_bar,
+    viewport_to_home_bar,
     APP_STATUS_X_INSET, APP_STATUS_Y, HEADER_H, HOME_INDICATOR_H, STATUS_BAR_H,
 };
 pub use containers::{chamfered_panel, info_tile, tag_label, tile, NOTCH, TAG_LABEL_H};

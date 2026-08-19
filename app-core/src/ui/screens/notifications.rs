@@ -29,6 +29,7 @@ use crate::ui::theme::Color;
 
 use crate::events::{SwipeDir, SystemEvent};
 use crate::ui::{fonts, layout, theme};
+use crate::ui::layout::rect_hit;
 use crate::ui::types::{
     Action, Notification, NotificationSeverity, NotificationSource, RenderCtx, Screen,
     SystemData,
@@ -38,14 +39,15 @@ use crate::ui::widgets::{
     corner_safe_header_rect,
     app_chrome_back_hit, app_header_rect, chamfered_panel, handle_scroll_drag, header,
     app_content_top, app_home_bar_y, render_scrolled, status_bar,
-    SCROLLBAR_GUTTER,
+    viewport_to_home_bar, SCROLLBAR_GUTTER, STATUS_BAR_H,
 };
 
 /// Per-screen accent. Yellow == warning per spec ("ALERTS" header
 /// is yellow-tinted).
 const ACCENT: Color = theme::ALERT;
 
-/// Side margin matching the alarm list rows.
+/// Side margin of the notification rows - tighter than the alarm
+/// list's 28 px band, giving the three-line rows more width.
 const SIDE_MARGIN: i32 = 14;
 
 /// Height of one notification row. Sized for three text lines
@@ -115,20 +117,24 @@ impl Screen for NotificationsScreen {
         // Status bar + header only - no home indicator. Notifications
         // closes via swipe-left, so the bottom-of-screen swipe-up
         // indicator that other apps show would mislead the user.
-        status_bar(
-            display,
-            data.safe_area.top,
-            &data.time,
-            data.power.battery_percent,
-            ACCENT,
-            APP_STATUS_X_INSET,
-            &data.safe_area,
-        );
-        header(
-            display,
-            corner_safe_header_rect(app_header_rect(&data.safe_area), &data.safe_area),
-            "ALERTS", tele.as_str(), ACCENT,
-        );
+        // Tile-gated like draw_app_chrome, so the chrome doesn't
+        // re-render on every band of a list repaint.
+        let top = data.safe_area.top;
+        if ctx.intersects_y(top, top + STATUS_BAR_H) {
+            status_bar(
+                display,
+                top,
+                &data.time,
+                data.power.battery_percent,
+                ACCENT,
+                APP_STATUS_X_INSET,
+                &data.safe_area,
+            );
+        }
+        let hdr = corner_safe_header_rect(app_header_rect(&data.safe_area), &data.safe_area);
+        if ctx.intersects_y(hdr.top_left.y, hdr.top_left.y + hdr.size.height as i32 + 8) {
+            header(display, hdr, "ALERTS", tele.as_str(), ACCENT);
+        }
 
         if data.notifications.entries.is_empty() {
             // Empty state: centered caption inside the content band.
@@ -262,15 +268,6 @@ fn dismiss_row(data: &mut SystemData, vec_idx: usize, gesture: RowGesture) -> Ac
     }
 }
 
-fn rect_hit(rect: Rectangle, x: i32, y: i32) -> bool {
-    let rx = rect.top_left.x;
-    let ry = rect.top_left.y;
-    x >= rx
-        && x < rx + rect.size.width as i32
-        && y >= ry
-        && y < ry + rect.size.height as i32
-}
-
 /// Sub-rect inside an alarm row reserved for the SNOOZE hint
 /// label. Right-aligned, vertically spanning the row.
 fn snooze_hint_rect(row: Rectangle) -> Rectangle {
@@ -333,7 +330,7 @@ fn render_row<D: BlendTarget>(
 
     // Timestamp: "»» HH:MM", FG_MUTED.
     let mut ts: heapless::String<12> = heapless::String::new();
-    let _ = write!(ts, "»» {:02}:{:02}", n.ts_hour, n.ts_minute);
+    let _ = write!(ts, "»» {}", crate::ui::fmt::hm(n.ts_hour, n.ts_minute).as_str());
     fonts::draw_at(
         display, &fonts::caption(),
         ts.as_str(),
@@ -348,7 +345,7 @@ fn render_row<D: BlendTarget>(
 /// Severity → border / label / badge colour.
 fn severity_color(sev: NotificationSeverity) -> Color {
     match sev {
-        NotificationSeverity::Critical => theme::ACCENT,
+        NotificationSeverity::Critical => theme::DANGER,
         NotificationSeverity::Warning  => theme::WARN,
         NotificationSeverity::Ok       => theme::OK,
         NotificationSeverity::Info     => theme::INFO,
@@ -371,12 +368,7 @@ fn row_rect(row_idx: usize, scroll: i32, safe: &crate::data::SafeArea) -> Rectan
 /// Visible viewport rect for the row list. Spans from just below
 /// the header hairline to just above the home indicator.
 fn list_viewport_rect(safe: &crate::data::SafeArea) -> Rectangle {
-    let top = app_content_top(safe);
-    let bot = app_home_bar_y(safe) - 4;
-    Rectangle::new(
-        Point::new(0, top),
-        Size::new(theme::SCREEN_W as u32, (bot - top) as u32),
-    )
+    viewport_to_home_bar(app_content_top(safe), safe)
 }
 
 /// Total content height of the row list for `n` entries.

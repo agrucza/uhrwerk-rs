@@ -57,10 +57,7 @@ use crate::ui::widgets::{
     overlay_title_y, NOTCH, SLIDER_BAR_H,
 };
 
-/// Slider lower bound for brightness. The hardware can render
-/// below this but in practice anything dimmer is unreadable on
-/// AMOLED at room light, so the slider clips the bottom 5 %.
-const BRIGHT_MIN_PCT: u8 = 5;
+use crate::ui::primitives::{brightness_pct, BRIGHT_MIN_PCT};
 
 // -- Tile metadata -----------------------------------------------------------
 
@@ -216,14 +213,6 @@ impl QuickAccessScreen {
             tiles_on: [false; 8],
         }
     }
-
-    /// Current brightness percent as read from the live config on
-    /// `data`. Converts the hardware 0..=255 back into the 5..=100
-    /// slider range.
-    fn brightness_pct(data: &SystemData) -> u8 {
-        let hw = data.config.display.brightness_active as u16;
-        ((hw * 100 / 255) as u8).clamp(BRIGHT_MIN_PCT, 100)
-    }
 }
 
 impl Screen for QuickAccessScreen {
@@ -242,7 +231,7 @@ impl Screen for QuickAccessScreen {
 
         // Brightness label - the slider widget handles its own value
         // readout, this just paints the section title on the left.
-        let brightness = Self::brightness_pct(data);
+        let brightness = brightness_pct(data);
         fonts::draw_at(
             display, &fonts::caption(),
             "BRIGHTNESS",
@@ -256,7 +245,7 @@ impl Screen for QuickAccessScreen {
         // the top of the range fills the bar regardless of mode.
         let max_pct = data.config.display.max_brightness_pct();
         let mut label: String<8> = String::new();
-        let _ = write!(label, "{:02}%", brightness);
+        let _ = write!(label, "{}%", brightness);
         slider(
             display, bright_bar_rect(&data.safe_area),
             brightness, BRIGHT_MIN_PCT, max_pct,
@@ -330,7 +319,7 @@ impl Screen for QuickAccessScreen {
                     bright_bar_rect(&data.safe_area), *x as i32, *y as i32,
                     BRIGHT_MIN_PCT, max_pct,
                 ) {
-                    if v != Self::brightness_pct(data) {
+                    if v != brightness_pct(data) {
                         return Action::SetBrightness { percent: v };
                     }
                 }

@@ -27,6 +27,20 @@ use embedded_graphics::{
 
 use crate::ui::theme;
 
+/// Half-open tap hit test shared by every screen's dispatch:
+/// inside means `[top_left, top_left + size)`. Accepts the raw
+/// `u16` touch coordinates or already-widened `i32`s.
+pub fn rect_hit(rect: Rectangle, x: impl Into<i32>, y: impl Into<i32>) -> bool {
+    let px: i32 = x.into();
+    let py: i32 = y.into();
+    let rx = rect.top_left.x;
+    let ry = rect.top_left.y;
+    px >= rx
+        && px < rx + rect.size.width as i32
+        && py >= ry
+        && py < ry + rect.size.height as i32
+}
+
 // -- Bottom tile row ---------------------------------------------------------
 
 /// Side padding for the bottom tile row.

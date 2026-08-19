@@ -41,6 +41,7 @@ use crate::ui::theme::Color;
 
 use crate::events::SystemEvent;
 use crate::ui::{fonts, layout, theme};
+use crate::ui::layout::rect_hit;
 use crate::ui::types::{Action, DirtyRegion, RenderCtx, Screen, SystemData, TimerState};
 use crate::data::TimeData;
 use crate::ui::widgets::{
@@ -631,15 +632,5 @@ fn dial_readout(secs: u64) -> heapless::String<12> {
 }
 
 
-fn rect_hit(rect: Rectangle, x: u16, y: u16) -> bool {
-    let px = x as i32;
-    let py = y as i32;
-    let rx = rect.top_left.x;
-    let ry = rect.top_left.y;
-    px >= rx
-        && px < rx + rect.size.width as i32
-        && py >= ry
-        && py < ry + rect.size.height as i32
-}
 
 

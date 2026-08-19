@@ -85,6 +85,19 @@ pub fn scrollbar_v<D: BlendTarget>(
 /// Pick the right status color for a given battery percentage:
 /// bone (neutral) when healthy, yellow as a heads-up, signal red when
 /// critical.
+/// Slider lower bound for brightness. The hardware can render below
+/// this but anything dimmer is unreadable on AMOLED at room light,
+/// so both brightness sliders (Quick Access, Settings Display) clip
+/// the bottom 5 %.
+pub const BRIGHT_MIN_PCT: u8 = 5;
+
+/// Brightness as a percent for the sliders: the hardware 0..=255
+/// register mapped back into the `BRIGHT_MIN_PCT..=100` range.
+pub fn brightness_pct(data: &crate::ui::types::SystemData) -> u8 {
+    let hw = data.config.display.brightness_active as u16;
+    ((hw * 100 / 255) as u8).clamp(BRIGHT_MIN_PCT, 100)
+}
+
 pub fn battery_color(percent: u8) -> Color {
     use super::theme;
     if percent > 50 { theme::FG }

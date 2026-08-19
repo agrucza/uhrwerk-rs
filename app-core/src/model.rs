@@ -597,10 +597,7 @@ impl Model {
                     .map(|idx| {
                         let e = &self.cached_data.config.alarms.entries[idx];
                         let mut s: heapless::String<32> = heapless::String::new();
-                        let _ = core::fmt::Write::write_fmt(
-                            &mut s,
-                            format_args!("{:02}:{:02}", e.hour, e.minute),
-                        );
+                        let _ = s.push_str(crate::ui::fmt::hm(e.hour, e.minute).as_str());
                         s
                     })
                     .unwrap_or_default();
@@ -826,7 +823,7 @@ impl Model {
                 let mut subtitle: heapless::String<32> = heapless::String::new();
                 let _ = core::fmt::Write::write_fmt(
                     &mut subtitle,
-                    format_args!("SNOOZED -> {:02}:{:02}", hour, minute),
+                    format_args!("SNOOZED -> {}", crate::ui::fmt::hm(hour, minute).as_str()),
                 );
                 self.push_notification_owned(
                     NotificationSeverity::Info,

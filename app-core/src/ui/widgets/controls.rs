@@ -80,8 +80,11 @@ pub const SLIDER_BAR_H: i32 = 12;
 pub const SLIDER_VSLOP: i32 = 12;
 
 /// Vertical offset of the slider's value label above the trough.
-/// The label draws at `rect.top_left.y - SLIDER_LABEL_OFFSET`.
-const SLIDER_LABEL_OFFSET: i32 = 6;
+/// The label draws at `rect.top_left.y - SLIDER_LABEL_OFFSET`; the
+/// caption ink is 10 px tall and the trough paints after the label,
+/// so anything below `ink height + a gap` gets its digits' bottom
+/// overpainted by the gradient.
+const SLIDER_LABEL_OFFSET: i32 = 14;
 
 /// Draw a horizontal slider into `rect`.
 ///
@@ -239,10 +242,10 @@ pub fn chamfered_button<D: BlendTarget>(
             );
         }
         ButtonVariant::Ghost => {
-            // No fill - just the chamfered outline in steel and the
-            // label in FG.
-            chamfered_panel(display, rect, notch, theme::BORDER, 1);
-            let _ = accent; // unused for Ghost
+            // No fill - just the chamfered outline in the caller's
+            // color (BORDER steel at every current call site) and
+            // the label in FG.
+            chamfered_panel(display, rect, notch, accent, 1);
             fonts::draw_centered_in_rect(
                 display, &fonts::caption(), label, rect, theme::FG,
             );

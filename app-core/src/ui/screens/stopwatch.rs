@@ -41,6 +41,7 @@ use crate::ui::theme::Color;
 
 use crate::events::SystemEvent;
 use crate::ui::{fmt, fonts, layout, theme};
+use crate::ui::layout::rect_hit;
 use crate::ui::types::{Action, DirtyRegion, RenderCtx, Screen, StopwatchState, SystemData};
 use crate::ui::widgets::{
     app_chrome_back_hit, chamfered_button, chamfered_panel, draw_app_chrome,
@@ -92,8 +93,9 @@ fn status_rect(safe: &crate::data::SafeArea) -> Rectangle {
         Size::new(theme::SCREEN_W as u32, (safe.top + STATUS_BAR_H + 4) as u32),
     )
 }
-/// Readout panel - the `HH:MM:SS` hero numerals. Repaints when the
-/// displayed second changes.
+/// Readout panel - the drawn panel rect and tap target. The dirty
+/// region pads this by 4 px (see `dirty_rects`) so the chamfer
+/// stroke's AA pixels aren't sliced on the repaint boundary.
 fn readout_rect(safe: &crate::data::SafeArea) -> Rectangle {
     Rectangle::new(
         Point::new(SIDE_MARGIN, readout_top(safe)),
@@ -171,21 +173,19 @@ impl Screen for StopwatchScreen {
         let total_secs = data.stopwatch.elapsed().as_secs();
         let buf = fmt::hms(total_secs);
 
-        // Centre vertically inside the panel below the tag-label
-        // band so the numerals don't sit on top of "ELAPSED".
-        let inner_rect = Rectangle::new(
-            Point::new(
-                panel.top_left.x,
-                panel.top_left.y + TAG_LABEL_H,
-            ),
-            Size::new(
-                panel.size.width,
-                panel.size.height - TAG_LABEL_H as u32,
-            ),
-        );
-        fonts::draw_centered_in_rect(
-            display, &fonts::hero(),
-            buf.as_str(), inner_rect, ACCENT,
+        // Centre below the tag-label band. Advance-anchored
+        // (draw_centered) like the timer dial, NOT ink-bbox centered
+        // (draw_centered_in_rect): ink centering re-measures the
+        // actual glyph outlines, so a narrow 1 shifts the whole run
+        // even with tabular digit advances.
+        let inner_top = panel.top_left.y + TAG_LABEL_H;
+        let inner_h = panel.size.height as i32 - TAG_LABEL_H;
+        let ink_h = 49; // hero digit ink height
+        fonts::draw_centered(
+            display, &fonts::hero(), buf.as_str(),
+            panel.top_left.x + panel.size.width as i32 / 2,
+            inner_top + (inner_h - ink_h) / 2,
+            ACCENT,
         );
 
         // -- Action row ----------------------------------------------------
@@ -283,7 +283,13 @@ impl Screen for StopwatchScreen {
 
         let mut region = DirtyRegion::empty();
         if prev.elapsed_secs != data.stopwatch.elapsed().as_secs() {
-            region.add(readout_rect(&data.safe_area));
+            // Panel rect padded 4 px so the chamfer stroke's AA
+            // pixels repaint with it.
+            let panel = readout_rect(&data.safe_area);
+            region.add(Rectangle::new(
+                Point::new(panel.top_left.x - 4, panel.top_left.y - 4),
+                Size::new(panel.size.width + 8, panel.size.height + 8),
+            ));
         }
         let zero = data.stopwatch.elapsed().as_secs() == 0;
         if prev.running != data.stopwatch.is_running() || prev.zero != zero {
@@ -310,13 +316,3 @@ impl Screen for StopwatchScreen {
 
 // -- Helpers -----------------------------------------------------------------
 
-fn rect_hit(rect: Rectangle, x: u16, y: u16) -> bool {
-    let px = x as i32;
-    let py = y as i32;
-    let rx = rect.top_left.x;
-    let ry = rect.top_left.y;
-    px >= rx
-        && px < rx + rect.size.width as i32
-        && py >= ry
-        && py < ry + rect.size.height as i32
-}

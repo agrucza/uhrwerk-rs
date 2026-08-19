@@ -337,7 +337,7 @@ impl Keyboard {
             .draw(display)
             .ok();
         Rectangle::new(rect.top_left, rect.size)
-            .into_styled(PrimitiveStyle::with_stroke(theme::FG_DIM, 1))
+            .into_styled(PrimitiveStyle::with_stroke(theme::BORDER, 1))
             .draw(display)
             .ok();
 
@@ -418,7 +418,7 @@ fn draw_key<D: BlendTarget>(
         KeyStyle::Special => (theme::BG, theme::BORDER, theme::FG_MUTED),
         KeyStyle::Active => (theme::SURFACE_3, theme::ACCENT, theme::ACCENT),
         KeyStyle::Hot => (theme::ACCENT_DEEP, theme::ACCENT, theme::ACCENT),
-        KeyStyle::Ghost => (theme::BG, theme::FG_DIM, theme::FG_DIM),
+        KeyStyle::Ghost => (theme::BG, theme::BORDER, theme::FG_DIM),
     };
     Rectangle::new(rect.top_left, rect.size)
         .into_styled(PrimitiveStyle::with_fill(fill))

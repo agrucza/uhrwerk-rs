@@ -285,8 +285,11 @@ pub fn draw_overlay_chrome<D: BlendTarget>(
             &data.safe_area,
         );
     }
+    // Gate spans the full line boxes: title ink starts at
+    // title_y - 8, the caption's line box (ascent 10 + descent 3
+    // from title_y + 22) ends at title_y + 35.
     let title_y = overlay_title_y(&data.safe_area);
-    if ctx.intersects_y(title_y - 8, title_y + 34) {
+    if ctx.intersects_y(title_y - 10, title_y + 36) {
         let cx = theme::SCREEN_W as i32 / 2;
         fonts::draw_centered(
             display, &fonts::value(), title,
@@ -329,6 +332,20 @@ pub fn app_content_top(safe: &crate::data::SafeArea) -> i32 {
 /// Y of the bottom home-indicator bar, lifted by the bottom inset.
 pub fn app_home_bar_y(safe: &crate::data::SafeArea) -> i32 {
     theme::SCREEN_H as i32 - 18 - safe.bottom
+}
+
+/// Full-width scroll viewport from `top` down to 4 px above the
+/// home-indicator bar - the shared shape of every scrolling list's
+/// clip rect (alarm list, notifications, settings index/motion).
+pub fn viewport_to_home_bar(
+    top: i32,
+    safe: &crate::data::SafeArea,
+) -> Rectangle {
+    let bot = app_home_bar_y(safe) - 4;
+    Rectangle::new(
+        Point::new(0, top),
+        Size::new(theme::SCREEN_W as u32, (bot - top) as u32),
+    )
 }
 
 /// Anchor row of an overlay's title band (drawer, quick access):

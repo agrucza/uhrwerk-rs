@@ -29,6 +29,7 @@ use core::fmt::Write;
 use crate::config::GpsTrackingCadence;
 use crate::data::GpsSyncState;
 use crate::ui::{fmt, fonts, glyphs, layout, theme};
+use crate::ui::layout::rect_hit;
 use crate::ui::types::{
     Action, RenderCtx, Screen, SelfTestId, SelfTestResult, SystemData, SystemEvent,
 };
@@ -42,10 +43,7 @@ use crate::ui::widgets::{
     WHEEL_TOTAL_H,
 };
 
-/// Slider lower bound for brightness in the Display sub-view -
-/// matches Quick Access. Anything dimmer is unreadable in practice
-/// so the slider never goes below 5 %.
-const BRIGHT_MIN_PCT: u8 = 5;
+use crate::ui::primitives::{brightness_pct, BRIGHT_MIN_PCT};
 
 /// Auto-lock options surfaced in the Display sub-view, in the
 /// order they appear (left -> right). `secs` is the off_timeout the
@@ -273,9 +271,7 @@ fn gps_value(data: &SystemData) -> String<20> {
             let _ = buf.push_str("SYNCING");
         }
         _ => {
-            let m = data.config.time.tz_offset_minutes;
-            let a = m.unsigned_abs();
-            let _ = write!(buf, "UTC{}{}:{:02}", if m < 0 { '-' } else { '+' }, a / 60, a % 60);
+            let _ = buf.push_str(fmt_utc_offset(data.config.time.tz_offset_minutes).as_str());
         }
     }
     buf
@@ -296,12 +292,27 @@ fn battery_value(data: &SystemData) -> String<20> {
     buf
 }
 
-fn storage_value(data: &SystemData) -> String<20> {
-    // Summary shown on the top-level settings index: "<files> / <size>K".
+/// `UTC+01:00`-style offset readout - shared by the index row value
+/// and the GPS view's timezone stepper.
+fn fmt_utc_offset(m: i16) -> String<12> {
+    let a = m.unsigned_abs();
     let mut buf = String::new();
     let _ = write!(
         buf,
-        "{} / {}K",
+        "UTC{}{:02}:{:02}",
+        if m < 0 { '-' } else { '+' },
+        a / 60,
+        a % 60,
+    );
+    buf
+}
+
+fn storage_value(data: &SystemData) -> String<20> {
+    // Summary shown on the top-level settings index: "<files> / <size> KB".
+    let mut buf = String::new();
+    let _ = write!(
+        buf,
+        "{} / {} KB",
         data.storage.files,
         data.storage.total_bytes / 1024,
     );
@@ -317,7 +328,7 @@ fn storage_flash_value(data: &SystemData) -> String<20> {
     let mut buf = String::new();
     let _ = write!(
         buf,
-        "{} FILES / {}K",
+        "{} FILES / {} KB",
         data.storage.files,
         data.storage.total_bytes / 1024,
     );
@@ -706,12 +717,7 @@ impl SettingsScreen {
 /// Visible-row viewport rect for the index. Spans from just below
 /// the header hairline to just above the home-indicator bar.
 fn index_viewport_rect(safe: &crate::data::SafeArea) -> Rectangle {
-    let top = rows_top(safe);
-    let bot = widgets::app_home_bar_y(safe) - 4;
-    Rectangle::new(
-        Point::new(0, top),
-        Size::new(theme::SCREEN_W as u32, (bot - top) as u32),
-    )
+    widgets::viewport_to_home_bar(rows_top(safe), safe)
 }
 
 /// Total content height of the index row list - visible rows only,
@@ -1260,12 +1266,7 @@ fn motion_layout(scroll: i32, has_steps: bool, safe: &crate::data::SafeArea) -> 
 /// Visible viewport for MOTION's scrollable area: from the row of
 /// section content (leaf_top_y) down to just above the home bar.
 fn motion_viewport_rect(safe: &crate::data::SafeArea) -> Rectangle {
-    let top = leaf_top_y(safe);
-    let bot = widgets::app_home_bar_y(safe) - 4;
-    Rectangle::new(
-        Point::new(0, top),
-        Size::new(theme::SCREEN_W as u32, (bot - top) as u32),
-    )
+    widgets::viewport_to_home_bar(leaf_top_y(safe), safe)
 }
 
 /// True when at least one axis or the temperature changed by more
@@ -1296,7 +1297,7 @@ fn motion_value(idx: usize, data: &SystemData, buf: &mut heapless::String<12>) {
         3 => write!(buf, "{}", m.gyro_x),
         4 => write!(buf, "{}", m.gyro_y),
         5 => write!(buf, "{}", m.gyro_z),
-        6 => write!(buf, "{} C", m.temp_raw / 256),
+        6 => write!(buf, "{}°C", m.temp_raw / 256),
         // Raw hub total (diagnostic) - the daily figure lives on the
         // clock face. "--" until the first step event arrives.
         7 => match m.steps {
@@ -1764,7 +1765,7 @@ impl SettingsScreen {
         let (accent, status_text) = if data.storage.sd_online {
             (theme::OK, "ONLINE")
         } else {
-            (theme::ACCENT, "NOT PRESENT")
+            (theme::WARN, "NOT PRESENT")
         };
         chamfered_panel(display, status_rect, NOTCH, accent, 1);
         tag_label(
@@ -1824,18 +1825,20 @@ impl SettingsScreen {
         data: &SystemData,
         ctx: &RenderCtx,
     ) {
-        draw_header(display, data, "RESTORE FROM SD", theme::ACCENT, ctx);
+        // DANGER like its FACTORY RESET sibling: restoring overwrites
+        // the live config and reboots.
+        draw_header(display, data, "RESTORE FROM SD", theme::DANGER, ctx);
 
-        // Warning panel: signal-bordered chamfered panel with a
+        // Warning panel: danger-bordered chamfered panel with a
         // RESTORE tag. Body explains what the action does.
         let (warn_rect, cancel_rect, primary_rect) = confirmation_slots(&data.safe_area);
-        chamfered_panel(display, warn_rect, NOTCH, theme::ACCENT, 1);
+        chamfered_panel(display, warn_rect, NOTCH, theme::DANGER, 1);
         tag_label(
             display,
             warn_rect.top_left.x,
             warn_rect.top_left.y,
             "RESTORE",
-            theme::ACCENT,
+            theme::DANGER,
             NOTCH,
         );
         let body = if data.storage.sd_online {
@@ -1859,7 +1862,7 @@ impl SettingsScreen {
         if data.storage.sd_online {
             chamfered_button(
                 display, primary_rect, "RESTORE",
-                ButtonVariant::Primary, theme::ACCENT,
+                ButtonVariant::Primary, theme::DANGER,
             );
         } else {
             chamfered_button(
@@ -2007,7 +2010,7 @@ impl SettingsScreen {
         let pct = brightness_pct(data);
         let max_pct = data.config.display.max_brightness_pct();
         let mut label: String<8> = String::new();
-        let _ = write!(label, "{:02}%", pct);
+        let _ = write!(label, "{}%", pct);
         slider(
             display, slots.brightness_bar,
             pct, BRIGHT_MIN_PCT, max_pct,
@@ -2306,12 +2309,12 @@ impl SettingsScreen {
                     Some(s) => { let _ = write!(line, "NEXT IN {}s", s); }
                     // Kick in flight (the task reports within
                     // milliseconds) or first tick pending.
-                    None => { let _ = line.push_str("STARTING..."); }
+                    None => { let _ = line.push_str("STARTING"); }
                 }
             }
             GpsSyncState::Idle => { let _ = line.push_str("READY"); }
             GpsSyncState::Synced { hour, minute } => {
-                let _ = write!(line, "SYNCED {:02}:{:02}", hour, minute);
+                let _ = write!(line, "SYNCED {}", fmt::hm(hour, minute).as_str());
             }
             GpsSyncState::NoSignal => { let _ = line.push_str("NO SIGNAL"); }
         }
@@ -2341,8 +2344,8 @@ impl SettingsScreen {
         // halves of the disabled contract).
         if matches!(data.gps_sync, GpsSyncState::Syncing { .. }) {
             chamfered_button(
-                display, slots.sync_btn, "SYNCING...",
-                ButtonVariant::Ghost, theme::FG_MUTED,
+                display, slots.sync_btn, "SYNCING",
+                ButtonVariant::Ghost, theme::BORDER,
             );
         } else {
             chamfered_button(
@@ -2365,10 +2368,7 @@ impl SettingsScreen {
         chamfered_button(
             display, slots.tz_plus, "+", ButtonVariant::Ghost, theme::BORDER,
         );
-        let m = data.config.time.tz_offset_minutes;
-        let a = m.unsigned_abs();
-        let mut tz: String<12> = String::new();
-        let _ = write!(tz, "UTC{}{}:{:02}", if m < 0 { '-' } else { '+' }, a / 60, a % 60);
+        let tz = fmt_utc_offset(data.config.time.tz_offset_minutes);
         let between_x = slots.tz_minus.top_left.x + slots.tz_minus.size.width as i32;
         let tz_rect = Rectangle::new(
             Point::new(between_x, slots.tz_minus.top_left.y),
@@ -2536,19 +2536,6 @@ fn days_in_month(month: i32, year: i32) -> i32 {
     }
 }
 
-/// Standalone hit-test - reused by the time/date entry sub-views to
-/// match against `action_row_rects()` slots without pulling in the
-/// alarm screen's helper.
-fn rect_hit(rect: Rectangle, x: u16, y: u16) -> bool {
-    let px = x as i32;
-    let py = y as i32;
-    let rx = rect.top_left.x;
-    let ry = rect.top_left.y;
-    px >= rx
-        && px < rx + rect.size.width as i32
-        && py >= ry
-        && py < ry + rect.size.height as i32
-}
 
 
 fn format_result(
@@ -2767,13 +2754,6 @@ fn display_slots(safe: &crate::data::SafeArea) -> DisplaySlots {
     }
 }
 
-/// Slider-percent view of the live brightness register (0..=255).
-/// Mirrors the QA helper so both Display sub-view and QA agree on
-/// the percent <-> register mapping.
-fn brightness_pct(data: &SystemData) -> u8 {
-    let hw = data.config.display.brightness_active as u16;
-    ((hw * 100 / 255) as u8).clamp(BRIGHT_MIN_PCT, 100)
-}
 
 /// Pick the accent color (panel border + tag + result text) for a
 /// given IMU test result. Visualises run state at a glance:

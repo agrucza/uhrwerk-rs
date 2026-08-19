@@ -576,7 +576,7 @@ pub fn moon<D: BlendTarget>(
     display: &mut D, cx: i32, cy: i32, radius: i32, color: Color,
 ) {
     let fill = PrimitiveStyle::with_fill(color);
-    let carve = PrimitiveStyle::with_fill(Color::new(0, 0, 0));
+    let carve = PrimitiveStyle::with_fill(crate::ui::theme::BG);
 
     // Base disc.
     Circle::with_center(Point::new(cx, cy), (radius * 2) as u32)

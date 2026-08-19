@@ -197,10 +197,13 @@ impl Screen for AppDrawerScreen {
                     .draw(display).ok();
             }
 
-            let icon_color = if t.target.is_some() {
-                t.border
+            // Placeholder tiles dim BOTH the icon and the caption -
+            // a dim icon under a full-brightness caption read as
+            // half-enabled.
+            let (icon_color, caption_color) = if t.target.is_some() {
+                (t.border, theme::FG)
             } else {
-                theme::FG_DIM
+                (theme::FG_DIM, theme::FG_DIM)
             };
             let stroke = if is_active { 2 } else { 1 };
             let kind = t.icon;
@@ -210,6 +213,7 @@ impl Screen for AppDrawerScreen {
                 |d, cx, cy, c| draw_icon(d, kind, cx, cy, 12, c),
                 icon_color,
                 t.caption,
+                caption_color,
             );
         }
 

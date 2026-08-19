@@ -44,6 +44,7 @@ use core::fmt::Write;
 
 use crate::events::SystemEvent;
 use crate::ui::{fmt, fonts, glyphs, layout, theme};
+use crate::ui::layout::rect_hit;
 use crate::ui::types::{Action, DirtyRegion, RenderCtx, Screen, ScreenId, SystemData};
 use crate::ui::widgets::{info_tile, ring_gauge};
 
@@ -99,14 +100,16 @@ const TELEMETRY_RECT: Rectangle = Rectangle::new(
     Size::new(theme::SCREEN_W as u32, 40),
 );
 /// Hero HH glyphs (signal-red, top of the stacked hero block).
+/// Mega ink is 76 px tall - the 96 px band leaves 10 px above AND
+/// below (the old 88 px left only 2 px under the glyphs).
 const HERO_HH_RECT: Rectangle = Rectangle::new(
     Point::new(0, HERO_HH_TOP - 10),
-    Size::new(theme::SCREEN_W as u32, 88),
+    Size::new(theme::SCREEN_W as u32, 96),
 );
 /// Hero MM glyphs (bone, directly below HH).
 const HERO_MM_RECT: Rectangle = Rectangle::new(
     Point::new(0, HERO_MM_TOP - 10),
-    Size::new(theme::SCREEN_W as u32, 88),
+    Size::new(theme::SCREEN_W as u32, 96),
 );
 /// Meta row: `:SS` and the coords readout.
 const META_RECT: Rectangle = Rectangle::new(
@@ -277,16 +280,6 @@ impl Screen for ClockScreen {
     }
 }
 
-fn rect_hit(rect: Rectangle, x: u16, y: u16) -> bool {
-    let px = x as i32;
-    let py = y as i32;
-    let rx = rect.top_left.x;
-    let ry = rect.top_left.y;
-    px >= rx
-        && px < rx + rect.size.width as i32
-        && py >= ry
-        && py < ry + rect.size.height as i32
-}
 
 // -- Draw helpers -----------------------------------------------------------
 

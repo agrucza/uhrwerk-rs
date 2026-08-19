@@ -37,6 +37,7 @@ use crate::ui::theme::Color;
 
 use crate::events::SystemEvent;
 use crate::ui::{fmt, fonts, layout, theme};
+use crate::ui::layout::rect_hit;
 use crate::ui::types::{
     Action, AlarmEntry, RenderCtx, Screen, SystemData, MAX_ALARMS,
 };
@@ -44,7 +45,7 @@ use crate::ui::widgets::{
     action_row_rects, app_chrome_back_hit, chamfered_panel, draw_app_chrome, fmt_2digit,
     handle_scroll_drag, render_action_row, render_scrolled, tag_label, toggle,
     Picker, Wheel,
-    app_content_top, app_home_bar_y, NOTCH,
+    app_content_top, viewport_to_home_bar, NOTCH,
     TOGGLE_H, TOGGLE_W, WHEEL_TOTAL_H,
 };
 
@@ -471,14 +472,19 @@ fn day_chip_rects(safe: &crate::data::SafeArea) -> [Rectangle; 7] {
     })
 }
 
-/// Draw one day chip - chamfered border + matching label colour.
-/// Active chips wear the accent; inactive chips read as steel.
+/// Draw one day chip - chamfered border + label. Active chips wear
+/// the accent; inactive chips get the standard BORDER outline (like
+/// the overview strip's inactive days) with a dim label.
 fn day_chip<D: BlendTarget>(
     display: &mut D, rect: Rectangle, label: &str, active: bool,
 ) {
-    let color = if active { ACCENT } else { theme::FG_DIM };
-    chamfered_panel(display, rect, DAY_CHIP_NOTCH, color, 1);
-    fonts::draw_centered_in_rect(display, &fonts::caption(), label, rect, color);
+    let (border, label_color) = if active {
+        (ACCENT, ACCENT)
+    } else {
+        (theme::BORDER, theme::FG_DIM)
+    };
+    chamfered_panel(display, rect, DAY_CHIP_NOTCH, border, 1);
+    fonts::draw_centered_in_rect(display, &fonts::caption(), label, rect, label_color);
 }
 
 /// Per-column rects for the HH:MM wheel picker, centred horizontally.
@@ -518,12 +524,7 @@ fn row_rect(idx: usize, scroll: i32, safe: &crate::data::SafeArea) -> Rectangle 
 /// list renders into a clipped sub-target of this rect so off-screen
 /// rows are hardware-clipped.
 fn list_viewport_rect(safe: &crate::data::SafeArea) -> Rectangle {
-    let top = app_content_top(safe);
-    let bot = app_home_bar_y(safe) - 4;
-    Rectangle::new(
-        Point::new(0, top),
-        Size::new(theme::SCREEN_W as u32, (bot - top) as u32),
-    )
+    viewport_to_home_bar(app_content_top(safe), safe)
 }
 
 /// Total content height of the List view: every alarm row plus the
@@ -533,17 +534,6 @@ fn list_content_h() -> i32 {
         + MAX_ALARMS as i32 * ROW_STEP
         - ROW_GAP
         + LIST_TOP_PAD
-}
-
-fn rect_hit(rect: Rectangle, x: u16, y: u16) -> bool {
-    let px = x as i32;
-    let py = y as i32;
-    let rx = rect.top_left.x;
-    let ry = rect.top_left.y;
-    px >= rx
-        && px < rx + rect.size.width as i32
-        && py >= ry
-        && py < ry + rect.size.height as i32
 }
 
 /// Day of week via Zeller's congruence, returning 0=Sunday..6=Saturday.
