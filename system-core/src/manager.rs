@@ -216,6 +216,17 @@ pub struct SystemManager<'d, B: Board> {
     // Cleared by render() after the frame.
     force_full_redraw: bool,
 
+    // Wake-from-Off is mid-flight: SLPOUT has run, the panel is
+    // dark, and the first frame still has to be rendered into GRAM
+    // before DISPON. Holds the target state (Active/Dim) and the
+    // SLPOUT instant (booster-ramp top-up). Set by the
+    // TransitionDisplay effect, consumed by the loop tail - which
+    // first waits (bounded) for the wake's fresh TimeUpdated (the
+    // RTC task broadcasts one for the wake Poll) so the frame
+    // doesn't show stale time. Cleared unconsumed if the display
+    // goes back Off.
+    wake_reveal_pending: Option<(app_core::ui::types::DisplayState, Instant)>,
+
     // RTC controller, used to enter/exit hardware light sleep.
     rtc: esp_hal::rtc_cntl::Rtc<'d>,
 
@@ -388,6 +399,7 @@ impl<B: Board> SystemManager<'static, B> {
             // First render after boot has no snapshot to diff; force
             // a full pass before dirty_rects takes over.
             force_full_redraw: true,
+            wake_reveal_pending: None,
             rtc,
             boot_uptime_secs,
             sleep_cycles: 0,
@@ -433,22 +445,34 @@ impl<B: Board> SystemManager<'static, B> {
         for effect in effects {
             match effect {
                 Effect::TransitionDisplay { from, to } => {
-                    // WAKE PROBE - remove after the wake-gap diagnosis.
-                    log::info!("wakeprobe: rtc {} ms - display transition start", self.rtc_now_us() / 1000);
-                    let waking_from_off = crate::display::transition(
-                        &mut self.display,
-                        from,
-                        to,
-                        &self.model.config().display,
-                    ).await;
-                    log::info!("wakeprobe: rtc {} ms - display transition done", self.rtc_now_us() / 1000);
-                    // Coming out of DISPOFF the panel's GRAM is whatever
-                    // garbage it held while powered down. Ignore the
-                    // per-screen dirty_rects on the next frame and push
-                    // everything so the panel is repopulated from scratch.
+                    use app_core::ui::types::DisplayState;
+                    let waking_from_off =
+                        from == DisplayState::Off && to != DisplayState::Off;
                     if waking_from_off {
+                        // SLPOUT; the panel stays dark. The first
+                        // frame is rendered into GRAM and lit by the
+                        // loop tail, AFTER the wake's fresh
+                        // TimeUpdated - rendering here would race the
+                        // RTC poll and paint stale time (watch-
+                        // observed as an old-frame flash).
+                        let slpout_at = Instant::now();
+                        crate::display::panel_wake(&mut self.display).await;
                         self.tile_hashes.fill(0);
                         self.force_full_redraw = true;
+                        self.wake_reveal_pending = Some((to, slpout_at));
+                    } else {
+                        // Going Off cancels any reveal still in
+                        // flight - the panel is dark again and the
+                        // next wake arms its own.
+                        if to == DisplayState::Off {
+                            self.wake_reveal_pending = None;
+                        }
+                        crate::display::transition(
+                            &mut self.display,
+                            from,
+                            to,
+                            &self.model.config().display,
+                        ).await;
                     }
                 }
                 Effect::BroadcastSleep(state) => {
@@ -456,8 +480,6 @@ impl<B: Board> SystemManager<'static, B> {
                     match state {
                         SleepState::Sleeping => log::info!("system: sleep"),
                         SleepState::Awake => {
-                            // WAKE PROBE - remove after the wake-gap diagnosis.
-                            log::info!("wakeprobe: rtc {} ms - awake broadcast + touch wake", self.rtc_now_us() / 1000);
                             // Kick the touch controller awake first so
                             // its boot overlaps the repaint below.
                             // No-op on controllers that wake on their
@@ -466,7 +488,6 @@ impl<B: Board> SystemManager<'static, B> {
                                 let mut i2c = self.i2c_bus.lock().await;
                                 self.board.touch_wake(&mut i2c);
                             }
-                            log::info!("wakeprobe: rtc {} ms - touch wake done", self.rtc_now_us() / 1000);
                             // Same reasoning as the DISPOFF -> Active
                             // transition above: stale GRAM + stale
                             // screen snapshot, so force a full repaint.
@@ -873,147 +894,222 @@ impl<B: Board> SystemManager<'static, B> {
     /// flagged a redraw. The timeout gives the idle timer a heartbeat
     /// even when no events are arriving. `main` calls this in a loop.
     pub async fn tick(&mut self) {
-        // Sleeping path: drain any pending events first, then halt
-        // the CPU in hardware light sleep until a wake source fires.
         if self.model.sleeping() {
-            while let Ok(event) = EVENTS.try_receive() {
-                self.handle_event(event).await;
-                if !self.model.sleeping() {
-                    return;
+            self.sleeping_tick().await;
+        } else {
+            self.awake_tick().await;
+        }
+
+        // Wake finish: SLPOUT has run, the panel is dark. Get fresh
+        // wall time first - the RTC task broadcasts a TimeUpdated
+        // for the wake Poll within a few ms; rendering without it
+        // painted time stale by the whole sleep (watch-observed as
+        // an old-frame flash + jump). Then render the first frame
+        // into the dark GRAM, top up the booster ramp, and light
+        // the panel: the first lit frame is current content at the
+        // correct brightness.
+        if let Some((to, slpout_at)) = self.wake_reveal_pending.take() {
+            if self.model.sleeping() {
+                // Went back Off between the transition and here -
+                // nothing to light; the Off transition handles the
+                // panel.
+            } else {
+                let _ = with_timeout(Duration::from_millis(150), async {
+                    loop {
+                        let event = EVENTS.receive().await;
+                        let fresh =
+                            matches!(event, SystemEvent::TimeUpdated { .. });
+                        self.handle_event(event).await;
+                        if fresh {
+                            break;
+                        }
+                    }
+                })
+                .await;
+                self.board.set_cpu_freq(CpuFreq::Mhz160);
+                self.render().await;
+                self.sync_canvas();
+                self.board.set_cpu_freq(CpuFreq::Mhz80);
+                // Time-wait + render overlapped the booster ramp;
+                // top up whatever of it is left before DISPON.
+                let elapsed = Instant::now().duration_since(slpout_at);
+                if elapsed < crate::display::SLPOUT_BOOST {
+                    Timer::after(crate::display::SLPOUT_BOOST - elapsed).await;
                 }
+                crate::display::panel_on(
+                    &mut self.display,
+                    to,
+                    &self.model.config().display,
+                )
+                .await;
             }
-            // An active hardware session holds a wake lock (a GPS
-            // sync today; audio is the planned second holder): its
-            // peripheral needs continuously running clocks, and
-            // hardware light sleep gates the UART/I2S clocks and
-            // silently drops their data. Idle here instead - the
-            // display stays dark, embassy time keeps running, the
-            // session's task and events flow - and real light sleep
-            // resumes on the first pass after the hold is released.
-            // Deliberately BEFORE enter_light_sleep so none of its
-            // wake diagnostics (cycle counts, slept-ms probes,
-            // summary lines) fire for these idle passes.
-            if crate::bus::wake_held() {
-                match select(
-                    EVENTS.receive(),
-                    Timer::after(Duration::from_millis(500)),
-                ).await {
-                    Either::First(event) => self.handle_event(event).await,
-                    Either::Second(_) => {}
-                }
-                // Same hole as the post-light-sleep path below: if
-                // that event woke the UI, this pass returns before
-                // the tail render and the next pass blocks on its
-                // select for up to a full idle tick - paint the wake
-                // frame before returning.
-                if !self.model.sleeping() && self.model.needs_redraw() {
-                    self.board.set_cpu_freq(CpuFreq::Mhz160);
-                    self.render().await;
-                    self.sync_canvas();
-                    self.board.set_cpu_freq(CpuFreq::Mhz80);
-                }
+        }
+
+        // THE render gate - the unconditional end of EVERY pass.
+        // Neither branch above can return around it, so any pass
+        // that leaves the model awake with a pending redraw paints
+        // here; a new sleep/wake path cannot re-create the
+        // stale-frame-until-next-idle-tick bug by forgetting to
+        // render. (A wake's first frame is painted by the reveal
+        // step above - by the time a wake pass reaches this gate
+        // its flag is already consumed.)
+        if !self.model.sleeping() && self.model.needs_redraw() {
+            self.board.set_cpu_freq(CpuFreq::Mhz160);
+            self.render().await;
+            // The frame above may have been the tail of an
+            // interaction - re-mirror any deferred canvas tiles while
+            // the clock is still raised. No-op unless tiles are stale
+            // and the finger is up.
+            self.sync_canvas();
+            self.board.set_cpu_freq(CpuFreq::Mhz80);
+        } else if self.canvas_stale != 0
+            && !self.touch_active
+            && !self.model.sleeping()
+        {
+            // Interaction ended without a final redraw (plain
+            // release) - the deferred mirror work is all that's left.
+            self.board.set_cpu_freq(CpuFreq::Mhz160);
+            self.sync_canvas();
+            self.board.set_cpu_freq(CpuFreq::Mhz80);
+        }
+
+        // Deferred re-log of a UI wake's diagnostics (see the field
+        // doc): by the end of the first awake tick the USB host has
+        // resynced, so this copy survives where the summary printed
+        // at the wake itself gets shredded.
+        if let Some((cycle, cause, slept)) = self.pending_wake_summary.take() {
+            log::info!(
+                "light_sleep: wake summary (cycle {}, cause {:#b}, slept {} ms)",
+                cycle,
+                cause,
+                slept,
+            );
+        }
+
+        // Diagnostics + the awake tick counter stay awake-gated as
+        // they were when sleeping passes returned early.
+        if !self.model.sleeping() {
+            self.log_diagnostics();
+            self.tick_count = self.tick_count.wrapping_add(1);
+            self.model.set_tick_count(self.tick_count);
+        }
+    }
+
+    /// One pass while the UI sleeps: drain pending events, then
+    /// either idle (wake held) or halt the CPU in hardware light
+    /// sleep until a wake source fires. Every return flows into
+    /// [`Self::tick`]'s shared render gate - a path in here can end
+    /// early, but it cannot skip the paint.
+    async fn sleeping_tick(&mut self) {
+        while let Ok(event) = EVENTS.try_receive() {
+            self.handle_event(event).await;
+            if !self.model.sleeping() {
                 return;
             }
-            let (wake_cause, slept_ms) = self.enter_light_sleep().await;
-            let gpio_wake = wake_cause & Self::WAKE_CAUSE_GPIO != 0;
-            // WAKE PROBE - remove after the wake-gap diagnosis.
-            log::info!("wakeprobe: rtc {} ms - light sleep returned", self.rtc_now_us() / 1000);
-
-            // Kick the RTC task to check for an alarm / timer flag
-            // latched while we slept. Boards with no RTC INT line (the
-            // C6) can't wake on expiry at all, and the RTC task's own
-            // software poll is embassy-timed - so it's frozen across
-            // light sleep and never fires on its own here. This makes
-            // detection happen on every heartbeat instead. Harmless on
-            // boards that woke via the RTC GPIO: the flag is read and
-            // cleared exactly once, whichever path reaches it first.
-            RTC_COMMAND.signal(RtcCommand::Poll);
-
-            // CPU just woke. The wake-source ISR marked its owning
-            // task ready but the task hasn't run yet, so `try_receive`
-            // here would race ahead of it. Wait with a short timeout
-            // for the first event, then drain any follow-ups. Timer
-            // wake with nothing else happening just falls through.
+        }
+        // An active hardware session holds a wake lock (a GPS
+        // sync today; audio is the planned second holder): its
+        // peripheral needs continuously running clocks, and
+        // hardware light sleep gates the UART/I2S clocks and
+        // silently drops their data. Idle here instead - the
+        // display stays dark, embassy time keeps running, the
+        // session's task and events flow - and real light sleep
+        // resumes on the first pass after the hold is released.
+        // Deliberately BEFORE enter_light_sleep so none of its
+        // wake diagnostics (cycle counts, slept-ms probes,
+        // summary lines) fire for these idle passes.
+        if crate::bus::wake_held() {
             match select(
                 EVENTS.receive(),
-                Timer::after(Duration::from_millis(50)),
+                Timer::after(Duration::from_millis(500)),
             ).await {
                 Either::First(event) => self.handle_event(event).await,
                 Either::Second(_) => {}
             }
-            while let Ok(event) = EVENTS.try_receive() {
-                self.handle_event(event).await;
-            }
-
-            // A wake line fired but no task delivered an event for it
-            // (a short tap: the touch-INT pulse ended before the
-            // touch task could service it, so nothing above woke the
-            // model). Don't lose the interaction back into sleep -
-            // synthesize the wake. Concrete events win when they
-            // arrive; this only fires when none did.
-            if gpio_wake && self.model.sleeping() {
-                // WAKE PROBE - remove after the wake-gap diagnosis.
-                log::info!("wakeprobe: rtc {} ms - no event within 50 ms, synthesizing", self.rtc_now_us() / 1000);
-                self.handle_event(SystemEvent::WakeInterrupt).await;
-            }
-
-            // Late re-log of the wake diagnostics: by now any wake
-            // transition has run and the USB host has resynced, so
-            // this line survives where the in-`enter_light_sleep`
-            // one gets eaten. A wake that stays dark after LESS than
-            // a full heartbeat is the anomaly under investigation
-            // (interrupted sleep attributed to the timer) and has no
-            // display transition to outlast the USB blackout - buy
-            // it the time explicitly (diagnosis probe; remove with
-            // the other probes).
-            if self.model.sleeping() && slept_ms < 4500 {
-                Timer::after(Duration::from_millis(300)).await;
-            }
-            // `rtc` is the absolute RTC-domain clock in ms - unlike
-            // embassy time it keeps counting through light sleep, so
-            // the line-to-line delta shows the true wall-clock
-            // cadence of the heartbeat (discriminates "sleeps are
-            // really ~0 ms" from "the slept probe is lying while the
-            // chip sleeps fine").
-            log::info!(
-                "light_sleep: summary (cycle {}, cause {:#b}, slept {} ms, rtc {} ms, {})",
-                self.sleep_cycles,
-                wake_cause,
-                slept_ms,
-                self.rtc_now_us() / 1000,
-                if self.model.sleeping() { "staying asleep" } else { "woke UI" },
-            );
-            // A UI wake's line above still races the USB resync -
-            // stash a copy for the first awake tick (see the field
-            // doc).
-            if !self.model.sleeping() {
-                self.pending_wake_summary =
-                    Some((self.sleep_cycles, wake_cause, slept_ms));
-                // Paint the wake frame NOW. This pass returns before
-                // the render at the tail of the awake path, and the
-                // next pass blocks on the event select for up to a
-                // full idle tick - without this the panel sits on the
-                // stale pre-sleep canvas for that second. Time may be
-                // one heartbeat (<= 5 s) stale in this frame; the
-                // next TimeUpdated tick repaints it.
-                if self.model.needs_redraw() {
-                    // WAKE PROBE - remove after the wake-gap diagnosis.
-                    log::info!("wakeprobe: rtc {} ms - wake render start", self.rtc_now_us() / 1000);
-                    self.board.set_cpu_freq(CpuFreq::Mhz160);
-                    self.render().await;
-                    log::info!("wakeprobe: rtc {} ms - wake render done", self.rtc_now_us() / 1000);
-                    self.sync_canvas();
-                    self.board.set_cpu_freq(CpuFreq::Mhz80);
-                    log::info!("wakeprobe: rtc {} ms - canvas sync done", self.rtc_now_us() / 1000);
-                }
-            }
             return;
         }
+        let (wake_cause, slept_ms) = self.enter_light_sleep().await;
+        let gpio_wake = wake_cause & Self::WAKE_CAUSE_GPIO != 0;
 
-        // Awake path: wait for events with an idle-tick heartbeat so
-        // the Model's dim / idle-sleep timers keep advancing even if
-        // nothing is happening. 1 s is plenty - thresholds are in
-        // multi-second territory.
+        // Kick the RTC task to check for an alarm / timer flag
+        // latched while we slept. Boards with no RTC INT line (the
+        // C6) can't wake on expiry at all, and the RTC task's own
+        // software poll is embassy-timed - so it's frozen across
+        // light sleep and never fires on its own here. This makes
+        // detection happen on every heartbeat instead. Harmless on
+        // boards that woke via the RTC GPIO: the flag is read and
+        // cleared exactly once, whichever path reaches it first.
+        RTC_COMMAND.signal(RtcCommand::Poll);
+
+        // CPU just woke. The wake-source ISR marked its owning
+        // task ready but the task hasn't run yet, so `try_receive`
+        // here would race ahead of it. Wait with a short timeout
+        // for the first event, then drain any follow-ups. Timer
+        // wake with nothing else happening just falls through.
+        match select(
+            EVENTS.receive(),
+            Timer::after(Duration::from_millis(50)),
+        ).await {
+            Either::First(event) => self.handle_event(event).await,
+            Either::Second(_) => {}
+        }
+        while let Ok(event) = EVENTS.try_receive() {
+            self.handle_event(event).await;
+        }
+
+        // A wake line fired but no task delivered an event for it
+        // (a short tap: the touch-INT pulse ended before the
+        // touch task could service it, so nothing above woke the
+        // model). Don't lose the interaction back into sleep -
+        // synthesize the wake. Concrete events win when they
+        // arrive; this only fires when none did.
+        if gpio_wake && self.model.sleeping() {
+            self.handle_event(SystemEvent::WakeInterrupt).await;
+        }
+
+        // Late re-log of the wake diagnostics: by now any wake
+        // transition has run and the USB host has resynced, so
+        // this line survives where the in-`enter_light_sleep`
+        // one gets eaten. A wake that stays dark after LESS than
+        // a full heartbeat is the anomaly under investigation
+        // (interrupted sleep attributed to the timer) and has no
+        // display transition to outlast the USB blackout - buy
+        // it the time explicitly (diagnosis probe; remove with
+        // the other probes).
+        if self.model.sleeping() && slept_ms < 4500 {
+            Timer::after(Duration::from_millis(300)).await;
+        }
+        // `rtc` is the absolute RTC-domain clock in ms - unlike
+        // embassy time it keeps counting through light sleep, so
+        // the line-to-line delta shows the true wall-clock
+        // cadence of the heartbeat (discriminates "sleeps are
+        // really ~0 ms" from "the slept probe is lying while the
+        // chip sleeps fine").
+        log::info!(
+            "light_sleep: summary (cycle {}, cause {:#b}, slept {} ms, rtc {} ms, {})",
+            self.sleep_cycles,
+            wake_cause,
+            slept_ms,
+            self.rtc_now_us() / 1000,
+            if self.model.sleeping() { "staying asleep" } else { "woke UI" },
+        );
+        // A UI wake's line above still races the USB resync -
+        // stash a copy for the first awake tick (see the field
+        // doc). The wake frame itself was already painted inside
+        // the display transition, before DISPON.
+        if !self.model.sleeping() {
+            self.pending_wake_summary =
+                Some((self.sleep_cycles, wake_cause, slept_ms));
+        }
+    }
+
+    /// One awake pass: wait for events with an idle-tick heartbeat
+    /// so the Model's dim / idle-sleep timers keep advancing even if
+    /// nothing is happening (1 s is plenty - thresholds are in
+    /// multi-second territory), drain the backlog, then advance
+    /// time-driven model state and service the SD slot. Rendering
+    /// happens in [`Self::tick`]'s shared gate.
+    async fn awake_tick(&mut self) {
         const IDLE_TICK: Duration = Duration::from_secs(1);
         match select(EVENTS.receive(), Timer::after(IDLE_TICK)).await {
             Either::First(event) => {
@@ -1055,43 +1151,6 @@ impl<B: Board> SystemManager<'static, B> {
         // CMD0/CMD8/ACMD41 sequence + MBR read - hence the
         // SD_RECOVER_INTERVAL throttle on that path).
         self.service_sd_slot().await;
-
-        if !self.model.sleeping() && self.model.needs_redraw() {
-            self.board.set_cpu_freq(CpuFreq::Mhz160);
-            self.render().await;
-            // The frame above may have been the tail of an
-            // interaction - re-mirror any deferred canvas tiles while
-            // the clock is still raised. No-op unless tiles are stale
-            // and the finger is up.
-            self.sync_canvas();
-            self.board.set_cpu_freq(CpuFreq::Mhz80);
-        } else if self.canvas_stale != 0
-            && !self.touch_active
-            && !self.model.sleeping()
-        {
-            // Interaction ended without a final redraw (plain
-            // release) - the deferred mirror work is all that's left.
-            self.board.set_cpu_freq(CpuFreq::Mhz160);
-            self.sync_canvas();
-            self.board.set_cpu_freq(CpuFreq::Mhz80);
-        }
-
-        // Deferred re-log of a UI wake's diagnostics (see the field
-        // doc): by the end of the first awake tick the USB host has
-        // resynced, so this copy survives where the summary printed
-        // at the wake itself gets shredded.
-        if let Some((cycle, cause, slept)) = self.pending_wake_summary.take() {
-            log::info!(
-                "light_sleep: wake summary (cycle {}, cause {:#b}, slept {} ms)",
-                cycle,
-                cause,
-                slept,
-            );
-        }
-
-        self.log_diagnostics();
-        self.tick_count = self.tick_count.wrapping_add(1);
-        self.model.set_tick_count(self.tick_count);
     }
 
     /// Render the active screen using per-tile rendering and dirty-tile

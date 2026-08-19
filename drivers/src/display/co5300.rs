@@ -204,9 +204,18 @@ impl<'fb, B: QspiWrite, RST: OutputPin> CO5300<'fb, B, RST> {
         self.write_cmd(0xC4,            &[0x80]).await; // enable QSPI opcode 0x32
         self.write_cmd(cmd::PIXFMT,     &[0x55]).await; // RGB565 (16 bpp)
         self.write_cmd(0x35,            &[0x00]).await; // tearing effect on, mode 0
-        self.write_cmd(0x53,            &[0x20]).await; // BC_EN=1
+        self.enable_brightness_ctrl().await;
         self.write_cmd(cmd::BRIGHTNESS, &[brightness]).await;
         self.write_cmd(0x63,            &[0xFF]).await; // HBM max
+    }
+
+    /// Enable the brightness-control block (WRCTRLD 53h, BCTRL=1).
+    /// While BCTRL is 0 the DBV brightness value is IGNORED
+    /// (datasheet 7.5.40), and SLPOUT's register-defaults reload
+    /// clears it (7.5.12) - so this must be re-sent after every
+    /// SLPOUT or brightness commands silently stop working.
+    pub async fn enable_brightness_ctrl(&mut self) {
+        self.write_cmd(0x53, &[0x20]).await;
     }
 
     // ---- Power / backlight ----------------------------------------------

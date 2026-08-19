@@ -74,6 +74,7 @@ pub async fn rtc_task(bus: &'static SharedI2c, mut state: RtcTaskState<'static>)
                 EVENTS.send(SystemEvent::TimeUpdated { data: time }).await;
             }
             Either3::Second(cmd) => {
+                let is_poll = matches!(cmd, RtcCommand::Poll);
                 // Drain any latched AF/TF before handling the
                 // command. The model emits `RtcCommand::SetAlarm`
                 // from `replan_alarms` whenever the next alarm
@@ -82,15 +83,27 @@ pub async fn rtc_task(bus: &'static SharedI2c, mut state: RtcTaskState<'static>)
                 // queue rolls forward. Without this drain, the new
                 // `set_alarm` would clear AF as part of arming and
                 // the fire event would be lost.
-                let pending = {
+                let (pending, time) = {
                     let mut i2c = bus.lock().await;
                     let time = state.snapshot(&mut *i2c);
                     let event = state.read_pending_flag(&mut *i2c, time);
                     state.handle_command(&mut *i2c, cmd);
-                    event
+                    (event, time)
                 };
                 if let Some(ev) = pending {
                     EVENTS.send(ev).await;
+                }
+                // A Poll is the manager's "we just woke" kick:
+                // broadcast the hardware read it already performed.
+                // Without this, the first TimeUpdated after a wake
+                // comes from this task's own 1 s soft-poll timer -
+                // an embassy timer, FROZEN across light sleep - so
+                // the wake frame rendered time stale by the whole
+                // sleep and visibly jumped up to a second later
+                // (watch-observed 2026-08-19: 00:00:44 -> 45 ->
+                // 01:23 on the stopwatch).
+                if is_poll {
+                    EVENTS.send(SystemEvent::TimeUpdated { data: time }).await;
                 }
             }
             Either3::Third(()) => {

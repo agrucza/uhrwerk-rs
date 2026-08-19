@@ -21,32 +21,69 @@ pub use app_core::ui::types::DisplayState;
 // compiling unchanged.
 pub use firmware_hal::display::init_display;
 
-/// Apply a display-state transition. Issues the necessary DCS
-/// commands over SPI: brightness changes for Active/Dim, the full
-/// `DISPOFF` + `SLPIN` sequence for Off, and `SLPOUT` + `DISPON` +
-/// brightness when waking from Off.
+/// Wake-from-Off, part 1: `SLPOUT` plus the post-SLPOUT command
+/// blackout (datasheet 7.5.12: the chip self-diagnoses and reloads
+/// register defaults for 5 ms - commands sent into that window are
+/// lost; 10 ms leaves margin), then re-arm the brightness-control
+/// block (7.5.40: with BCTRL cleared, DBV brightness values are
+/// silently ignored; one command, harmless if already set).
+///
+/// The panel is now powered but dark (`DISPON` not yet issued) and
+/// GRAM accepts writes (7.5.23: RAMWR is available in every mode,
+/// Sleep In included) - the caller renders the wake frame here,
+/// overlapping the booster's [`SLPOUT_BOOST`] ramp, then calls
+/// [`panel_on`]. The panel's first lit frame is current content.
+pub async fn panel_wake(display: &mut Display<'_>) {
+    display.wake().await;
+    Timer::after(Duration::from_millis(10)).await;
+    display.enable_brightness_ctrl().await;
+}
+
+/// Booster-on time after `SLPOUT` (datasheet 7.5.12 flow chart:
+/// "takes 120 ms to become Sleep Out mode (booster on)"). `DISPON`
+/// earlier risks an unstabilized first frame; the wake render
+/// overlaps this ramp and the caller tops up the remainder before
+/// [`panel_on`].
+pub const SLPOUT_BOOST: Duration = Duration::from_millis(120);
+
+/// Wake-from-Off, part 2: target brightness, then `DISPON` + its
+/// settle. The wake frame is already in GRAM and brightness is set
+/// before the panel lights, so the first lit frame is current
+/// content at the correct level.
+pub async fn panel_on(
+    display: &mut Display<'_>,
+    to: DisplayState,
+    config: &DisplayConfig,
+) {
+    let brightness = match to {
+        DisplayState::Dim => config.brightness_dim,
+        _ => config.brightness_active,
+    };
+    display.set_brightness(brightness).await;
+    display.display_on().await;
+    Timer::after(Duration::from_millis(70)).await;
+    log::info!("display: Off -> {:?}", to);
+}
+
+/// Apply a non-wake display-state transition: brightness moves
+/// between Active and Dim, and the full `DISPOFF` + `SLPIN`
+/// sequence for Off.
 ///
 /// Going to `Off` sends both DISPOFF (stops panel output) and
 /// SLPIN (shuts down the panel oscillator + booster) because
 /// DISPOFF alone still leaves the panel internal logic running at
 /// ~mA. SLPIN drops to panel standby (~uA).
 ///
-/// Waking from Off must respect the 120 ms SLPOUT settle window
-/// mandated by the CO5300 datasheet before issuing DISPON.
-///
-/// Returns `true` if the caller should treat this as "waking from
-/// Off" and force a full redraw: the caller is expected to reset
-/// its dirty-row tracking and set a redraw flag so the next tick
-/// pushes the full framebuffer back to the panel's GRAM. Returns
-/// `false` for the cheaper Active/Dim transitions where the panel
-/// contents are already correct.
+/// Waking from Off is deliberately NOT handled here - the manager
+/// orchestrates it as [`panel_wake`] -> fresh-time wait + wake-frame
+/// render (into the dark GRAM) -> [`panel_on`], so the first lit
+/// frame is current content at the correct brightness.
 pub async fn transition(
     display: &mut Display<'_>,
     from: DisplayState,
     to: DisplayState,
     config: &DisplayConfig,
-) -> bool {
-    let waking_from_off = from == DisplayState::Off && to != DisplayState::Off;
+) {
     match to {
         DisplayState::Off => {
             display.display_off().await;
@@ -59,27 +96,11 @@ pub async fn transition(
             Timer::after(Duration::from_millis(10)).await;
         }
         DisplayState::Active => {
-            if waking_from_off {
-                display.wake().await;
-                // Datasheet 7.5.12: wait >= 120 ms after SLPOUT before
-                // DISPON. Skipping this can leave the panel booster
-                // un-stabilized and produce a first-frame flash.
-                Timer::after(Duration::from_millis(120)).await;
-                display.display_on().await;
-                Timer::after(Duration::from_millis(70)).await;
-            }
             display.set_brightness(config.brightness_active).await;
         }
         DisplayState::Dim => {
-            if waking_from_off {
-                display.wake().await;
-                Timer::after(Duration::from_millis(120)).await;
-                display.display_on().await;
-                Timer::after(Duration::from_millis(70)).await;
-            }
             display.set_brightness(config.brightness_dim).await;
         }
     }
     log::info!("display: {:?} -> {:?}", from, to);
-    waking_from_off
 }
