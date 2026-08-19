@@ -433,12 +433,15 @@ impl<B: Board> SystemManager<'static, B> {
         for effect in effects {
             match effect {
                 Effect::TransitionDisplay { from, to } => {
+                    // WAKE PROBE - remove after the wake-gap diagnosis.
+                    log::info!("wakeprobe: rtc {} ms - display transition start", self.rtc_now_us() / 1000);
                     let waking_from_off = crate::display::transition(
                         &mut self.display,
                         from,
                         to,
                         &self.model.config().display,
                     ).await;
+                    log::info!("wakeprobe: rtc {} ms - display transition done", self.rtc_now_us() / 1000);
                     // Coming out of DISPOFF the panel's GRAM is whatever
                     // garbage it held while powered down. Ignore the
                     // per-screen dirty_rects on the next frame and push
@@ -453,6 +456,8 @@ impl<B: Board> SystemManager<'static, B> {
                     match state {
                         SleepState::Sleeping => log::info!("system: sleep"),
                         SleepState::Awake => {
+                            // WAKE PROBE - remove after the wake-gap diagnosis.
+                            log::info!("wakeprobe: rtc {} ms - awake broadcast + touch wake", self.rtc_now_us() / 1000);
                             // Kick the touch controller awake first so
                             // its boot overlaps the repaint below.
                             // No-op on controllers that wake on their
@@ -461,6 +466,7 @@ impl<B: Board> SystemManager<'static, B> {
                                 let mut i2c = self.i2c_bus.lock().await;
                                 self.board.touch_wake(&mut i2c);
                             }
+                            log::info!("wakeprobe: rtc {} ms - touch wake done", self.rtc_now_us() / 1000);
                             // Same reasoning as the DISPOFF -> Active
                             // transition above: stale GRAM + stale
                             // screen snapshot, so force a full repaint.
@@ -895,10 +901,23 @@ impl<B: Board> SystemManager<'static, B> {
                     Either::First(event) => self.handle_event(event).await,
                     Either::Second(_) => {}
                 }
+                // Same hole as the post-light-sleep path below: if
+                // that event woke the UI, this pass returns before
+                // the tail render and the next pass blocks on its
+                // select for up to a full idle tick - paint the wake
+                // frame before returning.
+                if !self.model.sleeping() && self.model.needs_redraw() {
+                    self.board.set_cpu_freq(CpuFreq::Mhz160);
+                    self.render().await;
+                    self.sync_canvas();
+                    self.board.set_cpu_freq(CpuFreq::Mhz80);
+                }
                 return;
             }
             let (wake_cause, slept_ms) = self.enter_light_sleep().await;
             let gpio_wake = wake_cause & Self::WAKE_CAUSE_GPIO != 0;
+            // WAKE PROBE - remove after the wake-gap diagnosis.
+            log::info!("wakeprobe: rtc {} ms - light sleep returned", self.rtc_now_us() / 1000);
 
             // Kick the RTC task to check for an alarm / timer flag
             // latched while we slept. Boards with no RTC INT line (the
@@ -933,6 +952,8 @@ impl<B: Board> SystemManager<'static, B> {
             // synthesize the wake. Concrete events win when they
             // arrive; this only fires when none did.
             if gpio_wake && self.model.sleeping() {
+                // WAKE PROBE - remove after the wake-gap diagnosis.
+                log::info!("wakeprobe: rtc {} ms - no event within 50 ms, synthesizing", self.rtc_now_us() / 1000);
                 self.handle_event(SystemEvent::WakeInterrupt).await;
             }
 
@@ -968,6 +989,23 @@ impl<B: Board> SystemManager<'static, B> {
             if !self.model.sleeping() {
                 self.pending_wake_summary =
                     Some((self.sleep_cycles, wake_cause, slept_ms));
+                // Paint the wake frame NOW. This pass returns before
+                // the render at the tail of the awake path, and the
+                // next pass blocks on the event select for up to a
+                // full idle tick - without this the panel sits on the
+                // stale pre-sleep canvas for that second. Time may be
+                // one heartbeat (<= 5 s) stale in this frame; the
+                // next TimeUpdated tick repaints it.
+                if self.model.needs_redraw() {
+                    // WAKE PROBE - remove after the wake-gap diagnosis.
+                    log::info!("wakeprobe: rtc {} ms - wake render start", self.rtc_now_us() / 1000);
+                    self.board.set_cpu_freq(CpuFreq::Mhz160);
+                    self.render().await;
+                    log::info!("wakeprobe: rtc {} ms - wake render done", self.rtc_now_us() / 1000);
+                    self.sync_canvas();
+                    self.board.set_cpu_freq(CpuFreq::Mhz80);
+                    log::info!("wakeprobe: rtc {} ms - canvas sync done", self.rtc_now_us() / 1000);
+                }
             }
             return;
         }
