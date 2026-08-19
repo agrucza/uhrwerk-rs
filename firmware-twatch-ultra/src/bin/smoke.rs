@@ -26,7 +26,7 @@ use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
-use firmware_hal::display::{init_display, take_framebuffer, HEIGHT, WIDTH};
+use firmware_hal::display::{init_display_lit, take_framebuffer, HEIGHT, WIDTH};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -106,7 +106,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
     // Display: same CO5300 init path as the other boards; only the
     // pins differ. Panel power is already up (ALDO2 + VCI_EN above).
     let fb = take_framebuffer();
-    let mut display = init_display(
+    let mut display = init_display_lit(
         peripherals.SPI2,
         peripherals.GPIO40, // SCLK
         peripherals.GPIO38, // SIO0

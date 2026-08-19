@@ -440,10 +440,36 @@ pub async fn init_display<'d, 'fb>(
     log::info!("Display: initializing CO5300...");
     display.init(brightness).await;
     display.wake().await;
-    Timer::after(Duration::from_millis(120)).await; // SLPOUT settle
+    Timer::after(Duration::from_millis(120)).await; // SLPOUT booster ramp
+    log::info!("Display: ready, dark ({} FB rows)", display.fb_rows());
+
+    display
+}
+
+/// [`init_display`] plus `DISPON`: panel initialized AND lit,
+/// showing whatever GRAM holds - which at power-on is random per
+/// the CO5300 datasheet (7.5.23, "Memory is set randomly": it
+/// showed as a brief green flash on the watch). For quick smoke
+/// bins only; the real firmware paints the boot frame first and
+/// lights the panel afterwards (manager boot reveal).
+pub async fn init_display_lit<'d, 'fb>(
+    spi: impl esp_hal::spi::master::Instance + 'd,
+    sclk: impl PeripheralOutput<'d>,
+    sio0: impl PeripheralInput<'d> + PeripheralOutput<'d>,
+    sio1: impl PeripheralInput<'d> + PeripheralOutput<'d>,
+    sio2: impl PeripheralInput<'d> + PeripheralOutput<'d>,
+    sio3: impl PeripheralInput<'d> + PeripheralOutput<'d>,
+    cs: impl PeripheralOutput<'d>,
+    dma: impl DmaChannelFor<AnySpi<'d>>,
+    reset_pin: Output<'d>,
+    fb: &'fb mut [u8],
+    brightness: u8,
+) -> CO5300<'fb, EspQspi<'d>, Output<'d>> {
+    let mut display = init_display(
+        spi, sclk, sio0, sio1, sio2, sio3, cs, dma, reset_pin, fb, brightness,
+    )
+    .await;
     display.display_on().await;
     Timer::after(Duration::from_millis(70)).await;
-    log::info!("Display: ready ({} FB rows)", display.fb_rows());
-
     display
 }

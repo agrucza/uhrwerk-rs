@@ -42,13 +42,17 @@ pub struct Capabilities {
 /// lip additionally swallows ~8 px on the top and sides.
 ///
 /// Only edge-hugging chrome consumes these (status bar, clock swipe
-/// hint, low-battery frame) - regular content already starts well
+/// hint) - regular content already starts well
 /// inboard and screens should keep deriving layout from the
 /// `theme::*` geometry, not from these insets.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SafeArea {
     pub top: i32,
     pub bottom: i32,
+    /// Left/right are COMFORT insets: raised beyond the physical
+    /// case edge so content stays readable at wrist viewing angles
+    /// (the raised case lip's occlusion sweeps inward horizontally
+    /// with the angle).
     pub left: i32,
     pub right: i32,
     /// Effective corner radius of the case aperture, in pixels,

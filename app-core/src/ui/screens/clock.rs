@@ -1,8 +1,9 @@
 //! Watch face - the Nightwatch OS ambient time display.
 //!
 //! Layout (top to bottom on a 410x502 canvas):
-//! 1. Telemetry strip: cyan `SYS-ID <code>` on the left, chrome
-//!    `DOW DD MON` on the right. Small mono-ish font.
+//! 1. Telemetry strip: cyan `BAT NN%` on the left (WARN/DANGER
+//!    below 20/10%), chrome `DOW DD MON` on the right. Small
+//!    mono-ish font.
 //! 2. Swipe-hint bar: a thin cyan 2 px line near the top, a visual
 //!    cue for the swipe-down-from-top edge gesture (routed by the
 //!    Model into Quick Access).
@@ -151,6 +152,9 @@ struct RenderedSnapshot {
     /// Last GPS fix at last render (`None` forever on boards
     /// without GPS, so the compare stays inert there).
     fix: Option<crate::data::GpsFix>,
+    /// Battery percent at last render - drives the telemetry
+    /// strip's low-battery takeover of the SYS-ID slot.
+    battery_pct: Option<u8>,
 }
 
 pub struct ClockScreen {
@@ -211,7 +215,10 @@ impl Screen for ClockScreen {
         if prev.hour != data.time.hour {
             region.add(HERO_HH_RECT);
         }
-        if prev.day != data.time.day || prev.month != data.time.month {
+        if prev.day != data.time.day
+            || prev.month != data.time.month
+            || prev.battery_pct != data.power.battery_percent
+        {
             // The strip renders shifted down by the device's top
             // inset; grow the region accordingly so the repaint
             // covers it on inset boards.
@@ -241,6 +248,7 @@ impl Screen for ClockScreen {
             timer_secs: data.timer.remaining().as_secs(),
             steps: data.steps_today,
             fix: data.gps_fix,
+            battery_pct: data.power.battery_percent,
         });
         self.force_full_next = false;
     }
@@ -314,14 +322,27 @@ fn draw_telemetry_strip<D: BlendTarget>(
     let left_pad = PAD_X.max(data.safe_area.left_inset_at(tele_y + 6, panel_h) + 6);
     let right_pad = PAD_X.max(data.safe_area.right_inset_at(tele_y + 6, panel_h) + 6);
 
-    // Left: SYS-ID code. Static filler per the spec - no real
-    // telemetry to report yet.
-    fonts::draw_at(
-        display, &font,
-        "SYS-ID 232.29CB.98B",
-        left_pad, tele_y,
-        theme::INFO,
-    );
+    // Left: battery readout - the clock face has no status bar, so
+    // this slot carries the always-on battery display AND the
+    // system-wide low-battery indicator (the status bar's % does
+    // both on every other screen). Replaced the spec's decorative
+    // SYS-ID filler.
+    let mut bat_buf: String<12> = String::new();
+    let (left_text, left_color) = match data.power.battery_percent {
+        Some(p) => {
+            let _ = write!(bat_buf, "BAT {}%", p);
+            let color = if p < 10 {
+                theme::DANGER
+            } else if p < 20 {
+                theme::WARN
+            } else {
+                theme::INFO
+            };
+            (bat_buf.as_str(), color)
+        }
+        None => ("BAT --", theme::FG_MUTED),
+    };
+    fonts::draw_at(display, &font, left_text, left_pad, tele_y, left_color);
 
     // Right: "TUE 24 APR".
     let weekday = crate::ui::screens::alarm::day_of_week(

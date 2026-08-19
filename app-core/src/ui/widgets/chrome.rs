@@ -207,10 +207,20 @@ pub fn status_bar<D: BlendTarget>(
     }
     let pct_w = fonts::measure_width(&font, buf.as_str());
 
+    // Low battery takes over the readout's color - THE system-wide
+    // low-battery indicator on every status-bar screen (the clock
+    // face mirrors it in its telemetry strip). A bezel ring was
+    // tried and dropped: no arc can hug the watch's case aperture
+    // without corner content crossing it.
+    let pct_color = match battery_pct {
+        Some(p) if p < 10 => theme::DANGER,
+        Some(p) if p < 20 => theme::WARN,
+        _ => tint,
+    };
     fonts::draw_at(
         display, &font, buf.as_str(),
         right_x - pct_w, y + 3,
-        tint,
+        pct_color,
     );
 
     let bt_cx = right_x - pct_w - gap - icon_r;

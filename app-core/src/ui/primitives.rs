@@ -9,12 +9,11 @@
 //! - `scrollbar_v` - vertical pill-shaped page indicator used by
 //!   the page-scrollbar chrome widget.
 //! - `battery_color` - status-color picker for a battery percent.
-//! - `battery_warning_frame` - low-battery system overlay.
 
 use embedded_graphics::{
     geometry::{Point, Size},
     prelude::Primitive,
-    primitives::{PrimitiveStyleBuilder, Rectangle, RoundedRectangle, StrokeAlignment},
+    primitives::{PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
     Drawable,
 };
 use crate::ui::types::BlendTarget;
@@ -105,57 +104,3 @@ pub fn battery_color(percent: u8) -> Color {
     else { theme::DANGER }
 }
 
-// -- System overlays ---------------------------------------------------------
-
-/// Draw a colored rounded-rect frame that runs parallel to the bezel
-/// curve, used as a system-wide low-battery warning overlay: yellow at
-/// 10-19%, signal red below 10%. No frame at 20% or above.
-///
-/// Geometry is tuned by eye against the actual visible bezel rather
-/// than `theme::CORNER_R` (which is a conservative *content-safe*
-/// inset, not the real bezel arc - using it produced a frame that sat
-/// well inside the bezel with too-small corners). `BEZEL_ARC_R` is
-/// the empirical bezel corner radius; `INSET` is how far inside the
-/// bezel the frame sits. The arc center lands at
-/// `(BEZEL_ARC_R, BEZEL_ARC_R)`, matching the bezel arc, so the frame
-/// runs exactly `INSET` px inside the bezel at every point.
-pub fn battery_warning_frame<D: BlendTarget>(
-    display: &mut D,
-    percent: u8,
-    safe: &crate::data::SafeArea,
-) {
-    use super::theme;
-    if percent >= 20 { return; }
-    let color = if percent < 10 { theme::DANGER } else { theme::WARN };
-
-    /// Empirical bezel corner radius - tuned by eye against the
-    /// actual visible bezel curve, not `theme::CORNER_R`.
-    const BEZEL_ARC_R: i32 = 116;
-    // The frame hugs the *visible* glass: the per-board safe-area
-    // insets keep it out from under the case lip (without them the
-    // T-Watch case swallows the whole top run). Boards that declare
-    // a measured aperture corner radius get their arc; the legacy
-    // Waveshare-tuned constant covers the rest.
-    let x = safe.left;
-    let y = safe.top;
-    let w = theme::SCREEN_W as i32 - safe.left - safe.right;
-    let h = theme::SCREEN_H as i32 - safe.top - safe.bottom;
-    let radius = if safe.corner_r > 0 {
-        safe.corner_r as u32
-    } else {
-        let min_inset = safe.top.min(safe.bottom).min(safe.left).min(safe.right);
-        (BEZEL_ARC_R - min_inset) as u32
-    };
-
-    let style = PrimitiveStyleBuilder::new()
-        .stroke_color(color)
-        .stroke_width(3)
-        .stroke_alignment(StrokeAlignment::Inside)
-        .build();
-    RoundedRectangle::with_equal_corners(
-        Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32)),
-        Size::new(radius, radius),
-    )
-    .into_styled(style)
-    .draw(display).ok();
-}

@@ -9,7 +9,6 @@ use crate::tasks::imu::ImuTaskState;
 use crate::tasks::power::PowerTaskState;
 use crate::tasks::rtc::RtcTaskState;
 use crate::tasks::touch::TouchTaskState;
-use app_core::ui::primitives;
 use app_core::ui::types::{DirtyRegion, RenderCtx, SystemData};
 use embedded_graphics::draw_target::DrawTarget;
 use embassy_futures::select::{select, Either};
@@ -284,6 +283,13 @@ pub struct SystemManager<'d, B: Board> {
 /// within a few seconds without flooding the slot with probes.
 const SD_RECOVER_INTERVAL: Duration = Duration::from_secs(5);
 
+/// No SD probing / mirroring before this point in the boot (the
+/// embassy clock starts at zero at reset, so an absolute Instant
+/// works as a boot deadline). Covers the boot storm - BHI260
+/// firmware upload (~4 s), radio canaries, first full render -
+/// whose CPU load blows the card's busy-poll deadlines.
+const SD_BOOT_GRACE_END: Instant = Instant::from_secs(10);
+
 // `NAV_STACK_DEPTH` and the `NavStack` type live in
 // `app_core::nav` so the stack's push/pop semantics are
 // host-testable.
@@ -342,12 +348,20 @@ impl<B: Board> SystemManager<'static, B> {
             .ok()
             .and_then(|mut i2c| board.sd_detect(&mut i2c))
             == Some(false);
-        let sd_online = if slot_empty {
+        // Boot only notes slot presence - the first probe + mirror
+        // backfill are deferred past SD_BOOT_GRACE_END (picked up by
+        // service_sd_slot): probing here put the card's busy-poll
+        // deadlines inside the boot storm (BHI260 firmware upload,
+        // radio canaries, first render) and flapped the mirror
+        // offline with TimeoutReadBuffer. Flash is primary, so the
+        // deferred mirror loses nothing; the backfill catches up in
+        // one quiet pass after the grace.
+        if slot_empty {
             log::info!("SD: slot empty - boot probe skipped");
-            false
         } else {
-            store.probe_sd()
-        };
+            log::info!("SD: probe deferred past boot grace");
+        }
+        let sd_online = false;
 
         crate::event_log::log_boot(&mut store, &initial_time);
 
@@ -605,6 +619,16 @@ impl<B: Board> SystemManager<'static, B> {
     /// touch-drag rate, contending with the touch task for the bus.
     async fn service_sd_slot(&mut self) {
         let now = Instant::now();
+        // Boot grace: the first SD probe + mirror backfill used to
+        // land in the middle of the boot storm (BHI260 firmware
+        // upload, boot render, radio canaries), where the card's
+        // busy-polling deadlines blow (TimeoutReadBuffer) and the
+        // mirror flaps offline/online. Flash is the primary store,
+        // so deferring the mirror costs nothing - the backfill
+        // catches up in one quiet pass once the grace expires.
+        if now < SD_BOOT_GRACE_END {
+            return;
+        }
         if let Some(last) = self.last_sd_detect_check {
             if now.duration_since(last) < SD_RECOVER_INTERVAL {
                 return;
@@ -1189,7 +1213,6 @@ impl<B: Board> SystemManager<'static, B> {
         // the per-frame clone cost is ~400 bytes, well below the
         // render-time budget at any realistic frame cadence.
         let data = self.model.cached_data().clone();
-        let battery_pct = data.power.battery_percent;
 
         // Decide which tiles need to be rendered this frame.
         //
@@ -1256,9 +1279,6 @@ impl<B: Board> SystemManager<'static, B> {
             self.display.clear(app_core::ui::theme::BG).ok();
 
             self.model.screen_mut().render(&mut self.display, &data, &ctx);
-            if let Some(pct) = battery_pct {
-                primitives::battery_warning_frame(&mut self.display, pct, &data.safe_area);
-            }
 
             // Decide whether this tile needs to go over QSPI. For
             // `FullScreen` dirty frames we already know the answer (yes)
@@ -1374,7 +1394,6 @@ impl<B: Board> SystemManager<'static, B> {
         }
         let sync_start = Instant::now();
         let data = self.model.cached_data().clone();
-        let battery_pct = data.power.battery_percent;
 
         for tile_idx in 0..NUM_TILES {
             if self.canvas_stale & (1u16 << tile_idx) == 0 {
@@ -1387,9 +1406,6 @@ impl<B: Board> SystemManager<'static, B> {
             self.display.set_tile_y(tile_y);
             self.display.clear(app_core::ui::theme::BG).ok();
             self.model.screen_mut().render(&mut self.display, &data, &ctx);
-            if let Some(pct) = battery_pct {
-                primitives::battery_warning_frame(&mut self.display, pct, &data.safe_area);
-            }
 
             let canvas = self.fb_canvas.as_deref_mut().unwrap();
             let start = tile_y as usize * ROW_STRIDE;
@@ -1614,6 +1630,20 @@ pub async fn run<T: Bringup>(
     // Board-specific: the speaker task, where the board has one. Owns
     // the I2S / DMA / speaker pins; lazy bring-up on the first tone.
     bringup.spawn_audio(spawner, i2c_bus);
+
+    // Boot reveal: the panel is initialized but dark (init_display
+    // stops before DISPON - power-on GRAM is random per datasheet
+    // 7.5.23, which showed as a green flash when lit unpainted).
+    // Paint the boot frame, then light it - the same frame-before-
+    // first-light rule as the wake path.
+    manager.render().await;
+    manager.sync_canvas();
+    crate::display::panel_on(
+        &mut manager.display,
+        app_core::ui::types::DisplayState::Active,
+        &manager.model.config().display,
+    )
+    .await;
 
     loop {
         manager.tick().await;
