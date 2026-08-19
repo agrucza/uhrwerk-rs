@@ -283,7 +283,13 @@ use embassy_time::{Duration, Instant};
 #[derive(Debug, Clone, Copy)]
 pub enum StopwatchState {
     Idle,
-    Running { start: Instant, accumulated: Duration },
+    /// Counting. `start`/`accumulated` are the embassy-clock view
+    /// that `elapsed()` reads; the embassy clock freezes across
+    /// light sleep, so the model re-derives `start` from
+    /// `anchor_secs` - the RTC seconds-since-midnight at this run
+    /// segment's start - on every TimeUpdated (see
+    /// `Model::resync_stopwatch`).
+    Running { start: Instant, accumulated: Duration, anchor_secs: u32 },
     Paused { accumulated: Duration },
 }
 
@@ -292,7 +298,7 @@ impl StopwatchState {
     pub fn elapsed(&self) -> Duration {
         match self {
             Self::Idle => Duration::from_ticks(0),
-            Self::Running { start, accumulated } => {
+            Self::Running { start, accumulated, .. } => {
                 *accumulated + Instant::now().duration_since(*start)
             }
             Self::Paused { accumulated } => *accumulated,

@@ -29,7 +29,7 @@ use crate::nav::NavStack;
 use crate::ui::screens::ActiveScreen;
 use crate::ui::types::{
     Action, AlarmReprogram, AlarmState, DisplayState, Notification, NotificationSeverity,
-    NotificationSource, ScreenId, SystemData, TimerState,
+    NotificationSource, ScreenId, StopwatchState, SystemData, TimerState,
 };
 
 /// Upper bound on the number of [`Effect`]s produced by a single
@@ -509,9 +509,11 @@ impl Model {
                 // Day rollover zeroes the daily step count. Covers
                 // midnight and any time-set that lands on another
                 // day (GPS sync, manual set).
-                if data.day != self.cached_data.time.day {
+                let day_rolled = data.day != self.cached_data.time.day;
+                if day_rolled {
                     self.cached_data.steps_today = 0;
                 }
+                self.resync_stopwatch(data, day_rolled);
                 self.cached_data.time = *data;
                 // Re-evaluate the next-firing alarm against the
                 // new time. Catches alarms whose fire-time the
@@ -1146,6 +1148,60 @@ impl Model {
         self.screen.open_notifications(&self.cached_data);
     }
 
+    /// Re-derive a running stopwatch's embassy view from its RTC
+    /// anchor. The embassy clock freezes across light sleep, so
+    /// `elapsed()` would silently exclude every slept second;
+    /// rewriting `start` against the segment's FIXED `anchor_secs`
+    /// on each wall-clock tick makes the first tick after any sleep
+    /// fold the whole gap in - before any screen renders - and,
+    /// because the anchor never moves, repeated corrections cannot
+    /// accumulate rounding error. Runs before `cached_data.time` is
+    /// overwritten (`day_rolled` comes from the old value).
+    fn resync_stopwatch(&mut self, now_time: &crate::data::TimeData, day_rolled: bool) {
+        let StopwatchState::Running { start, accumulated, anchor_secs } =
+            self.cached_data.stopwatch
+        else {
+            return;
+        };
+        let now = Instant::now();
+        let now_secs = now_time.secs_of_day();
+        self.cached_data.stopwatch = if day_rolled {
+            // Fold the segment across midnight (anchor..24:00 plus
+            // 00:00..now, RTC-exact) and re-anchor. Handles multi-day
+            // runs one midnight at a time.
+            StopwatchState::Running {
+                start: now,
+                accumulated: accumulated
+                    + Duration::from_secs((86_400 - anchor_secs + now_secs) as u64),
+                anchor_secs: now_secs,
+            }
+        } else if now_secs >= anchor_secs {
+            let run = Duration::from_secs((now_secs - anchor_secs) as u64);
+            match now.checked_sub(run) {
+                // Normal path: same accumulated/anchor, embassy view
+                // re-derived so elapsed() agrees with the RTC.
+                Some(start) => StopwatchState::Running { start, accumulated, anchor_secs },
+                // Segment is longer than the embassy clock has been
+                // alive (long sleeps early after boot): fold the
+                // RTC-exact segment instead of anchoring before zero.
+                None => StopwatchState::Running {
+                    start: now,
+                    accumulated: accumulated + run,
+                    anchor_secs: now_secs,
+                },
+            }
+        } else {
+            // Clock moved backwards without a day change (manual
+            // set / GPS sync): the RTC delta is meaningless, so keep
+            // the embassy-measured elapsed and re-anchor.
+            StopwatchState::Running {
+                start: now,
+                accumulated: accumulated + now.duration_since(start),
+                anchor_secs: now_secs,
+            }
+        };
+    }
+
     /// Re-evaluate which enabled alarm fires next given the
     /// cached time and emit the matching RTC command. The `force`
     /// flag controls whether to emit a command even when the
@@ -1407,6 +1463,44 @@ mod tests {
         // still credits only its delta.
         m.handle_event(&step_event(510), Instant::from_millis(3_000));
         assert_eq!(m.cached_data().steps_today, 10);
+    }
+
+    #[test]
+    fn stopwatch_resyncs_from_rtc_across_sleep() {
+        // The embassy clock effectively stands still in this test
+        // (only test-execution time passes), standing in for a light
+        // sleep; the RTC ticks are what must drive elapsed().
+        let mut d = SystemData::default();
+        d.time = crate::data::TimeData {
+            hour: 10, minute: 0, second: 0,
+            ..Default::default()
+        };
+        d.stopwatch = StopwatchState::Running {
+            start: Instant::now(),
+            accumulated: Duration::from_ticks(0),
+            anchor_secs: 10 * 3600,
+        };
+        let mut m = Model::new(d, Config::default(), Instant::from_millis(0));
+
+        // RTC says 90 s passed while embassy time stood still.
+        let mut t = m.cached_data().time;
+        t.minute = 1;
+        t.second = 30;
+        m.handle_event(&SystemEvent::TimeUpdated { data: t }, Instant::from_millis(1_000));
+        let e = m.cached_data().stopwatch.elapsed().as_secs();
+        assert!((90..=91).contains(&e), "elapsed {e}, expected ~90");
+
+        // Midnight fold: 10:01:30 -> 00:00:10 next day is 50 410 s
+        // from the run's 10:00:00 anchor. The anchor did NOT move on
+        // the first resync, so the fold is exact against it.
+        let mut t2 = t;
+        t2.day += 1;
+        t2.hour = 0;
+        t2.minute = 0;
+        t2.second = 10;
+        m.handle_event(&SystemEvent::TimeUpdated { data: t2 }, Instant::from_millis(2_000));
+        let e = m.cached_data().stopwatch.elapsed().as_secs();
+        assert!((50_410..=50_411).contains(&e), "elapsed {e}, expected ~50410");
     }
 
     #[test]

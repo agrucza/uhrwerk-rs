@@ -178,6 +178,13 @@ pub struct TimeData {
     pub day: u8,
 }
 
+impl TimeData {
+    /// Seconds since midnight of the wall-clock time.
+    pub fn secs_of_day(&self) -> u32 {
+        self.hour as u32 * 3600 + self.minute as u32 * 60 + self.second as u32
+    }
+}
+
 impl Default for TimeData {
     fn default() -> Self {
         Self { hour: 0, minute: 0, second: 0, year: 2026, month: 1, day: 1 }

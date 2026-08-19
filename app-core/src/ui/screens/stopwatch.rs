@@ -244,13 +244,18 @@ impl Screen for StopwatchScreen {
                         StopwatchState::Idle => StopwatchState::Running {
                             start: Instant::now(),
                             accumulated: Duration::from_ticks(0),
+                            anchor_secs: data.time.secs_of_day(),
                         },
-                        StopwatchState::Running { start, accumulated } => StopwatchState::Paused {
-                            accumulated: accumulated + Instant::now().duration_since(start),
-                        },
+                        StopwatchState::Running { start, accumulated, .. } => {
+                            StopwatchState::Paused {
+                                accumulated: accumulated
+                                    + Instant::now().duration_since(start),
+                            }
+                        }
                         StopwatchState::Paused { accumulated } => StopwatchState::Running {
                             start: Instant::now(),
                             accumulated,
+                            anchor_secs: data.time.secs_of_day(),
                         },
                     };
                     Action::Redraw
