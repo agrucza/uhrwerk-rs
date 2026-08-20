@@ -390,6 +390,16 @@ pub fn classify_for_log(event: &SystemEvent) -> Option<LoggedEvent> {
             LoggedEvent { tag: "gps_sync", detail: None, detail2: None },
         SystemEvent::WifiStatusUpdated { state: crate::data::WifiState::Synced { .. } } =>
             LoggedEvent { tag: "wifi_sync", detail: None, detail2: None },
+        // Charge termination, and only that phase - the same
+        // terminal-event-only rule as the two syncs above. This is
+        // the moment the charger current tapered below the
+        // termination threshold, which is what re-anchors the fuel
+        // gauge's 100%. Nothing else marks it: `battery` lines are
+        // written on percent CHANGE and have long since stopped at
+        // 100 by the time termination arrives, so without this line
+        // the anchor has no timestamp anywhere.
+        SystemEvent::ChargerPhaseChanged { phase: ChargerPhase::Done } =>
+            LoggedEvent { tag: "charged", detail: None, detail2: None },
         _ => return None,
     })
 }
@@ -469,6 +479,28 @@ mod tests {
             }),
             Some(LoggedEvent { tag: "battery", detail: Some(73), detail2: Some(3912) }),
         );
+    }
+
+    #[test]
+    fn log_classifier_records_only_the_charge_termination_phase() {
+        assert_eq!(
+            classify_for_log(&SystemEvent::ChargerPhaseChanged {
+                phase: ChargerPhase::Done,
+            }),
+            Some(LoggedEvent { tag: "charged", detail: None, detail2: None }),
+        );
+        // Every other phase is a step on the way, not the anchor -
+        // logging them would put four lines in the log per charge and
+        // bury the one that matters.
+        for phase in [
+            ChargerPhase::TriCharge,
+            ChargerPhase::PreCharge,
+            ChargerPhase::ConstantCurrent,
+            ChargerPhase::ConstantVoltage,
+            ChargerPhase::NotCharging,
+        ] {
+            assert_eq!(classify_for_log(&SystemEvent::ChargerPhaseChanged { phase }), None);
+        }
     }
 
     #[test]
