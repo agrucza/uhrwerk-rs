@@ -5,8 +5,11 @@ embassy) firmware for ESP32 AMOLED smartwatches. One shared,
 board-agnostic system layer (`system-core`: manager, tasks, UI model,
 storage, audio) runs on three watches through a `Board` trait plus
 per-chip driver seams; each `firmware-*` bin crate only supplies pins,
-board bring-up, and its chip choices. Long-term goal: a push-to-talk
-Home Assistant voice assistant (Wyoming over TCP).
+board bring-up, and its chip choices.
+
+The goal is a daily-driver watch: full hardware support first, feature
+builds on top of it. A push-to-talk Home Assistant voice assistant
+(Rust-native, Wyoming over TCP) is one of the planned features.
 
 ## Workspace
 
@@ -41,4 +44,6 @@ License 1.1 - license text in `assets/fonts/LICENSE.txt`.
 | LoRa (SX1262) | n/a | n/a | working (RX + TX proven over the air vs a Meshtastic node; boot probe, session UI pending) |
 | GPS (MIA-M10Q) | n/a | n/a | working (rail-gated time sync, settings UI) |
 | NFC (ST25R3916) | n/a | n/a | working (ISO14443A card detect proven; rail-gated boot probe, session UI pending) |
-| WiFi / networking | not started | not started | not started |
+| WiFi / networking | working (scan, WPA2 join, DHCP, NTP time sync) | working | working |
+| Bluetooth LE | not started | not started | not started |
+| 802.15.4 (Zigbee / Thread) | n/a | not started | n/a |
