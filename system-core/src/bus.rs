@@ -180,3 +180,23 @@ pub type SharedI2c = Mutex<CriticalSectionRawMutex, I2c<'static, Blocking>>;
 /// One-time storage for the shared I2C bus. Initialised by the
 /// manager and handed to tasks as `&'static SharedI2c`.
 pub static I2C_BUS: StaticCell<SharedI2c> = StaticCell::new();
+
+/// Type alias for the shared persistent store, protected by an async
+/// mutex - the same arrangement as [`SharedI2c`], for the same
+/// reason: storage is a device more than one subsystem needs.
+///
+/// The manager was its sole owner while it was the only reader and
+/// writer. A task that serves files over the network needs the same
+/// handle, and two independent handles onto one flash region would
+/// mean two caches over the same blocks.
+///
+/// **Lock discipline.** Every `Store` method is SYNCHRONOUS - littlefs
+/// over SPI flash and embedded-sdmmc are both blocking - so whoever
+/// holds this lock is also holding the executor. Lock for one
+/// operation, release, and yield before the next: never read a whole
+/// file, or await anything, while holding it.
+pub type SharedStore = Mutex<CriticalSectionRawMutex, crate::storage::Store<'static>>;
+
+/// One-time storage for the shared store. Initialised by the manager
+/// during bring-up and handed out as `&'static SharedStore`.
+pub static STORE: StaticCell<SharedStore> = StaticCell::new();

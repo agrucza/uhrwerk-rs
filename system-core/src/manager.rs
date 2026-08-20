@@ -258,7 +258,12 @@ pub struct SystemManager<'d, B: Board> {
     // SD-mirror online flag. Mirrored writes, flash-only escape
     // hatch (`flash_mut`) and SD-only escape hatch (`sd_mut`) all
     // live on this one handle. See `system::storage` for the API.
-    store: crate::storage::Store<'d>,
+    //
+    // SHARED, not owned: tasks that need storage (the file-server
+    // session) hold the same `&'static SharedStore`. Every access
+    // here locks for one operation and releases - see the lock
+    // discipline on [`crate::bus::SharedStore`].
+    store: &'static crate::bus::SharedStore,
 
     // Last storage usage pushed into the event channel. Compared
     // against a fresh summary after each save / boot; we only
@@ -390,6 +395,14 @@ impl<B: Board> SystemManager<'static, B> {
         crate::event_log::load_battery_history(
             &mut store, &mut cached_data.battery_history,
         );
+
+        // Boot-time reads are done. Hand the store to the shared cell:
+        // from here every touch of it - ours and any task's - goes
+        // through the mutex. Done here rather than at construction so
+        // the bring-up reads above stay plain synchronous calls on an
+        // owned value, with no lock to reason about before tasks exist.
+        let store: &'static crate::bus::SharedStore =
+            crate::bus::STORE.init(embassy_sync::mutex::Mutex::new(store));
 
         let model = app_core::model::Model::new(
             cached_data, loaded_config, Instant::now(),
@@ -564,17 +577,17 @@ impl<B: Board> SystemManager<'static, B> {
                 }
                 Effect::FactoryReset => {
                     log::info!("factory reset: wiping flash + SD mirror");
-                    self.store.reset_user_data();
+                    self.store.lock().await.reset_user_data();
                     self.refresh_storage_usage().await;
                 }
                 Effect::ProbeSd => {
                     log::info!("SD: re-probing on user request");
-                    self.store.probe_sd();
+                    self.store.lock().await.probe_sd();
                     self.refresh_storage_usage().await;
                 }
                 Effect::RestoreFromSd => {
                     log::info!("restore: copying config blob from SD to flash");
-                    let (copied, skipped) = self.store
+                    let (copied, skipped) = self.store.lock().await
                         .restore_config_from_sd(&[CONFIG_PATH]);
                     log::info!(
                         "restore: {} copied, {} skipped - resetting",
@@ -586,7 +599,7 @@ impl<B: Board> SystemManager<'static, B> {
                     esp_hal::system::software_reset();
                 }
                 Effect::SaveConfig => {
-                    self.store.save_blob(
+                    self.store.lock().await.save_blob(
                         CONFIG_PATH,
                         CONFIG_VERSION,
                         self.model.config(),
@@ -642,9 +655,14 @@ impl<B: Board> SystemManager<'static, B> {
         };
         match detect {
             Some(false) => {
-                if self.store.sd_online() {
+                // Bind the flag before the body: the body locks again,
+                // and this mutex is NOT reentrant. Holding the guard
+                // in the condition across a second lock would deadlock
+                // the whole executor, so never let the two overlap.
+                let was_online = self.store.lock().await.sd_online();
+                if was_online {
                     log::info!("SD: card removed - mirror offline");
-                    self.store.on_sd_removed();
+                    self.store.lock().await.on_sd_removed();
                     self.refresh_storage_usage().await;
                 }
             }
@@ -658,7 +676,12 @@ impl<B: Board> SystemManager<'static, B> {
     /// `StorageUsageUpdated` event so the UI's "SD online"
     /// indicator updates without waiting for the next save.
     async fn try_sd_auto_recovery(&mut self) {
-        if self.store.sd_online() {
+        // Hoisted like the others. This body happens not to lock
+        // today, but the rule is uniform on purpose: nobody adding a
+        // storage call here later should have to notice that the
+        // condition still holds the guard.
+        let already_online = self.store.lock().await.sd_online();
+        if already_online {
             return;
         }
         let now = Instant::now();
@@ -668,7 +691,10 @@ impl<B: Board> SystemManager<'static, B> {
             }
         }
         self.last_sd_recover_attempt = Some(now);
-        if self.store.try_recover_sd() {
+        // Same rule as `service_sd_slot`: release the guard before the
+        // body, which locks again inside `refresh_storage_usage`.
+        let recovered = self.store.lock().await.try_recover_sd();
+        if recovered {
             log::info!("SD: auto-recovered (card detected)");
             self.refresh_storage_usage().await;
         }
@@ -680,11 +706,17 @@ impl<B: Board> SystemManager<'static, B> {
     /// boot). Keeps the fire-hose out of the event pipeline when
     /// nothing visibly changed.
     async fn refresh_storage_usage(&mut self) {
-        let fs_usage = self.store.usage();
+        // One lock for both reads: they describe the same moment, and
+        // re-locking between them would let a task's write land in the
+        // middle of the pair.
+        let (fs_usage, sd_online) = {
+            let store = self.store.lock().await;
+            (store.usage(), store.sd_online())
+        };
         let fresh = app_core::data::StorageUsage {
             files: fs_usage.files,
             total_bytes: fs_usage.total_bytes,
-            sd_online: self.store.sd_online(),
+            sd_online,
         };
         if fresh != self.last_storage_usage {
             self.last_storage_usage = fresh;
@@ -894,7 +926,7 @@ impl<B: Board> SystemManager<'static, B> {
         // log captures the triggering event even if the model
         // transitions into sleep or shuts down.
         crate::event_log::try_log(
-            &mut self.store,
+            &mut *self.store.lock().await,
             &self.model.cached_data().time,
             &event,
         );
