@@ -2,6 +2,24 @@
 //!
 //! Status snapshots, configuration structs, and enums for charger,
 //! input limits, power key timing, and other PMU subsystems.
+//!
+//! # Encoding audit status (2026-08-20, vs datasheet V1.4)
+//!
+//! Audited against the datasheet, pinned by unit tests where
+//! numeric: PmuStatus1/2, CurrentDirection, ChargerPhase,
+//! InputCurrentLimit, PreChargeCurrent, ChargeCurrent (was one
+//! code off in both ranges!), TerminationCurrent, ChargeVoltage,
+//! PowerOffVoltage, LowBatteryWarning, button-battery voltage, the
+//! 14-bit ADC assembly and its 1 mV/LSB scaling.
+//!
+//! Hardware-verified daily rather than re-derived: LDO/DCDC
+//! voltage encodings (working 1.8 V / 3.3 V peripherals), the IRQ
+//! bit maps in `interrupts.rs` (wake sources function).
+//!
+//! NOT audited (no callers in the firmware): JEITA, charge-LED,
+//! TS-pin, DCDC-PWM, PWROK, sleep/wake, watchdog and power-key
+//! types below. Audit before first use - this driver has already
+//! shipped one wrong table that "worked".
 
 // ---- Status registers (REG 00h-01h) ----------------------------------------
 
@@ -141,7 +159,8 @@ impl InputCurrentLimit {
 /// Pre-charge current (REG 61h bits 3:0).
 /// Value in mA = 25 * N, where N = register value (0-15).
 /// Range: 0 mA (disabled) to 375 mA in 25 mA steps.
-/// Default after reset: 0 (disabled).
+/// POR default: 0101b = 125 mA (datasheet 6.13.2.59 - an earlier
+/// version of this doc claimed 0/disabled).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreChargeCurrent(pub u8);
 

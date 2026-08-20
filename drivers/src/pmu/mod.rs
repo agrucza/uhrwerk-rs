@@ -480,14 +480,13 @@ impl Pmu {
 
     /// Read battery voltage in millivolts.
     ///
-    /// The ADC produces a 14-bit value with 1 mV per LSB.
+    /// The ADC produces a 14-bit value with 1 mV per LSB (datasheet
+    /// 6.10 table: VBAT/VBUS/VSYS channels are all 1 mV/LSB).
     pub fn battery_voltage_mv<I2C, E>(&self, i2c: &mut I2C) -> Result<u16, Error<E>>
     where
         I2C: I2cTrait<Error = E>,
     {
-        let hi = self.read_register(i2c, registers::REG_VBAT_H)? as u16;
-        let lo = self.read_register(i2c, registers::REG_VBAT_L)? as u16;
-        Ok((hi << 8) | lo)
+        self.read_adc_14bit(i2c, registers::REG_VBAT_H, registers::REG_VBAT_L)
     }
 
     // ---- Status registers (REG 00h-01h) ------------------------------------
@@ -744,6 +743,39 @@ impl Pmu {
     {
         let reg = self.read_register(i2c, registers::REG_VSYS_PWROFF)?;
         Ok(types::PowerOffVoltage(reg & 0x07))
+    }
+
+    /// Read the fuel gauge's 128-byte battery model through the
+    /// BROM window (REG A1h).
+    ///
+    /// Toggling the writer-control bit (REG A2h bit 0) off -> on
+    /// resets the window's address pointer to byte 0; each A1h
+    /// access then auto-increments. Read-only and safe: the default
+    /// model lives in mask ROM restored at power-on and cannot be
+    /// damaged. Bit 4 (ROM/SRAM select) is preserved. Sequence per
+    /// the Allwinner BSP gauge driver (lindenis-v853-lichee-
+    /// linux-4.9, axp2101_battery.c model read-back).
+    ///
+    /// Silicon-observed 2026-08-20: with no model uploaded, this
+    /// returns stable but HIGH-ENTROPY bytes that do NOT match the
+    /// plain blob format the BSP uploads - the ROM bank evidently
+    /// reads back in an internal representation. Read-back is only
+    /// meaningful for verifying data previously written through
+    /// the window (the only way the BSP itself uses it).
+    pub fn read_battery_model<I2C, E>(&self, i2c: &mut I2C) -> Result<[u8; 128], Error<E>>
+    where
+        I2C: I2cTrait<Error = E>,
+    {
+        let cfg = self.read_register(i2c, registers::REG_GAUGE_CFG)?;
+        self.write_register(i2c, registers::REG_GAUGE_CFG, cfg & !0x01)?;
+        self.write_register(i2c, registers::REG_GAUGE_CFG, (cfg & !0x01) | 0x01)?;
+        let mut model = [0u8; 128];
+        for byte in model.iter_mut() {
+            *byte = self.read_register(i2c, registers::REG_BAT_PARAM)?;
+        }
+        // Close the window (writer control off).
+        self.write_register(i2c, registers::REG_GAUGE_CFG, cfg & !0x01)?;
+        Ok(model)
     }
 
     /// Read the constant-voltage charge target.
@@ -1758,9 +1790,32 @@ impl Pmu {
     where
         I2C: I2cTrait<Error = E>,
     {
-        let hi = self.read_register(i2c, reg_h)? as u16;
-        let lo = self.read_register(i2c, reg_l)? as u16;
-        Ok((hi << 8) | lo)
+        let hi = self.read_register(i2c, reg_h)?;
+        let lo = self.read_register(i2c, reg_l)?;
+        Ok(adc14(hi, lo))
+    }
+}
+
+/// Assemble a 14-bit ADC value from its high/low register bytes.
+/// The high byte's bits 7:6 are NOT part of the value - on vbat_h
+/// (REG 34) they are even writable debug-channel controls
+/// (ch_dbg_en, datasheet 6.13.2.30) - so they must be masked. The
+/// unmasked version only ever worked because those bits default
+/// to 0.
+fn adc14(hi: u8, lo: u8) -> u16 {
+    (((hi & 0x3F) as u16) << 8) | lo as u16
+}
+
+#[cfg(test)]
+mod adc_tests {
+    use super::adc14;
+
+    #[test]
+    fn adc14_masks_debug_bits() {
+        assert_eq!(adc14(0x0F, 0xA0), 0x0FA0);
+        // ch_dbg_en bits set must not leak into the value.
+        assert_eq!(adc14(0xCF, 0xA0), 0x0FA0);
+        assert_eq!(adc14(0x3F, 0xFF), 0x3FFF); // full-scale 14-bit
     }
 }
 
