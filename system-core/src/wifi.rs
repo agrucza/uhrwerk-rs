@@ -87,8 +87,16 @@ const NTP_REPLY_SECS: u64 = 3;
 /// The walk was verified on hardware 2026-08-20 with a TEST-NET-1
 /// address wedged in at the front: both attempts timed out, the
 /// session moved on to the next name and synced.
+///
+/// ANYCAST FIRST, pool last (reordered 2026-08-20): `pool.ntp.org`
+/// hands out a random volunteer server, and on this network it drew a
+/// dead one twice - each time costing both attempts (6 s of a sync)
+/// before the walk reached a server that answered instantly. The
+/// anycast services route to whatever instance is nearest and up, so
+/// they are the right first try; the pool stays as the vendor-neutral
+/// fallback for networks that block the big providers.
 const NTP_SERVERS: &[&str] =
-    &["pool.ntp.org", "time.cloudflare.com", "time.google.com"];
+    &["time.cloudflare.com", "time.google.com", "pool.ntp.org"];
 
 /// SNTP attempts per server before moving to the next: a lone UDP
 /// datagram can simply be lost - one loss must not skip a live
@@ -294,7 +302,7 @@ async fn run_sync_session(
     let seed = ((rng.random() as u64) << 32) | rng.random() as u64;
     let (stack, mut runner) = embassy_net::new(
         interfaces.station,
-        embassy_net::Config::dhcpv4(Default::default()),
+        embassy_net::Config::dhcpv4(dhcp_config()),
         &mut resources,
         seed,
     );
@@ -314,6 +322,26 @@ async fn run_sync_session(
         }
     };
     publish(outcome).await;
+}
+
+/// How long the DHCP client waits for an offer before sending a new
+/// DISCOVER. smoltcp's default is 10 s, and that full 10 s was
+/// measured on hardware 2026-08-20: the first DISCOVER goes out the
+/// instant the link comes up - while the AP is still finishing with
+/// the freshly associated station - and got dropped, so the session
+/// sat idle until the retry, which then leased immediately. The
+/// retry is the fix for a lost datagram; waiting 10 s for it is not.
+/// 2 s is well clear of a healthy lease (measured in tens of ms once
+/// the DISCOVER lands) and costs 5 attempts inside the same budget.
+const DHCP_DISCOVER_TIMEOUT_SECS: u64 = 2;
+
+/// DHCP client settings for a session: stock apart from the discover
+/// timeout above.
+fn dhcp_config() -> embassy_net::DhcpConfig {
+    let mut cfg = embassy_net::DhcpConfig::default();
+    cfg.retry_config.discover_timeout =
+        smoltcp::time::Duration::from_secs(DHCP_DISCOVER_TIMEOUT_SECS);
+    cfg
 }
 
 /// The session's actual work: associate, lease, resolve, exchange,

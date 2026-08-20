@@ -739,7 +739,17 @@ impl Bhi260Imu {
         // sampling). Reading an empty channel latches a benign
         // "download channel empty" code; every error-register check
         // filters that class via `is_transient` instead.
-        let mut buf = [0u8; 512];
+        // 2 KB, not the 512 B this started as: whenever the poll task
+        // is kept off the CPU for a while the FIFO keeps filling, and
+        // the tail past the buffer is dropped. Hardware 2026-08-20:
+        // a WiFi association starved the shared executor for 1.76 s,
+        // the hub offered 1138 B in one go, and every sample past
+        // 512 B was lost. 2 KB covers ~3 s of the enabled 25 Hz
+        // sensor set at that rate, so a stall has to be far worse
+        // than the measured one before data goes missing. Costs
+        // 1.5 KB more stack in this frame (boards measured 47-99 KB
+        // free at the time).
+        let mut buf = [0u8; 2048];
         let n = self
             .drv
             .read_fifo(i2c, bhi260::reg::CHANNEL_NONWAKE_FIFO, &mut buf)

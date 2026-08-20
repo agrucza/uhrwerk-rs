@@ -61,6 +61,16 @@ embassy-net = { version = "0.9.1", features = [
     "dns",
     "dhcpv4",
 ], optional = true }
+# Direct dep purely to configure the DHCP client: `DhcpConfig`'s
+# `retry_config` field is smoltcp's `RetryConfig`, and embassy-net
+# re-exports neither it nor `smoltcp::time::Duration` - so the
+# discover timeout can't be set without naming the types. Version
+# and features mirror what embassy-net 0.9.1 itself asks for, so
+# cargo unifies to one smoltcp (0.13.1 in the lockfile).
+smoltcp = { version = "0.13.0", default-features = false, features = [
+    "socket",
+    "async",
+], optional = true }
 
 # Local crates. app-core's `serde` feature must be on: the manager
 # calls `store.load_blob::<Config>()` which needs `Config: Deserialize`.
@@ -74,4 +84,4 @@ firmware-hal = { path = "../firmware-hal" }
 # Session-based WiFi (src/wifi.rs). The enabling bin must also add
 # `esp-radio` itself with its chip feature, and give `esp-rtos` its
 # `esp-radio` scheduler feature.
-wifi = ["dep:esp-radio", "dep:embassy-net"]
+wifi = ["dep:esp-radio", "dep:embassy-net", "dep:smoltcp"]
