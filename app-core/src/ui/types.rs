@@ -261,10 +261,19 @@ pub enum Action {
     /// is already running).
     GpsSync,
 
-    /// Shift `config.time.tz_offset_minutes` by `delta_min` (the settings
-    /// GPS view's +/- 15-minute stepper). The Model clamps to the
-    /// real-world UTC offset range and marks config dirty; the next
-    /// `TouchReleased` persists it.
+    /// Set the clock from whichever time source this board has (the
+    /// settings CLOCK view's TIME SYNC button). The Model picks ONE
+    /// source per tap and does not chain: WiFi when the board has the
+    /// radio and a network is stored, otherwise GPS. With neither
+    /// available the action is a no-op and the button renders Ghost.
+    /// The per-source triggers (WIFI CONNECT, GPS SYNC NOW) stay -
+    /// they force a specific source, which this deliberately can't.
+    TimeSync,
+
+    /// Shift `config.time.tz_offset_minutes` by `delta_min` (the
+    /// settings CLOCK view's +/- 15-minute stepper). The Model clamps
+    /// to the real-world UTC offset range and marks config dirty; the
+    /// next `TouchReleased` persists it.
     AdjustTimezone { delta_min: i16 },
 
     /// Flip `config.gps.tracking_enabled` (the settings GPS view's
@@ -904,6 +913,13 @@ pub struct SystemData {
     /// accumulated from `SystemEvent::WifiScanEntry` and cleared when
     /// the next scan starts. RAM-only.
     pub wifi_scan: crate::data::WifiScanList,
+
+    /// The most recent sync that set the RTC, whichever source did it.
+    /// `None` until the first one lands this boot. Read by the
+    /// settings CLOCK view's TIME SYNC status line, which can't
+    /// otherwise tell whether `wifi` or `gps_sync` holds the fresher
+    /// `Synced`. See [`crate::data::TimeSyncOutcome`].
+    pub last_time_sync: Option<crate::data::TimeSyncOutcome>,
 }
 
 // -- Screen trait -------------------------------------------------------------

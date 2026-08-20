@@ -561,8 +561,17 @@ impl Model {
                     // sync: the screen may well be dark by the time a
                     // mid-use session completes. Manager gates the
                     // pulse on haptics_enabled.
-                    if matches!(state, crate::data::WifiState::Synced { .. }) {
+                    if let crate::data::WifiState::Synced { hour, minute } = state {
                         let _ = out.push(Effect::MotorPulse { duration_ms: 350 });
+                        // Stamp which source last set the clock - the
+                        // CLOCK view's status line can't order two
+                        // untimestamped `Synced` states on its own.
+                        self.cached_data.last_time_sync =
+                            Some(crate::data::TimeSyncOutcome {
+                                source: crate::data::TimeSource::Wifi,
+                                hour: *hour,
+                                minute: *minute,
+                            });
                     }
                     self.cached_data.wifi = *state;
                     self.needs_redraw = true;
@@ -722,6 +731,18 @@ impl Model {
                             }
                             _ => {}
                         }
+                    }
+                    // Stamp the source that last set the clock. Not
+                    // gated on `tracking` the way the buzz is: a
+                    // tracking session that reaches Synced set the
+                    // RTC just as much as a manual one did.
+                    if let GpsSyncState::Synced { hour, minute } = state {
+                        self.cached_data.last_time_sync =
+                            Some(crate::data::TimeSyncOutcome {
+                                source: crate::data::TimeSource::Gps,
+                                hour: *hour,
+                                minute: *minute,
+                            });
                     }
                     self.cached_data.gps_sync = *state;
                     self.needs_redraw = true;
@@ -1015,6 +1036,25 @@ impl Model {
                 // task's reported state, and the task publishes
                 // Syncing as its first act of the session -
                 // milliseconds behind the tap.
+            }
+            Action::TimeSync => {
+                // ONE source per tap, no chaining: WiFi when this
+                // board has the radio AND a network is stored,
+                // otherwise GPS. A failure surfaces its reason and
+                // stops there - the user re-taps, or forces the other
+                // source from its own view (WIFI CONNECT / GPS SYNC
+                // NOW), which is why those buttons still exist.
+                let caps = self.cached_data.capabilities;
+                if caps.wifi && self.config.wifi.is_set() {
+                    self.kick_wifi_sync(out);
+                } else if caps.gps {
+                    let _ = out.push(Effect::GpsCommand(GpsCommand::SyncOnce {
+                        tz_offset_minutes: self.config.time.tz_offset_minutes,
+                    }));
+                }
+                // Neither source usable: no-op. The button renders
+                // Ghost in that state, so this is the tap-side half
+                // of the same contract, not a silent swallow.
             }
             Action::AdjustTimezone { delta_min } => {
                 self.config.time.tz_offset_minutes = (self.config.time.tz_offset_minutes
@@ -1788,6 +1828,113 @@ mod tests {
         );
         m.handle_event(&net("C", -50), Instant::from_millis(0));
         assert_eq!(m.cached_data().wifi_scan.len(), 1);
+    }
+
+    /// A model whose board carries the given radios.
+    fn with_caps(wifi: bool, gps: bool) -> Model {
+        let mut data = SystemData::default();
+        data.capabilities = crate::data::Capabilities { wifi, gps, steps: false };
+        Model::new(data, Config::default(), Instant::from_millis(0))
+    }
+
+    /// Store a network without going through the keyboard action.
+    fn store_network(m: &mut Model) {
+        let mut out = Effects::new();
+        m.dispatch_action(
+            Action::SetWifiCredentials {
+                ssid: heapless::String::try_from("Attic").unwrap(),
+                passphrase: heapless::String::try_from("hunter22").unwrap(),
+            },
+            &mut out,
+        );
+    }
+
+    #[test]
+    fn time_sync_picks_one_source_per_tap() {
+        // Board with both radios and a stored network: WiFi wins, and
+        // nothing GPS-shaped is emitted alongside it.
+        let mut m = with_caps(true, true);
+        store_network(&mut m);
+        let mut out = Effects::new();
+        m.dispatch_action(Action::TimeSync, &mut out);
+        assert!(matches!(
+            out.as_slice(),
+            [Effect::WifiCommand(WifiCommand::SyncOnce { .. })]
+        ));
+
+        // Same board, no network stored: GPS is the only usable
+        // source, so the tap goes there instead.
+        let mut m = with_caps(true, true);
+        let mut out = Effects::new();
+        m.dispatch_action(Action::TimeSync, &mut out);
+        assert_eq!(
+            out.as_slice(),
+            &[Effect::GpsCommand(GpsCommand::SyncOnce {
+                tz_offset_minutes: Config::DEFAULT.time.tz_offset_minutes,
+            })]
+        );
+
+        // WiFi-only board with nothing stored: no source, no effect.
+        // (The button renders Ghost in this state.)
+        let mut m = with_caps(true, false);
+        let mut out = Effects::new();
+        m.dispatch_action(Action::TimeSync, &mut out);
+        assert!(out.is_empty());
+
+        // No radios at all: likewise a no-op.
+        let mut m = with_caps(false, false);
+        let mut out = Effects::new();
+        m.dispatch_action(Action::TimeSync, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn time_sync_does_not_chain_to_the_other_source_on_failure() {
+        use crate::data::{WifiFailure, WifiState};
+        // One source per tap: a failed WiFi session must NOT kick GPS
+        // behind the user's back, even though the board has both.
+        let mut m = with_caps(true, true);
+        store_network(&mut m);
+        let mut out = Effects::new();
+        m.dispatch_action(Action::TimeSync, &mut out);
+        assert!(!out.is_empty());
+
+        let fx = m.handle_event(
+            &SystemEvent::WifiStatusUpdated {
+                state: WifiState::Failed(WifiFailure::NoNtp),
+            },
+            Instant::from_millis(0),
+        );
+        assert!(!fx.iter().any(|e| matches!(e, Effect::GpsCommand(_))));
+    }
+
+    #[test]
+    fn last_time_sync_stamps_whichever_source_finished_last() {
+        use crate::data::{GpsSyncState, TimeSource, WifiState};
+        let mut m = with_caps(true, true);
+        assert!(m.cached_data().last_time_sync.is_none());
+
+        m.handle_event(
+            &SystemEvent::WifiStatusUpdated {
+                state: WifiState::Synced { hour: 9, minute: 5 },
+            },
+            Instant::from_millis(0),
+        );
+        let last = m.cached_data().last_time_sync.unwrap();
+        assert_eq!(last.source, TimeSource::Wifi);
+        assert_eq!((last.hour, last.minute), (9, 5));
+
+        // A later GPS sync overwrites it - neither state carries a
+        // timestamp, so this stamp IS the ordering.
+        m.handle_event(
+            &SystemEvent::GpsSyncUpdated {
+                state: GpsSyncState::Synced { hour: 11, minute: 42 },
+            },
+            Instant::from_millis(0),
+        );
+        let last = m.cached_data().last_time_sync.unwrap();
+        assert_eq!(last.source, TimeSource::Gps);
+        assert_eq!((last.hour, last.minute), (11, 42));
     }
 
     #[test]

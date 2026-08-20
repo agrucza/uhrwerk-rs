@@ -138,6 +138,45 @@ fn isqrt(v: u64) -> u32 {
 }
 
 // ============================================================================
+// TimeSync - which source last set the RTC, and when.
+// ============================================================================
+
+/// Where a completed time sync got its time from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeSource {
+    /// An NTP exchange over WiFi.
+    Wifi,
+    /// A GNSS session.
+    Gps,
+}
+
+impl TimeSource {
+    /// Uppercase label for the settings CLOCK status line.
+    pub fn label(self) -> &'static str {
+        match self {
+            TimeSource::Wifi => "WIFI",
+            TimeSource::Gps => "GPS",
+        }
+    }
+}
+
+/// The last sync that actually wrote the RTC: which source did it and
+/// the local time that was written.
+///
+/// `WifiState::Synced` and `GpsSyncState::Synced` each carry their own
+/// outcome, but neither is timestamped, so with both populated there is
+/// no way to tell which ran later. This field records that ordering:
+/// the Model overwrites it whenever either source reports Synced, so
+/// it always describes the most recent successful sync. RAM-only - a
+/// reboot clears it (the RTC keeps the time itself).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeSyncOutcome {
+    pub source: TimeSource,
+    pub hour: u8,
+    pub minute: u8,
+}
+
+// ============================================================================
 // GpsSyncState - progress of a GPS time-sync session.
 // ============================================================================
 

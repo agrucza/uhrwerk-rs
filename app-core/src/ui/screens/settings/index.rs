@@ -17,7 +17,6 @@ use crate::ui::widgets::{
     handle_scroll_drag, render_scrolled, row, RowControl, ROW_H,
 };
 
-use super::gps::fmt_utc_offset;
 use super::{draw_header, header_back_hit, row_rect, rows_top, SettingsScreen, SettingsView};
 
 // -- Index row metadata ------------------------------------------------------
@@ -128,18 +127,19 @@ fn clock_value(data: &SystemData) -> String<20> {
     buf
 }
 
-/// Index-row inline value for GPS: the live session state while one
-/// runs, otherwise the configured timezone.
+/// Index-row inline value for GPS: what the receiver is doing. The
+/// timezone offset used to sit here, but it is a clock property and
+/// now lives in the CLOCK view with the rest of the time settings -
+/// this row must not advertise it any more.
 fn gps_value(data: &SystemData) -> String<20> {
     let mut buf = String::new();
-    match data.gps_sync {
-        crate::data::GpsSyncState::Syncing { .. } => {
-            let _ = buf.push_str("SYNCING");
-        }
-        _ => {
-            let _ = buf.push_str(fmt_utc_offset(data.config.time.tz_offset_minutes).as_str());
-        }
+    if matches!(data.gps_sync, crate::data::GpsSyncState::Syncing { .. }) {
+        let _ = buf.push_str("SYNCING");
+    } else if data.config.gps.tracking_enabled {
+        let _ = buf.push_str("TRACKING");
     }
+    // Otherwise empty - the row renders a chevron like the other
+    // plain navigate rows.
     buf
 }
 

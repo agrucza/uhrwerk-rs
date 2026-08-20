@@ -22,35 +22,16 @@ use crate::ui::widgets::{
 
 use super::{draw_header, header_back_hit, leaf_top_y, SettingsScreen, SettingsView};
 
-/// `UTC+01:00`-style offset readout - shared by the index row value
-/// and the GPS view's timezone stepper.
-pub(super) fn fmt_utc_offset(m: i16) -> String<12> {
-    let a = m.unsigned_abs();
-    let mut buf = String::new();
-    let _ = write!(
-        buf,
-        "UTC{}{:02}:{:02}",
-        if m < 0 { '-' } else { '+' },
-        a / 60,
-        a % 60,
-    );
-    buf
-}
-
 /// All rects the GPS sub-view needs. Render and event handlers both
 /// call [`gps_slots`] and read the same fields, so geometry can
 /// never drift between draw and hit-test.
 struct GpsSlots {
     /// Outer chamfered panel for the session status section.
     status_panel: Rectangle,
-    /// The SYNC NOW trigger (disabled while a session runs).
+    /// The SYNC NOW trigger (disabled while a session runs). Forces a
+    /// GPS session specifically - the CLOCK view's TIME SYNC button
+    /// would pick WiFi whenever a network is stored.
     sync_btn: Rectangle,
-    /// Outer chamfered panel for the timezone section.
-    tz_panel: Rectangle,
-    /// -15 min stepper inside `tz_panel`.
-    tz_minus: Rectangle,
-    /// +15 min stepper inside `tz_panel`.
-    tz_plus: Rectangle,
     /// Outer chamfered panel for the tracking section.
     tracking_panel: Rectangle,
     /// Hit area of the enable toggle in the panel's tag row (the
@@ -74,30 +55,11 @@ fn gps_slots(safe: &crate::data::SafeArea) -> GpsSlots {
     let status_panel = s.slot(96);
     s.gap(18);
     let sync_btn = s.slot(44);
-    s.gap(18);
-    let tz_panel = s.slot(84);
-    // The +/- steppers flank the timezone readout inside the panel,
-    // vertically centered below its tag label.
     let inset: i32 = 14;
-    let btn: i32 = 44;
-    let by = tz_panel.top_left.y
-        + TAG_LABEL_H
-        + (tz_panel.size.height as i32 - TAG_LABEL_H - btn) / 2;
-    let tz_minus = Rectangle::new(
-        Point::new(tz_panel.top_left.x + inset, by),
-        Size::new(btn as u32, btn as u32),
-    );
-    let tz_plus = Rectangle::new(
-        Point::new(
-            tz_panel.top_left.x + tz_panel.size.width as i32 - inset - btn,
-            by,
-        ),
-        Size::new(btn as u32, btn as u32),
-    );
 
     // Tracking panel: enable toggle in the tag row, cadence buttons
     // hugging the bottom (auto-lock layout idiom).
-    s.gap(14);
+    s.gap(18);
     let tracking_panel = s.slot(76);
     let tracking_toggle = Rectangle::new(
         Point::new(
@@ -114,7 +76,7 @@ fn gps_slots(safe: &crate::data::SafeArea) -> GpsSlots {
     let tracking_buttons = tracking_inner.row::<4>(btn_h, 8);
 
     GpsSlots {
-        status_panel, sync_btn, tz_panel, tz_minus, tz_plus,
+        status_panel, sync_btn,
         tracking_panel, tracking_toggle, tracking_buttons,
     }
 }
@@ -199,33 +161,6 @@ impl SettingsScreen {
             );
         }
 
-        // Timezone stepper: +/- 15 min covers every real UTC offset
-        // (Newfoundland, Nepal); the value between the steppers.
-        chamfered_panel(display, slots.tz_panel, NOTCH, theme::BORDER, 1);
-        tag_label(
-            display,
-            slots.tz_panel.top_left.x, slots.tz_panel.top_left.y,
-            "TIMEZONE", theme::BORDER, NOTCH,
-        );
-        chamfered_button(
-            display, slots.tz_minus, "-", ButtonVariant::Ghost, theme::BORDER,
-        );
-        chamfered_button(
-            display, slots.tz_plus, "+", ButtonVariant::Ghost, theme::BORDER,
-        );
-        let tz = fmt_utc_offset(data.config.time.tz_offset_minutes);
-        let between_x = slots.tz_minus.top_left.x + slots.tz_minus.size.width as i32;
-        let tz_rect = Rectangle::new(
-            Point::new(between_x, slots.tz_minus.top_left.y),
-            Size::new(
-                (slots.tz_plus.top_left.x - between_x) as u32,
-                slots.tz_minus.size.height,
-            ),
-        );
-        fonts::draw_centered_in_rect(
-            display, &fonts::value(), tz.as_str(), tz_rect, theme::FG,
-        );
-
         // Tracking: enable toggle in the tag row, cadence radio row
         // below. The cadence buttons stay live while tracking is
         // off - they set a remembered preference, they don't act.
@@ -271,12 +206,6 @@ impl SettingsScreen {
                         return Action::None;
                     }
                     return Action::GpsSync;
-                }
-                if rect_hit(slots.tz_minus, *x, *y) {
-                    return Action::AdjustTimezone { delta_min: -15 };
-                }
-                if rect_hit(slots.tz_plus, *x, *y) {
-                    return Action::AdjustTimezone { delta_min: 15 };
                 }
                 if rect_hit(slots.tracking_toggle, *x, *y) {
                     return Action::ToggleGpsTracking;

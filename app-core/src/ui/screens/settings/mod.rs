@@ -51,8 +51,6 @@ use pickers::{days_in_month, DATE_YEAR_MAX, DATE_YEAR_MIN};
 
 // -- Settings chrome helpers -------------------------------------------------
 
-const HDR_H: i32 = widgets::HEADER_H;
-
 /// Top row of the settings content area (below the shared header),
 /// derived from the device safe area.
 fn rows_top(safe: &crate::data::SafeArea) -> i32 {
