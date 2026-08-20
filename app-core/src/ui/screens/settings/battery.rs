@@ -1,6 +1,11 @@
 //! Battery sub-view: live percent/voltage with a charge ring, the
-//! history sparkline drawn from the flash event log, and the
-//! UPTIME / ACTIVE / SLEEPS diagnostic panels.
+//! charger phase, the history sparkline drawn from the flash event
+//! log, and the UPTIME / ACTIVE / SLEEPS diagnostic panels.
+//!
+//! Scrolls: the stack outgrew the viewport when CHARGE was added
+//! (before that, SLEEPS ended exactly on the home-bar line of the
+//! tightest board and a comment here claimed a scroll that did not
+//! exist). Same smooth-scroll machinery the MOTION view uses.
 
 use embedded_graphics::{
     geometry::{Point, Size},
@@ -10,11 +15,78 @@ use crate::ui::types::BlendTarget;
 use heapless::String;
 use core::fmt::Write;
 
-use crate::ui::{fmt, fonts, theme};
+use crate::ui::{fmt, fonts, theme, widgets};
 use crate::ui::types::{Action, RenderCtx, SystemData, SystemEvent};
-use crate::ui::widgets::{chamfered_panel, ring_gauge, tag_label, NOTCH};
+use crate::ui::widgets::{
+    chamfered_panel, handle_scroll_drag, render_scrolled, ring_gauge, tag_label, NOTCH,
+};
 
-use super::{draw_header, header_back_hit, rows_top, SettingsScreen, SettingsView};
+use super::{draw_header, header_back_hit, leaf_top_y, rows_top, SettingsScreen, SettingsView};
+
+/// Height of the NOW / CHARGE / UPTIME / ACTIVE / SLEEPS panels.
+const PANEL_H: i32 = 60;
+/// Height of the history sparkline band.
+const GRAPH_H: i32 = 96;
+
+/// Every rect the battery view draws, already shifted by `scroll`.
+/// Single source for render (the event side only needs `content_h`).
+struct BatterySlots {
+    now: Rectangle,
+    charge: Rectangle,
+    graph: Rectangle,
+    uptime: Rectangle,
+    active: Rectangle,
+    slept: Rectangle,
+    /// Total unscrolled height, for the scroll extents.
+    content_h: i32,
+}
+
+fn battery_slots(scroll: i32, safe: &crate::data::SafeArea) -> BatterySlots {
+    let top = leaf_top_y(safe) - scroll;
+    let w = theme::SCREEN_W as i32 - 56;
+    let x = (theme::SCREEN_W as i32 - w) / 2;
+    let panel = |y: i32| {
+        Rectangle::new(Point::new(x, y), Size::new(w as u32, PANEL_H as u32))
+    };
+
+    let now = panel(top);
+    let charge = panel(top + PANEL_H + 12);
+    let graph_y = charge.top_left.y + PANEL_H + 14;
+    // The sparkline is deliberately edge-to-edge, not inset like the
+    // panels.
+    let graph = Rectangle::new(
+        Point::new(0, graph_y),
+        Size::new(theme::SCREEN_W as u32, GRAPH_H as u32),
+    );
+    let uptime = panel(graph_y + GRAPH_H + 14);
+    let active = panel(uptime.top_left.y + PANEL_H + 12);
+    let slept = panel(active.top_left.y + PANEL_H + 12);
+
+    let content_h = slept.top_left.y + PANEL_H - top;
+    BatterySlots { now, charge, graph, uptime, active, slept, content_h }
+}
+
+/// Viewport for the scrolled battery stack.
+fn battery_viewport(safe: &crate::data::SafeArea) -> Rectangle {
+    widgets::viewport_to_home_bar(rows_top(safe), safe)
+}
+
+/// Charger phase as a short uppercase label, plus the tint that says
+/// whether it is worth waiting on. DONE is the one that matters for a
+/// fuel-gauge anchor charge: it means the charger tapered to the
+/// termination current, which is what re-anchors 100%.
+fn charge_state(data: &SystemData) -> (&'static str, crate::ui::theme::Color) {
+    use drivers::pmu::ChargerPhase;
+    match data.power.charger_phase {
+        ChargerPhase::TriCharge => ("TRICKLE", theme::WARN),
+        ChargerPhase::PreCharge => ("PRE-CHARGE", theme::WARN),
+        ChargerPhase::ConstantCurrent => ("CHARGING CC", theme::INFO),
+        ChargerPhase::ConstantVoltage => ("CHARGING CV", theme::INFO),
+        ChargerPhase::Done => ("CHARGED", theme::OK),
+        ChargerPhase::NotCharging if data.power.vbus_good => ("NOT CHARGING", theme::FG_MUTED),
+        ChargerPhase::NotCharging => ("ON BATTERY", theme::FG_MUTED),
+    }
+}
 
 /// Inline value on the settings index's BATTERY row: the live charge
 /// percent, or "--" before the first reading.
@@ -36,137 +108,123 @@ impl SettingsScreen {
     ) {
         draw_header(display, data, "BATTERY", theme::ACCENT, ctx);
 
-        // Top: chamfered tag-labeled BATTERY panel with live
-        // percent/voltage centered inside.
-        let panel_w = theme::SCREEN_W as i32 - 56;
-        let panel_x = (theme::SCREEN_W as i32 - panel_w) / 2;
-        let panel_y = rows_top(&data.safe_area) + 18;
-        let panel_h = 60i32;
-        let panel_rect = Rectangle::new(
-            Point::new(panel_x, panel_y),
-            Size::new(panel_w as u32, panel_h as u32),
-        );
-        chamfered_panel(display, panel_rect, NOTCH, theme::ACCENT, 1);
-        tag_label(
-            display,
-            panel_rect.top_left.x,
-            panel_rect.top_left.y,
-            "NOW",
-            theme::ACCENT,
-            NOTCH,
-        );
-
-        // Charge ring on the panel's left: sweep = battery percent,
-        // color follows the same health palette as the battery icon.
-        // Sized/positioned to clear the NOW tag in the TL corner.
-        let ring_r = 18i32;
-        let ring_cx = panel_x + 52;
-        let ring_cy = panel_y + panel_h / 2 + 4;
+        let scroll = self.battery_scroll.offset();
+        let slots = battery_slots(scroll, &data.safe_area);
         let pct = data.power.battery_percent;
-        ring_gauge(
-            display, ctx,
-            ring_cx, ring_cy, ring_r, 5,
-            pct.unwrap_or(0) as u32, 100,
-            crate::ui::primitives::battery_color(pct.unwrap_or(100)),
-            Some(theme::SURFACE_3),
-        );
 
-        let mut val: String<20> = String::new();
-        match (pct, data.power.battery_voltage_mv) {
-            (Some(p), Some(mv)) => {
-                let _ = write!(val, "{}% / {}.{:02}V", p, mv / 1000, (mv % 1000) / 10);
-            }
-            (Some(p), None) => { let _ = write!(val, "{}%", p); }
-            _               => { let _ = val.push_str("--"); }
-        }
-        // Value text centers in the panel area right of the ring.
-        let text_rect = Rectangle::new(
-            Point::new(panel_x + 80, panel_y),
-            Size::new((panel_w - 88) as u32, panel_h as u32),
-        );
-        fonts::draw_centered_in_rect(
-            display, &fonts::value(),
-            val.as_str(), text_rect, theme::FG,
-        );
+        render_scrolled(
+            display, scroll,
+            battery_viewport(&data.safe_area), slots.content_h, theme::ACCENT, ctx,
+            |clipped, _| {
+                // NOW: chamfered tag-labeled panel with live
+                // percent/voltage centered inside.
+                chamfered_panel(clipped, slots.now, NOTCH, theme::ACCENT, 1);
+                tag_label(
+                    clipped,
+                    slots.now.top_left.x, slots.now.top_left.y,
+                    "NOW", theme::ACCENT, NOTCH,
+                );
 
-        // Sparkline: full screen width, edge-to-edge, no card around.
-        let graph_y = panel_y + panel_h + 14;
-        let graph_h = 96i32;
-        let graph_rect = Rectangle::new(
-            Point::new(0, graph_y),
-            Size::new(theme::SCREEN_W as u32, graph_h as u32),
-        );
-        draw_battery_sparkline(display, graph_rect, &data.battery_history);
+                // Charge ring on the panel's left: sweep = battery
+                // percent, color follows the same health palette as the
+                // battery icon. Sized/positioned to clear the NOW tag
+                // in the TL corner.
+                let ring_r = 18i32;
+                let ring_cx = slots.now.top_left.x + 52;
+                let ring_cy = slots.now.top_left.y + PANEL_H / 2 + 4;
+                ring_gauge(
+                    clipped, ctx,
+                    ring_cx, ring_cy, ring_r, 5,
+                    pct.unwrap_or(0) as u32, 100,
+                    crate::ui::primitives::battery_color(pct.unwrap_or(100)),
+                    Some(theme::SURFACE_3),
+                );
 
-        // Below the sparkline: UPTIME (wall-time since power-on, from
-        // the SoC RTC counter - survives light sleep) and below that
-        // ACTIVE (embassy time since boot - pauses during light
-        // sleep). Together they let the user read off duty cycle:
-        // active / uptime ~= fraction of time the chip was awake.
-        let uptime_y = graph_y + graph_h + 14;
-        let uptime_rect = Rectangle::new(
-            Point::new(panel_x, uptime_y),
-            Size::new(panel_w as u32, panel_h as u32),
-        );
-        chamfered_panel(display, uptime_rect, NOTCH, theme::INFO, 1);
-        tag_label(
-            display,
-            uptime_rect.top_left.x,
-            uptime_rect.top_left.y,
-            "UPTIME",
-            theme::INFO,
-            NOTCH,
-        );
-        let up_buf = fmt::hms(data.uptime_secs as u64);
-        fonts::draw_centered_in_rect(
-            display, &fonts::value(),
-            up_buf.as_str(), uptime_rect, theme::FG,
-        );
+                let mut val: String<20> = String::new();
+                match (pct, data.power.battery_voltage_mv) {
+                    (Some(p), Some(mv)) => {
+                        let _ = write!(val, "{}% / {}.{:02}V", p, mv / 1000, (mv % 1000) / 10);
+                    }
+                    (Some(p), None) => { let _ = write!(val, "{}%", p); }
+                    _               => { let _ = val.push_str("--"); }
+                }
+                // Value text centers in the panel area right of the ring.
+                let text_rect = Rectangle::new(
+                    Point::new(slots.now.top_left.x + 80, slots.now.top_left.y),
+                    Size::new((slots.now.size.width as i32 - 88) as u32, PANEL_H as u32),
+                );
+                fonts::draw_centered_in_rect(
+                    clipped, &fonts::value(),
+                    val.as_str(), text_rect, theme::FG,
+                );
 
-        let active_y = uptime_y + panel_h + 12;
-        let active_rect = Rectangle::new(
-            Point::new(panel_x, active_y),
-            Size::new(panel_w as u32, panel_h as u32),
-        );
-        chamfered_panel(display, active_rect, NOTCH, theme::INFO, 1);
-        tag_label(
-            display,
-            active_rect.top_left.x,
-            active_rect.top_left.y,
-            "ACTIVE",
-            theme::INFO,
-            NOTCH,
-        );
-        let act_buf = fmt::hms(data.active_secs as u64);
-        fonts::draw_centered_in_rect(
-            display, &fonts::value(),
-            act_buf.as_str(), active_rect, theme::FG,
-        );
+                // CHARGE: what the charger is doing right now. Read
+                // straight from the PMU's charger-phase bits, which the
+                // power task already polls and event-publishes. CHARGED
+                // is the one to wait for when anchoring the fuel gauge:
+                // it means the current tapered to the termination
+                // threshold, which is what makes 100% mean 100%.
+                let (state, tint) = charge_state(data);
+                chamfered_panel(clipped, slots.charge, NOTCH, tint, 1);
+                tag_label(
+                    clipped,
+                    slots.charge.top_left.x, slots.charge.top_left.y,
+                    "CHARGE", tint, NOTCH,
+                );
+                fonts::draw_centered_in_rect(
+                    clipped, &fonts::value(), state, slots.charge, tint,
+                );
 
-        // SLEEPS: count of completed light-sleep cycles. Diagnostic -
-        // paced by the ~5 s heartbeat when really sleeping (~12/min); a
-        // far higher rate vs UPTIME means the CPU is instant-waking
-        // instead of gating off. 4th panel below ACTIVE, same geometry;
-        // scroll down to see it.
-        let slept_y = active_y + panel_h + 12;
-        let slept_rect = Rectangle::new(
-            Point::new(panel_x, slept_y),
-            Size::new(panel_w as u32, panel_h as u32),
-        );
-        chamfered_panel(display, slept_rect, NOTCH, theme::INFO, 1);
-        tag_label(
-            display,
-            slept_rect.top_left.x,
-            slept_rect.top_left.y,
-            "SLEEPS",
-            theme::INFO,
-            NOTCH,
-        );
-        let mut slept_buf: String<16> = String::new();
-        let _ = write!(slept_buf, "{}", data.sleep_cycles);
-        fonts::draw_centered_in_rect(
-            display, &fonts::value(),
-            slept_buf.as_str(), slept_rect, theme::FG,
+                // Sparkline: full screen width, edge-to-edge, no card.
+                draw_battery_sparkline(clipped, slots.graph, &data.battery_history);
+
+                // Below the sparkline: UPTIME (wall-time since power-on,
+                // from the SoC RTC counter - survives light sleep) and
+                // below that ACTIVE (embassy time since boot - pauses
+                // during light sleep). Together they let the user read
+                // off duty cycle: active / uptime ~= fraction of time
+                // the chip was awake.
+                chamfered_panel(clipped, slots.uptime, NOTCH, theme::INFO, 1);
+                tag_label(
+                    clipped,
+                    slots.uptime.top_left.x, slots.uptime.top_left.y,
+                    "UPTIME", theme::INFO, NOTCH,
+                );
+                let up_buf = fmt::hms(data.uptime_secs as u64);
+                fonts::draw_centered_in_rect(
+                    clipped, &fonts::value(),
+                    up_buf.as_str(), slots.uptime, theme::FG,
+                );
+
+                chamfered_panel(clipped, slots.active, NOTCH, theme::INFO, 1);
+                tag_label(
+                    clipped,
+                    slots.active.top_left.x, slots.active.top_left.y,
+                    "ACTIVE", theme::INFO, NOTCH,
+                );
+                let act_buf = fmt::hms(data.active_secs as u64);
+                fonts::draw_centered_in_rect(
+                    clipped, &fonts::value(),
+                    act_buf.as_str(), slots.active, theme::FG,
+                );
+
+                // SLEEPS: count of completed light-sleep cycles.
+                // Diagnostic - paced by the ~5 s heartbeat when really
+                // sleeping (~12/min); a far higher rate vs UPTIME means
+                // the CPU is instant-waking instead of gating off.
+                chamfered_panel(clipped, slots.slept, NOTCH, theme::INFO, 1);
+                tag_label(
+                    clipped,
+                    slots.slept.top_left.x, slots.slept.top_left.y,
+                    "SLEEPS", theme::INFO, NOTCH,
+                );
+                let mut slept_buf: String<16> = String::new();
+                let _ = write!(slept_buf, "{}", data.sleep_cycles);
+                fonts::draw_centered_in_rect(
+                    clipped, &fonts::value(),
+                    slept_buf.as_str(), slots.slept, theme::FG,
+                );
+            },
         );
     }
 
@@ -184,9 +242,24 @@ impl SettingsScreen {
                 self.view = SettingsView::Index;
                 Action::Redraw
             }
-            // Any live snapshot refresh or new sample should repaint.
+            // Drag scroll for the panel stack.
+            SystemEvent::TouchPressed { .. } | SystemEvent::TouchReleased => {
+                let viewport_h = battery_viewport(&data.safe_area).size.height as i32;
+                let content_h = battery_slots(0, &data.safe_area).content_h;
+                if handle_scroll_drag(
+                    &mut self.battery_scroll, event, viewport_h, content_h,
+                ) {
+                    return Action::Redraw;
+                }
+                Action::None
+            }
+            // Any live snapshot refresh or new sample should repaint -
+            // including a charger-phase change, which the CHARGE panel
+            // shows and which is the whole point of watching this view
+            // while a cell anchors.
             SystemEvent::PowerUpdated { .. }
             | SystemEvent::BatteryChanged { .. }
+            | SystemEvent::ChargerPhaseChanged { .. }
             | SystemEvent::TimeUpdated { .. } => Action::Redraw,
             _ => Action::None,
         }

@@ -160,6 +160,9 @@ pub struct SettingsScreen {
     /// Vertical scroll state for the MOTION sub-view (live readouts +
     /// self-tests stacked together overflow the viewport).
     imu_scroll: layout::ScrollState,
+    /// Vertical scroll state for the BATTERY sub-view (NOW / CHARGE /
+    /// graph / UPTIME / ACTIVE / SLEEPS overflow the viewport).
+    battery_scroll: layout::ScrollState,
     /// Counter that throttles MOTION-sub-view redraws to a fraction
     /// of the IMU's 20 Hz `MotionUpdated` cadence.
     motion_phase: u8,
@@ -197,6 +200,7 @@ impl SettingsScreen {
             ]),
             index_scroll: layout::ScrollState::new(),
             imu_scroll: layout::ScrollState::new(),
+            battery_scroll: layout::ScrollState::new(),
             motion_phase: 0,
             motion_last: None,
             mic_loopback: false,
