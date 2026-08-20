@@ -159,9 +159,15 @@ impl PreChargeCurrent {
 
 /// Constant-current charge current (REG 62h bits 4:0).
 ///
-/// The mapping is non-linear:
-///   0-7:   25 + N*25 mA   (25, 50, 75, 100, 125, 150, 175, 200)
-///   8-31:  200 + (N-8)*100 mA  (300, 400, 500 ... 2500)
+/// Datasheet V1.4 (6.13.2.60) mapping:
+///   N <= 8:  25 * N mA          (0, 25, 50 ... 200)
+///   N > 8:   200 + (N-8) * 100  (300, 400 ... 1000 at N = 16)
+///   N > 16:  reserved
+///
+/// (An earlier version of this type assumed `25 + N*25` and
+/// code 8 = 300 mA - one code off in BOTH ranges, so every set and
+/// decoded current was wrong: "100 mA" wrote 75, "300 mA" wrote
+/// 200. Caught by a datasheet audit 2026-08-19.)
 ///
 /// Use `from_ma()` to find the closest register value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,38 +175,41 @@ pub struct ChargeCurrent(pub u8);
 
 impl ChargeCurrent {
     /// Create from milliamps. Picks the closest value that does not
-    /// exceed the requested current. Clamped to 25-2500 mA.
+    /// exceed the requested current. Clamped to 1000 mA (codes
+    /// above it are reserved); 201-299 mA has no code and clamps
+    /// to 200.
     pub fn from_ma(ma: u16) -> Self {
-        let ma = ma.max(25).min(2500);
-        let reg = if ma <= 200 {
-            // 25 mA steps: 25, 50, 75, ... 200
-            ((ma - 25) / 25) as u8
+        let ma = ma.min(1000);
+        let reg = if ma < 300 {
+            (ma.min(200) / 25) as u8
         } else {
-            // 100 mA steps starting at code 8 = 300 mA
-            (8 + (ma - 300) / 100) as u8
+            // 100 mA steps starting at code 9 = 300 mA
+            (8 + (ma - 200) / 100) as u8
         };
-        Self(reg.min(31))
+        Self(reg.min(16))
     }
 
     /// Return the current in milliamps.
     pub fn as_ma(self) -> u16 {
         let n = self.0 as u16;
-        if n <= 7 {
-            25 + n * 25
+        if n <= 8 {
+            25 * n
         } else {
-            200 + (n - 8) * 100 // code 8 = 300, 9 = 400, ...
+            200 + (n - 8) * 100 // code 9 = 300, 10 = 400, ...
         }
     }
 }
 
 /// Termination current (REG 63h bits 3:0).
-/// Value in mA = 25 * N (0-15). Range: 0-375 mA in 25 mA steps.
+/// Value in mA = 25 * N. Codes 0-8 (0-200 mA) are valid; 9-15 are
+/// reserved per datasheet V1.4 (6.13.2.61), so requests clamp to
+/// 200 mA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminationCurrent(pub u8);
 
 impl TerminationCurrent {
     pub fn from_ma(ma: u16) -> Self {
-        Self(((ma.min(375)) / 25) as u8)
+        Self(((ma.min(200)) / 25) as u8)
     }
 
     pub fn as_ma(self) -> u16 {
@@ -233,6 +242,29 @@ impl ChargeVoltage {
             5 => Some(Self::V4_4),
             _ => None,
         }
+    }
+}
+
+/// Battery voltage for power-off (VOFF, REG 24h bits 2:0).
+/// 2.6-3.3 V in 0.1 V steps (0b000 = 2.6 V ... 0b111 = 3.3 V).
+///
+/// The power-on default is 2.6 V - deep-discharge territory for a
+/// Li-ion cell, and every collapse there wipes the fuel gauge's
+/// learned state (watch-observed as 0% -> dead -> 87%-on-charger).
+/// Daily-driver firmware raises this at init.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PowerOffVoltage(pub u8);
+
+impl PowerOffVoltage {
+    /// Create from millivolts (clamped to 2600-3300, rounded down
+    /// to 100 mV steps).
+    pub fn from_mv(mv: u16) -> Self {
+        Self(((mv.clamp(2600, 3300) - 2600) / 100) as u8)
+    }
+
+    /// Return the threshold in millivolts.
+    pub fn as_mv(self) -> u16 {
+        2600 + self.0 as u16 * 100
     }
 }
 
@@ -927,5 +959,45 @@ impl FastPwronSeq {
             2 => Self::Step2,
             _ => Self::Disabled,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// REG 62 per datasheet V1.4 (6.13.2.60): 25*N up to code 8
+    /// (200 mA), then 200 + 100*(N-8) up to code 16 (1000 mA). The
+    /// original implementation was one code off in both ranges.
+    #[test]
+    fn charge_current_matches_datasheet() {
+        assert_eq!(ChargeCurrent::from_ma(25).0, 1);
+        assert_eq!(ChargeCurrent::from_ma(100).0, 4); // was 3 = 75 mA
+        assert_eq!(ChargeCurrent::from_ma(200).0, 8);
+        assert_eq!(ChargeCurrent::from_ma(250).0, 8); // gap clamps down
+        assert_eq!(ChargeCurrent::from_ma(300).0, 9); // was 8 = 200 mA
+        assert_eq!(ChargeCurrent::from_ma(1000).0, 16);
+        assert_eq!(ChargeCurrent::from_ma(2500).0, 16); // reserved above
+        for code in 0..=16u8 {
+            let ma = ChargeCurrent(code).as_ma();
+            assert_eq!(ChargeCurrent::from_ma(ma).0, code, "roundtrip {ma} mA");
+        }
+    }
+
+    /// REG 63: 25*N, codes 9-15 reserved -> clamp at 200 mA.
+    #[test]
+    fn termination_current_matches_datasheet() {
+        assert_eq!(TerminationCurrent::from_ma(25).0, 1);
+        assert_eq!(TerminationCurrent::from_ma(50).0, 2);
+        assert_eq!(TerminationCurrent::from_ma(375).0, 8);
+    }
+
+    /// REG 24: 2.6 V + 0.1 V per code, 3.2 V = 0b110.
+    #[test]
+    fn power_off_voltage_matches_datasheet() {
+        assert_eq!(PowerOffVoltage::from_mv(2600).0, 0);
+        assert_eq!(PowerOffVoltage::from_mv(3200).0, 6);
+        assert_eq!(PowerOffVoltage::from_mv(3300).0, 7);
+        assert_eq!(PowerOffVoltage::from_mv(9999).as_mv(), 3300);
     }
 }

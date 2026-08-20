@@ -722,6 +722,30 @@ impl Pmu {
         self.write_register(i2c, registers::REG_CV_VOLT, (reg & !0x07) | (cv as u8))
     }
 
+    /// Set the battery voltage at which the PMU powers the system
+    /// off (VOFF, REG 24h bits 2:0). See [`types::PowerOffVoltage`]
+    /// for why the 2.6 V power-on default should be raised.
+    pub fn set_power_off_voltage<I2C, E>(
+        &self,
+        i2c: &mut I2C,
+        v: types::PowerOffVoltage,
+    ) -> Result<(), Error<E>>
+    where
+        I2C: I2cTrait<Error = E>,
+    {
+        let reg = self.read_register(i2c, registers::REG_VSYS_PWROFF)?;
+        self.write_register(i2c, registers::REG_VSYS_PWROFF, (reg & !0x07) | (v.0 & 0x07))
+    }
+
+    /// Read the configured power-off voltage threshold.
+    pub fn power_off_voltage<I2C, E>(&self, i2c: &mut I2C) -> Result<types::PowerOffVoltage, Error<E>>
+    where
+        I2C: I2cTrait<Error = E>,
+    {
+        let reg = self.read_register(i2c, registers::REG_VSYS_PWROFF)?;
+        Ok(types::PowerOffVoltage(reg & 0x07))
+    }
+
     /// Read the constant-voltage charge target.
     pub fn charge_voltage<I2C, E>(&self, i2c: &mut I2C) -> Result<Option<types::ChargeVoltage>, Error<E>>
     where
@@ -1087,11 +1111,16 @@ impl Pmu {
     /// Forces the gauge to re-learn battery capacity from scratch.
     /// The percentage reading will be inaccurate for several charge
     /// cycles after a reset.
+    ///
+    /// REG 17h bit 3 = "reset the gauge" (bit 2 would reset it
+    /// "besides registers"); the previous implementation wrote
+    /// bit 0, which is undocumented and did nothing.
     pub fn reset_fuel_gauge<I2C, E>(&self, i2c: &mut I2C) -> Result<(), Error<E>>
     where
         I2C: I2cTrait<Error = E>,
     {
-        self.write_register(i2c, registers::REG_GAUGE_RESET, 0x01)
+        let reg = self.read_register(i2c, registers::REG_GAUGE_RESET)?;
+        self.write_register(i2c, registers::REG_GAUGE_RESET, reg | (1 << 3))
     }
 
     /// Configure the watchdog timer (REG 19h).

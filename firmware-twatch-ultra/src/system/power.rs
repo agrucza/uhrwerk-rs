@@ -25,7 +25,10 @@
 //! rail (DLDO1) never enabled. Each future radio effort undoes only
 //! its own parking.
 
-use drivers::pmu::{Config as PmuConfig, InterruptConfig, InterruptSource, Pmu};
+use drivers::pmu::{
+    ChargeCurrent, ChargeVoltage, Config as PmuConfig, InterruptConfig, InterruptSource,
+    Pmu, PowerOffVoltage, TerminationCurrent,
+};
 use drivers::xl9555::{Config as ExpanderConfig, Xl9555};
 use embedded_hal::i2c::I2c;
 use esp_hal::gpio::{Input, Output};
@@ -186,6 +189,39 @@ impl TwatchUltraBoard {
         );
         pmu.enable_all_adc(i2c).map_err(|_| ())?;
         pmu.enable_battery_monitor(i2c).map_err(|_| ())?;
+
+        // Charge + power-off profile for the watch's 1100 mAh cell.
+        // The AXP2101's power-on defaults leave charging largely
+        // unconfigured and VOFF at 2.6 V - deep-discharge territory
+        // that also wipes the fuel gauge's learned state on every
+        // collapse. ~0.27 C charge (300 mA - the register has no
+        // code nearer to 0.25 C; gentle on the enclosed cell),
+        // explicit 4.2 V CV, 50 mA termination so charge-done
+        // anchors the gauge at a true 100%, 3.2 V VOFF. Non-fatal:
+        // a failed write degrades to the old defaults, not a boot
+        // abort.
+        let profile_ok = pmu.set_charge_voltage(i2c, ChargeVoltage::V4_2).is_ok()
+            && pmu.set_charge_current(i2c, ChargeCurrent::from_ma(300)).is_ok()
+            && pmu
+                .set_termination_current(i2c, TerminationCurrent::from_ma(50), true)
+                .is_ok()
+            && pmu
+                .set_power_off_voltage(i2c, PowerOffVoltage::from_mv(3200))
+                .is_ok();
+        if !profile_ok {
+            log::warn!("PMU: charge profile configuration failed");
+        }
+        // Read BACK from silicon - the log must show what the chip
+        // holds, not what we requested (a wrong ChargeCurrent
+        // register mapping once wore the requested values as a
+        // label; requested here: 4.2 V / 300 mA / 50 mA / 3200 mV).
+        log::info!(
+            "PMU: charge profile readback: CV {:?}, CC {:?} mA, term {:?} mA, VOFF {:?} mV",
+            pmu.charge_voltage(i2c).ok().flatten(),
+            pmu.charge_current(i2c).ok().map(|c| c.as_ma()),
+            pmu.termination_current(i2c).ok().map(|(t, en)| (t.as_ma(), en)),
+            pmu.power_off_voltage(i2c).ok().map(|v| v.as_mv()),
+        );
 
         // Explicit IRQ whitelist. This is the first board where the
         // PMU IRQ line reaches a GPIO and is armed as a light-sleep
