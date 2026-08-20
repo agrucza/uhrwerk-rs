@@ -99,7 +99,14 @@ pub fn load_battery_history(store: &mut Store, out: &mut BatteryHistory) {
         if let Some(entry) = parse_log_line(line) {
             if entry.tag.as_str() == "battery" {
                 if let Some(pct) = entry.detail {
-                    out.push(BatterySample { time: entry.time, percent: pct as u8 });
+                    // detail2 carries millivolts on lines written
+                    // since the pair landed; older lines have none and
+                    // restore with `voltage_mv: None`.
+                    out.push(BatterySample {
+                        time: entry.time,
+                        percent: pct as u8,
+                        voltage_mv: entry.detail2.map(|mv| mv as u16),
+                    });
                     seen += 1;
                 }
             }
@@ -208,7 +215,7 @@ pub fn try_log(store: &mut Store, time: &TimeData, event: &SystemEvent) {
 /// running", emitted directly from the manager after the RTC +
 /// Store are up.
 pub fn log_boot(store: &mut Store, time: &TimeData) {
-    write_line(store, time, LoggedEvent { tag: "boot", detail: None });
+    write_line(store, time, LoggedEvent { tag: "boot", detail: None, detail2: None });
 }
 
 fn write_line(store: &mut Store, time: &TimeData, event: LoggedEvent) {
@@ -217,8 +224,19 @@ fn write_line(store: &mut Store, time: &TimeData, event: LoggedEvent) {
     // 64 bytes holds "<u32>,YYYY-MM-DDTHH:MM:SS,<tag>,<u32>\n"
     // with plenty of slack (u32 is 10 digits max, tag ≤ 20).
     let mut line: heapless::String<64> = heapless::String::new();
-    let fmt_result = match event.detail {
-        Some(n) => write!(
+    let fmt_result = match (event.detail, event.detail2) {
+        // Two details: `<tag>,<detail>,<detail2>` (battery percent +
+        // millivolts). detail2 without detail cannot be expressed in
+        // the format and is treated as detail-only.
+        (Some(n), Some(m)) => write!(
+            &mut line,
+            "{},{:04}-{:02}-{:02}T{:02}:{:02}:{:02},{},{},{}\n",
+            seq,
+            time.year, time.month, time.day,
+            time.hour, time.minute, time.second,
+            event.tag, n, m,
+        ),
+        (Some(n), None) => write!(
             &mut line,
             "{},{:04}-{:02}-{:02}T{:02}:{:02}:{:02},{},{}\n",
             seq,
@@ -226,7 +244,7 @@ fn write_line(store: &mut Store, time: &TimeData, event: LoggedEvent) {
             time.hour, time.minute, time.second,
             event.tag, n,
         ),
-        None => write!(
+        (None, _) => write!(
             &mut line,
             "{},{:04}-{:02}-{:02}T{:02}:{:02}:{:02},{}\n",
             seq,

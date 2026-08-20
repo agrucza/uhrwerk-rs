@@ -207,11 +207,19 @@ impl PowerTaskState {
             }
         }
 
-        // Battery percentage change
+        // Battery percentage change. The cell voltage rides along:
+        // read here, in the same poll, so the logged pair describes
+        // one moment rather than two. Percent is the learning gauge's
+        // opinion; voltage is measured - keeping them together is what
+        // lets the log show whether the gauge is tracking reality.
         if let Ok(pct) = self.pmu.battery_percent(i2c) {
             if pct != self.last_battery {
                 self.last_battery = pct;
-                let _ = events.push(SystemEvent::BatteryChanged { percent: pct });
+                let voltage_mv = self.pmu.battery_voltage_mv(i2c).ok();
+                let _ = events.push(SystemEvent::BatteryChanged {
+                    percent: pct,
+                    voltage_mv,
+                });
             }
         }
     }

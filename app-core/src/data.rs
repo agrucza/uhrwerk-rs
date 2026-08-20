@@ -471,6 +471,17 @@ pub struct StorageUsage {
 pub struct BatterySample {
     pub time: TimeData,
     pub percent: u8,
+    /// Cell voltage at the moment the percent changed, from the same
+    /// PMU snapshot. `None` for samples restored from log lines
+    /// written before the field existed, and if the ADC read failed.
+    ///
+    /// Kept beside the percent on purpose: percent comes from the
+    /// AXP2101's learning fuel gauge, which runs a default battery
+    /// model it was never given this cell's parameters for, while
+    /// voltage is a direct ADC reading. The pair is what makes the
+    /// gauge auditable - percent alone cannot be checked against
+    /// anything.
+    pub voltage_mv: Option<u16>,
 }
 
 /// Capacity of the battery-history ring buffer.
@@ -526,6 +537,7 @@ mod battery_history_tests {
         BatterySample {
             time: TimeData { hour, ..Default::default() },
             percent,
+            voltage_mv: None,
         }
     }
 

@@ -56,7 +56,12 @@ pub enum SystemEvent {
     /// Battery state-of-charge changed. The power task emits this
     /// whenever the fuel-gauge percentage differs from its last
     /// poll; the new value is in the payload.
-    BatteryChanged { percent: u8 },
+    /// Battery percent changed. Carries the cell voltage read in the
+    /// same PMU snapshot: percent comes from the AXP2101's LEARNING
+    /// fuel gauge, voltage straight from the ADC, so keeping the pair
+    /// together is what makes the gauge checkable against something
+    /// it cannot influence. `None` if the ADC read failed.
+    BatteryChanged { percent: u8, voltage_mv: Option<u16> },
     /// VBUS (USB power) was just plugged in (status1.vbus_good
     /// transitioned false → true).
     VbusInserted,
@@ -348,6 +353,12 @@ pub fn is_wake_source(event: &SystemEvent) -> bool {
 pub struct LoggedEvent {
     pub tag: &'static str,
     pub detail: Option<u32>,
+    /// Optional SECOND detail field, written after `detail` as
+    /// `<tag>,<detail>,<detail2>`. Only `battery` uses it today (cell
+    /// millivolts alongside the percent), so a percent-vs-voltage
+    /// trace can be read straight off the log without a second event
+    /// stream. Requires `detail` to be present.
+    pub detail2: Option<u32>,
 }
 
 /// Classify a [`SystemEvent`] for the SD-card event log, or return
@@ -361,18 +372,24 @@ pub struct LoggedEvent {
 /// lines.
 pub fn classify_for_log(event: &SystemEvent) -> Option<LoggedEvent> {
     Some(match event {
-        SystemEvent::AlarmFired { .. }        => LoggedEvent { tag: "alarm",         detail: None },
-        SystemEvent::TimerExpired { .. }      => LoggedEvent { tag: "timer_expired", detail: None },
-        SystemEvent::VbusInserted             => LoggedEvent { tag: "vbus_in",       detail: None },
-        SystemEvent::VbusRemoved              => LoggedEvent { tag: "vbus_out",      detail: None },
-        SystemEvent::PowerButtonLong          => LoggedEvent { tag: "shutdown_req",  detail: None },
-        SystemEvent::BatteryChanged { percent } => LoggedEvent { tag: "battery",     detail: Some(*percent as u32) },
+        SystemEvent::AlarmFired { .. }        => LoggedEvent { tag: "alarm",         detail: None, detail2: None },
+        SystemEvent::TimerExpired { .. }      => LoggedEvent { tag: "timer_expired", detail: None, detail2: None },
+        SystemEvent::VbusInserted             => LoggedEvent { tag: "vbus_in",       detail: None, detail2: None },
+        SystemEvent::VbusRemoved              => LoggedEvent { tag: "vbus_out",      detail: None, detail2: None },
+        SystemEvent::PowerButtonLong          => LoggedEvent { tag: "shutdown_req",  detail: None, detail2: None },
+        // The only two-detail line: percent AND cell millivolts, so
+        // the log alone answers "does the gauge track voltage?".
+        SystemEvent::BatteryChanged { percent, voltage_mv } => LoggedEvent {
+            tag: "battery",
+            detail: Some(*percent as u32),
+            detail2: voltage_mv.map(|mv| mv as u32),
+        },
         // Only the terminal success is log-worthy; Syncing is cadence
         // chatter and NoSignal is the common indoor outcome.
         SystemEvent::GpsSyncUpdated { state: crate::data::GpsSyncState::Synced { .. } } =>
-            LoggedEvent { tag: "gps_sync", detail: None },
+            LoggedEvent { tag: "gps_sync", detail: None, detail2: None },
         SystemEvent::WifiStatusUpdated { state: crate::data::WifiState::Synced { .. } } =>
-            LoggedEvent { tag: "wifi_sync", detail: None },
+            LoggedEvent { tag: "wifi_sync", detail: None, detail2: None },
         _ => return None,
     })
 }
@@ -431,23 +448,26 @@ mod tests {
         let t = crate::data::TimeData::default();
         assert_eq!(
             classify_for_log(&SystemEvent::AlarmFired { time: t }),
-            Some(LoggedEvent { tag: "alarm", detail: None }),
+            Some(LoggedEvent { tag: "alarm", detail: None, detail2: None }),
         );
         assert_eq!(
             classify_for_log(&SystemEvent::TimerExpired { time: t }),
-            Some(LoggedEvent { tag: "timer_expired", detail: None }),
+            Some(LoggedEvent { tag: "timer_expired", detail: None, detail2: None }),
         );
         assert_eq!(
             classify_for_log(&SystemEvent::PowerButtonLong),
-            Some(LoggedEvent { tag: "shutdown_req", detail: None }),
+            Some(LoggedEvent { tag: "shutdown_req", detail: None, detail2: None }),
         );
     }
 
     #[test]
     fn log_classifier_captures_battery_percent() {
         assert_eq!(
-            classify_for_log(&SystemEvent::BatteryChanged { percent: 73 }),
-            Some(LoggedEvent { tag: "battery", detail: Some(73) }),
+            classify_for_log(&SystemEvent::BatteryChanged {
+                percent: 73,
+                voltage_mv: Some(3912),
+            }),
+            Some(LoggedEvent { tag: "battery", detail: Some(73), detail2: Some(3912) }),
         );
     }
 

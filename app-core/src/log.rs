@@ -46,6 +46,11 @@ pub struct LogEntry {
     pub time: TimeData,
     pub tag: heapless::String<MAX_TAG_LEN>,
     pub detail: Option<u32>,
+    /// Second detail field, present only on lines written as
+    /// `<tag>,<detail>,<detail2>` (today: `battery,<percent>,<mv>`).
+    /// `None` on single-detail lines, which includes every line
+    /// written before the field existed - old logs stay readable.
+    pub detail2: Option<u32>,
 }
 
 /// Parse one `<seq>,YYYY-MM-DDTHH:MM:SS,tag[,detail]` line.
@@ -85,14 +90,27 @@ pub fn parse_log_line(line: &str) -> Option<LogEntry> {
     let minute = ts.get(14..16)?.parse::<u8>().ok()?;
     let second = ts.get(17..19)?.parse::<u8>().ok()?;
 
-    // Remainder is tag[,detail]. Split at the first comma.
+    // Remainder is tag[,detail[,detail2]]. Split at the first comma,
+    // then optionally again: a second detail is what the battery
+    // lines use to carry millivolts next to the percent. Parsing it
+    // is not optional politeness - before this existed, the single
+    // `parse::<u32>()` below rejected the WHOLE line on a second
+    // field, which would have silently dropped every battery entry
+    // from both the history and the seq scan.
     let body = &rest[20..];
-    let (tag_str, detail) = match body.find(',') {
+    let (tag_str, detail, detail2) = match body.find(',') {
         Some(c) => {
-            let detail = body[c + 1..].parse::<u32>().ok()?;
-            (&body[..c], Some(detail))
+            let rest_detail = &body[c + 1..];
+            match rest_detail.find(',') {
+                Some(d) => {
+                    let first = rest_detail[..d].parse::<u32>().ok()?;
+                    let second = rest_detail[d + 1..].parse::<u32>().ok()?;
+                    (&body[..c], Some(first), Some(second))
+                }
+                None => (&body[..c], Some(rest_detail.parse::<u32>().ok()?), None),
+            }
         }
-        None => (body, None),
+        None => (body, None, None),
     };
     if tag_str.is_empty() {
         return None;
@@ -106,6 +124,7 @@ pub fn parse_log_line(line: &str) -> Option<LogEntry> {
         time: TimeData { hour, minute, second, year, month, day },
         tag,
         detail,
+        detail2,
     })
 }
 
@@ -139,6 +158,27 @@ mod tests {
         assert_eq!(e.seq, 42);
         assert_eq!(e.tag, tag("battery"));
         assert_eq!(e.detail, Some(85));
+        // Single-detail lines predate the voltage field and must keep
+        // parsing - the flash log on a device that has been running
+        // is full of them.
+        assert_eq!(e.detail2, None);
+    }
+
+    #[test]
+    fn parses_battery_line_with_percent_and_millivolts() {
+        let e = parse_log_line("43,2026-04-22T19:12:33,battery,84,3912").unwrap();
+        assert_eq!(e.seq, 43);
+        assert_eq!(e.tag, tag("battery"));
+        assert_eq!(e.detail, Some(84));
+        assert_eq!(e.detail2, Some(3912));
+    }
+
+    #[test]
+    fn rejects_line_whose_second_detail_is_not_a_number() {
+        // The second field is parsed, not skipped: garbage there must
+        // fail the line rather than silently yield a percent-only
+        // sample that looks trustworthy.
+        assert!(parse_log_line("44,2026-04-22T19:13:00,battery,84,abc").is_none());
     }
 
     #[test]

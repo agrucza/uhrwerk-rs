@@ -754,11 +754,12 @@ impl Model {
             SystemEvent::TouchReleased => {
                 self.cached_data.touch = TouchData::default();
             }
-            SystemEvent::BatteryChanged { percent } => {
+            SystemEvent::BatteryChanged { percent, voltage_mv } => {
                 self.cached_data.battery_history.push(
                     crate::data::BatterySample {
                         time: self.cached_data.time,
                         percent: *percent,
+                        voltage_mv: *voltage_mv,
                     },
                 );
                 self.needs_redraw = true;
