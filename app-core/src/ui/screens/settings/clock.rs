@@ -25,8 +25,18 @@ use crate::ui::widgets::{
 
 use super::{draw_header, header_back_hit, leaf_top_y, SettingsScreen, SettingsView};
 
-/// `UTC+01:00`-style offset readout - shared by the timezone stepper
-/// here and the settings index's GPS row value.
+/// Inline value on the settings index's CLOCK row: the live time.
+pub(super) fn index_value(data: &SystemData) -> String<20> {
+    let mut buf = String::new();
+    let _ = buf.push_str(
+        fmt::hms_parts(
+            data.time.hour as u64, data.time.minute as u64, data.time.second as u64,
+        ).as_str(),
+    );
+    buf
+}
+
+/// `UTC+01:00`-style offset readout for the timezone stepper.
 pub(super) fn fmt_utc_offset(m: i16) -> String<12> {
     let a = m.unsigned_abs();
     let mut buf = String::new();

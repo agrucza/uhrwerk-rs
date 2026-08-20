@@ -22,6 +22,14 @@ use crate::ui::widgets::{
 
 use super::{draw_header, header_back_hit, leaf_top_y, SettingsScreen, SettingsView};
 
+/// Inline value on the settings index's MOTION row: the detected IMU's
+/// name, or a generic label before it reports one.
+pub(super) fn index_value(data: &SystemData) -> heapless::String<20> {
+    let mut buf = heapless::String::new();
+    let _ = buf.push_str(if data.imu_name.is_empty() { "IMU" } else { data.imu_name });
+    buf
+}
+
 // -- Self-test list ----------------------------------------------------------
 
 struct ImuTestRow {

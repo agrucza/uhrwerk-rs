@@ -25,6 +25,22 @@ use crate::ui::widgets::{
 
 use super::{draw_header, header_back_hit, leaf_top_y, row_rect, rows_top, SettingsScreen, SettingsView};
 
+/// The settings index's WIFI row exists only in builds that spawn the
+/// radio task.
+pub(super) fn index_visible(data: &SystemData) -> bool {
+    data.capabilities.wifi
+}
+
+/// Inline value on the settings index's WIFI row: the stored network
+/// name, or empty (chevron) when none is stored.
+pub(super) fn index_value(data: &SystemData) -> String<20> {
+    let mut buf = String::new();
+    for c in data.config.wifi.ssid.chars().take(16) {
+        let _ = buf.push(c);
+    }
+    buf
+}
+
 /// Layout of the WIFI view - single source for render and hit-test.
 struct WifiSlots {
     network_panel: Rectangle,

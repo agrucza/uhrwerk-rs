@@ -9,9 +9,8 @@ use embedded_graphics::{
 use crate::ui::types::BlendTarget;
 use crate::ui::theme::Color;
 use heapless::String;
-use core::fmt::Write;
 
-use crate::ui::{fmt, glyphs, theme, widgets};
+use crate::ui::{glyphs, theme, widgets};
 use crate::ui::types::{Action, RenderCtx, SystemData, SystemEvent};
 use crate::ui::widgets::{
     handle_scroll_drag, render_scrolled, row, RowControl, ROW_H,
@@ -95,9 +94,10 @@ pub(super) struct IndexRow {
     pub(super) label: &'static str,
     pub(super) icon: RowIcon,
     /// Capability gate: the row renders and hit-tests only when this
-    /// returns true (rows below it shift up). `always` for standard
-    /// rows; capability probes (e.g. [`has_gps`]) for rows whose
-    /// hardware only some boards carry.
+    /// returns true (rows below it shift up). [`always`] for standard
+    /// rows; the owning sub-view's `index_visible` (e.g.
+    /// [`super::gps::index_visible`]) for rows whose hardware only
+    /// some boards carry.
     pub(super) visible: fn(&SystemData) -> bool,
     pub(super) kind: RowKind,
 }
@@ -105,69 +105,6 @@ pub(super) struct IndexRow {
 /// Standard-row visibility: every board has this hardware.
 pub(super) fn always(_data: &SystemData) -> bool {
     true
-}
-
-/// GPS rows exist only on boards whose bin declared the capability.
-fn has_gps(data: &SystemData) -> bool {
-    data.capabilities.gps
-}
-
-/// The WIFI row exists only in builds that spawn the radio task.
-fn has_wifi(data: &SystemData) -> bool {
-    data.capabilities.wifi
-}
-
-fn clock_value(data: &SystemData) -> String<20> {
-    let mut buf = String::new();
-    let _ = buf.push_str(
-        fmt::hms_parts(
-            data.time.hour as u64, data.time.minute as u64, data.time.second as u64,
-        ).as_str(),
-    );
-    buf
-}
-
-/// Index-row inline value for GPS: what the receiver is doing. The
-/// timezone offset used to sit here, but it is a clock property and
-/// now lives in the CLOCK view with the rest of the time settings -
-/// this row must not advertise it any more.
-fn gps_value(data: &SystemData) -> String<20> {
-    let mut buf = String::new();
-    if matches!(data.gps_sync, crate::data::GpsSyncState::Syncing { .. }) {
-        let _ = buf.push_str("SYNCING");
-    } else if data.config.gps.tracking_enabled {
-        let _ = buf.push_str("TRACKING");
-    }
-    // Otherwise empty - the row renders a chevron like the other
-    // plain navigate rows.
-    buf
-}
-
-fn imu_value(data: &SystemData) -> String<20> {
-    let mut buf = String::new();
-    let _ = buf.push_str(if data.imu_name.is_empty() { "IMU" } else { data.imu_name });
-    buf
-}
-
-fn battery_value(data: &SystemData) -> String<20> {
-    let mut buf = String::new();
-    match data.power.battery_percent {
-        Some(pct) => { let _ = write!(buf, "{}%", pct); }
-        None      => { let _ = buf.push_str("--"); }
-    }
-    buf
-}
-
-fn storage_value(data: &SystemData) -> String<20> {
-    // Summary shown on the top-level settings index: "<files> / <size> KB".
-    let mut buf = String::new();
-    let _ = write!(
-        buf,
-        "{} / {} KB",
-        data.storage.files,
-        data.storage.total_bytes / 1024,
-    );
-    buf
 }
 
 fn haptics_is_on(data: &SystemData) -> bool {
@@ -186,14 +123,15 @@ fn dnd_is_on(data: &SystemData) -> bool {
 /// instead of an inline string.
 fn empty_value(_data: &SystemData) -> String<20> { String::new() }
 
-/// The stored network name on the WIFI row (chevron when none).
-fn wifi_value(data: &SystemData) -> String<20> {
-    let mut buf = String::new();
-    for c in data.config.wifi.ssid.chars().take(16) {
-        let _ = buf.push(c);
-    }
-    buf
-}
+// The table below is the index's own business: which rows exist, in
+// what order, with which label, icon and target. What each row SAYS
+// on its right-hand side, and whether the board carries the hardware
+// at all, belong to the sub-view that owns the subject - so those are
+// function pointers into the sibling modules (`gps::index_value`,
+// `wifi::index_visible`, ...). Keeping them here once cost us a stale
+// timezone readout on the GPS row after the stepper moved to CLOCK.
+// Rows with no sub-view (the inline toggles) are the exception; their
+// probes live here because there is nowhere else for them.
 
 const INDEX_ROWS: &[IndexRow] = &[
     // Spec prefs first - most-used live up top.
@@ -224,8 +162,8 @@ const INDEX_ROWS: &[IndexRow] = &[
     IndexRow {
         label: "WIFI",
         icon: RowIcon::Wifi,
-        visible: has_wifi,
-        kind: RowKind::Navigate { target: SettingsView::Wifi, value_fn: wifi_value },
+        visible: super::wifi::index_visible,
+        kind: RowKind::Navigate { target: SettingsView::Wifi, value_fn: super::wifi::index_value },
     },
     IndexRow {
         label: "BLUETOOTH",
@@ -244,25 +182,25 @@ const INDEX_ROWS: &[IndexRow] = &[
         label: "CLOCK",
         icon: RowIcon::Clock,
         visible: always,
-        kind: RowKind::Navigate { target: SettingsView::Clock, value_fn: clock_value },
+        kind: RowKind::Navigate { target: SettingsView::Clock, value_fn: super::clock::index_value },
     },
     IndexRow {
         label: "GPS",
         icon: RowIcon::Gps,
-        visible: has_gps,
-        kind: RowKind::Navigate { target: SettingsView::Gps, value_fn: gps_value },
+        visible: super::gps::index_visible,
+        kind: RowKind::Navigate { target: SettingsView::Gps, value_fn: super::gps::index_value },
     },
     IndexRow {
         label: "BATTERY",
         icon: RowIcon::Battery,
         visible: always,
-        kind: RowKind::Navigate { target: SettingsView::Battery, value_fn: battery_value },
+        kind: RowKind::Navigate { target: SettingsView::Battery, value_fn: super::battery::index_value },
     },
     IndexRow {
         label: "MOTION",
         icon: RowIcon::Imu,
         visible: always,
-        kind: RowKind::Navigate { target: SettingsView::Imu, value_fn: imu_value },
+        kind: RowKind::Navigate { target: SettingsView::Imu, value_fn: super::motion::index_value },
     },
     IndexRow {
         label: "MIC TEST",
@@ -274,7 +212,7 @@ const INDEX_ROWS: &[IndexRow] = &[
         label: "STORAGE",
         icon: RowIcon::Storage,
         visible: always,
-        kind: RowKind::Navigate { target: SettingsView::Storage, value_fn: storage_value },
+        kind: RowKind::Navigate { target: SettingsView::Storage, value_fn: super::storage::index_value },
     },
     // Destructive action - last, danger-tinted icon. Re-uses the
     // existing Factory Reset sub-view (the spec's Purge+Reset and

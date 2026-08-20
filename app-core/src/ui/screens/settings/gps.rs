@@ -22,6 +22,28 @@ use crate::ui::widgets::{
 
 use super::{draw_header, header_back_hit, leaf_top_y, SettingsScreen, SettingsView};
 
+/// The settings index's GPS row exists only on boards whose bin
+/// declared the capability.
+pub(super) fn index_visible(data: &SystemData) -> bool {
+    data.capabilities.gps
+}
+
+/// Inline value on the settings index's GPS row: what the receiver is
+/// doing. The timezone offset used to sit here, but it is a clock
+/// property and lives in the CLOCK view with the rest of the time
+/// settings - this row must not advertise it.
+pub(super) fn index_value(data: &SystemData) -> String<20> {
+    let mut buf = String::new();
+    if matches!(data.gps_sync, GpsSyncState::Syncing { .. }) {
+        let _ = buf.push_str("SYNCING");
+    } else if data.config.gps.tracking_enabled {
+        let _ = buf.push_str("TRACKING");
+    }
+    // Otherwise empty - the row renders a chevron like the other
+    // plain navigate rows.
+    buf
+}
+
 /// All rects the GPS sub-view needs. Render and event handlers both
 /// call [`gps_slots`] and read the same fields, so geometry can
 /// never drift between draw and hit-test.

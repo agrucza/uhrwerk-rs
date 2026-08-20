@@ -27,6 +27,20 @@ use crate::ui::widgets::{
 use super::index::{always, index_viewport_rect, render_rows, row_hit, IndexRow, RowIcon, RowKind};
 use super::{draw_header, header_back_hit, leaf_top_y, rows_top, SettingsScreen, SettingsView};
 
+/// Inline value on the settings index's STORAGE row: files and used
+/// space, summarised. The sub-index rows below carry the per-medium
+/// detail.
+pub(super) fn index_value(data: &SystemData) -> String<20> {
+    let mut buf = String::new();
+    let _ = write!(
+        buf,
+        "{} / {} KB",
+        data.storage.files,
+        data.storage.total_bytes / 1024,
+    );
+    buf
+}
+
 // -- Storage sub-index rows --------------------------------------------------
 //
 // Same IndexRow pattern as the top-level settings index, one level

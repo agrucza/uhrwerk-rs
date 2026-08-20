@@ -16,6 +16,17 @@ use crate::ui::widgets::{chamfered_panel, ring_gauge, tag_label, NOTCH};
 
 use super::{draw_header, header_back_hit, rows_top, SettingsScreen, SettingsView};
 
+/// Inline value on the settings index's BATTERY row: the live charge
+/// percent, or "--" before the first reading.
+pub(super) fn index_value(data: &SystemData) -> String<20> {
+    let mut buf = String::new();
+    match data.power.battery_percent {
+        Some(pct) => { let _ = write!(buf, "{}%", pct); }
+        None      => { let _ = buf.push_str("--"); }
+    }
+    buf
+}
+
 impl SettingsScreen {
     pub(super) fn render_battery<D: BlendTarget>(
         &self,
