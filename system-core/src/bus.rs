@@ -33,7 +33,9 @@ use static_cell::StaticCell;
 // so `Effect` can carry them. The `Signal` and `Watch` statics
 // below still live here - they're hardware-coupled (task wakers,
 // interrupt-safe mutexes).
-pub use app_core::commands::{AudioCommand, GpsCommand, ImuCommand, RtcCommand, SleepState};
+pub use app_core::commands::{
+    AudioCommand, GpsCommand, ImuCommand, RtcCommand, SleepState, WifiCommand,
+};
 
 /// Size of the system event channel. Should be large enough to
 /// buffer a burst of events without blocking producers but small
@@ -119,6 +121,19 @@ pub static AUDIO_COMMAND: Channel<CriticalSectionRawMutex, AudioCommand, 4> = Ch
 ///
 /// Single-consumer: only the GPS task should call `wait()` on this.
 pub static GPS_COMMAND: Signal<CriticalSectionRawMutex, GpsCommand> = Signal::new();
+
+/// Main-to-WiFi command signal.
+///
+/// The main loop publishes a [`WifiCommand`] here
+/// (`Effect::WifiCommand`). In builds with the `wifi` feature the
+/// shared WiFi session task waits on it; without the feature nothing
+/// listens and a signal (unreachable anyway - the UI entry point is
+/// capability-gated) is simply overwritten. A single slot is right:
+/// the UI refuses a second kick while a session runs, and a queued
+/// stale command would start a radio session nobody asked for.
+///
+/// Single-consumer: only the WiFi task should call `wait()` on this.
+pub static WIFI_COMMAND: Signal<CriticalSectionRawMutex, WifiCommand> = Signal::new();
 
 /// Count of live wake holds - sessions that need the executor and
 /// peripheral clocks continuously up (a GPS sync session's UART

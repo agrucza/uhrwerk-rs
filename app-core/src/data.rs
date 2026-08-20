@@ -28,6 +28,11 @@ pub struct Capabilities {
     /// pipeline (currently the T-Watch Ultra's BHI260AP). Gates the
     /// clock-face steps readout and the MOTION view's STEPS panel.
     pub steps: bool,
+    /// A WiFi radio with the shared session task spawned behind the
+    /// WiFi command channel. Set by the system layer from its own
+    /// build feature (a bin can't claim a radio it didn't wire), not
+    /// by the bin. Gates the settings WIFI row.
+    pub wifi: bool,
 }
 
 // ============================================================================
@@ -163,6 +168,81 @@ pub struct GpsFix {
     pub lat_e7: i32,
     pub lon_e7: i32,
 }
+
+// ============================================================================
+// WifiState - progress of a WiFi session (scan or sync).
+// ============================================================================
+
+/// State of the most recent WiFi session, cached from
+/// `SystemEvent::WifiStatusUpdated` for the settings WIFI views.
+/// Both session kinds report through the same state: a session is
+/// the unit of radio time, whatever it does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WifiState {
+    /// No session since boot.
+    #[default]
+    Idle,
+    /// A scan session is running; entries are streaming in.
+    Scanning,
+    /// A scan session finished with `count` networks listed.
+    Scanned { count: u8 },
+    /// A sync session is associating / leasing / resolving.
+    Connecting,
+    /// A sync session finished having set the RTC; payload is the
+    /// local time that was written (the view renders "SYNCED HH:MM").
+    Synced { hour: u8, minute: u8 },
+    /// The session ended without doing its job.
+    Failed(WifiFailure),
+}
+
+impl WifiState {
+    /// A session is in flight - the UI refuses a second kick.
+    pub fn is_busy(self) -> bool {
+        matches!(self, WifiState::Scanning | WifiState::Connecting)
+    }
+}
+
+/// Why a WiFi session failed, classified by the task from the
+/// driver's result so the UI can say something actionable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WifiFailure {
+    /// The radio driver did not come up (init or station config).
+    RadioInit,
+    /// The scan itself errored or ran past its budget.
+    ScanFailed,
+    /// No access point with the stored SSID answered.
+    NoAp,
+    /// The AP rejected the credentials (auth / handshake failure).
+    AuthFailed,
+    /// Association failed for another reason (beacon loss, AP-side
+    /// disconnect, ...).
+    ConnectFailed,
+    /// Associated, but no DHCP lease arrived.
+    NoLease,
+    /// Online, but DNS or the NTP exchange failed.
+    NoNtp,
+    /// The whole-session budget ran out.
+    Timeout,
+}
+
+/// One access point from a scan session, as shown in the settings
+/// network list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WifiNetwork {
+    pub ssid: heapless::String<{ crate::config::WifiConfig::SSID_MAX }>,
+    /// Signal strength in dBm.
+    pub rssi: i8,
+    /// Any authentication at all (open networks join without a
+    /// passphrase).
+    pub secured: bool,
+}
+
+/// Most networks a scan keeps: enough for a flat or a street, and
+/// ~36 B each inside `SystemData`.
+pub const MAX_WIFI_NETWORKS: usize = 12;
+
+/// The scan list, strongest signal first.
+pub type WifiScanList = heapless::Vec<WifiNetwork, MAX_WIFI_NETWORKS>;
 
 // ============================================================================
 // TimeData - calendar time of day, consumed by clock-style screens.

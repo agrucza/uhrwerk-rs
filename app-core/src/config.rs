@@ -2,8 +2,9 @@
 //!
 //! One root struct, organized by owner: `config.display.*`,
 //! `config.alerts.*`, `config.time.*`, `config.gps.*`,
-//! `config.alarms.*`. Every persisted setting is reachable through
-//! its owning group; there is no second persistent store.
+//! `config.wifi.*`, `config.alarms.*`. Every persisted setting is
+//! reachable through its owning group; there is no second persistent
+//! store.
 //!
 //! Held as a mutable struct on `SystemManager`; loaded from the flash
 //! blob at boot (BEFORE hardware init - hardware initializes from
@@ -41,6 +42,7 @@
 use crate::ui::types::AlarmState;
 #[cfg(feature = "serde")]
 use crate::ui::types::MAX_ALARMS;
+use heapless::String;
 
 /// Display power-management parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,13 +128,44 @@ pub struct GpsConfig {
     pub tracking_cadence: GpsTrackingCadence,
 }
 
-/// Top-level runtime config - the settings tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The single stored WiFi network (user decision: one network, not
+/// a list). Credentials live in the tagged store like every other
+/// setting; an empty `ssid` means "not provisioned" and an empty
+/// `passphrase` with a set `ssid` means an open network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WifiConfig {
+    /// Network name, IEEE 802.11 maximum of 32 bytes.
+    pub ssid: String<{ WifiConfig::SSID_MAX }>,
+    /// WPA2 passphrase: 8..=63 printable ASCII characters (the
+    /// capacity rounds up to 64).
+    pub passphrase: String<{ WifiConfig::PASSPHRASE_CAP }>,
+}
+
+impl WifiConfig {
+    /// SSID capacity in bytes (the 802.11 limit).
+    pub const SSID_MAX: usize = 32;
+    /// Longest WPA2 passphrase the user can type.
+    pub const PASSPHRASE_MAX: usize = 63;
+    /// Storage capacity of the passphrase field.
+    pub const PASSPHRASE_CAP: usize = 64;
+
+    pub const DEFAULT: Self = Self { ssid: String::new(), passphrase: String::new() };
+
+    /// True once a network name is stored.
+    pub fn is_set(&self) -> bool {
+        !self.ssid.is_empty()
+    }
+}
+
+/// Top-level runtime config - the settings tree. `Clone`, not
+/// `Copy`: the WiFi credentials are heapless Strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub display: DisplayConfig,
     pub alerts: AlertsConfig,
     pub time: TimeConfig,
     pub gps: GpsConfig,
+    pub wifi: WifiConfig,
     /// The alarm list (plus its transient runtime flags, which are
     /// never persisted - see [`AlarmState`]). Persisted per slot:
     /// each entry is its own tagged field.
@@ -192,6 +225,7 @@ impl Config {
             tracking_enabled: false,
             tracking_cadence: GpsTrackingCadence::Every60s,
         },
+        wifi: WifiConfig::DEFAULT,
         alarms: AlarmState::DEFAULT,
     };
 
@@ -214,7 +248,7 @@ impl Default for Config {
 /// 1..=31; alarm slots occupy `ALARM_SLOT_BASE..ALARM_SLOT_BASE +
 /// MAX_ALARMS`.
 ///
-/// NEXT_FIELD_ID: 13 (scalars), alarm slots 32..=39 assigned.
+/// NEXT_FIELD_ID: 15 (scalars), alarm slots 32..=39 assigned.
 #[cfg(feature = "serde")]
 mod field_id {
     pub const DIM_TIMEOUT_S: u16 = 1;
@@ -229,14 +263,16 @@ mod field_id {
     pub const TZ_OFFSET_MINUTES: u16 = 10;
     pub const GPS_TRACKING_ENABLED: u16 = 11;
     pub const GPS_TRACKING_CADENCE: u16 = 12;
+    pub const WIFI_SSID: u16 = 13;
+    pub const WIFI_PASSPHRASE: u16 = 14;
     /// One id per alarm slot: `ALARM_SLOT_BASE + slot_index`.
     pub const ALARM_SLOT_BASE: u16 = 32;
 }
 
 /// Upper bound on the tagged payload. Scalars ~90 B + 8 alarm slots
-/// at ~8 B each, with headroom for the WiFi credentials (SSID 32 +
-/// passphrase 63) and growth. The storage layer's blob buffer is
-/// 512 B - keep this below it.
+/// at ~8 B each + the WiFi credentials (SSID 32 + passphrase 63 +
+/// headers) ~ 260 B worst case, with headroom for growth. The
+/// storage layer's blob buffer is 512 B - keep this below it.
 #[cfg(feature = "serde")]
 const TAGGED_MAX: usize = 384;
 
@@ -263,6 +299,8 @@ impl Config {
         put(buf, &mut at, TZ_OFFSET_MINUTES, &self.time.tz_offset_minutes)?;
         put(buf, &mut at, GPS_TRACKING_ENABLED, &self.gps.tracking_enabled)?;
         put(buf, &mut at, GPS_TRACKING_CADENCE, &self.gps.tracking_cadence)?;
+        put(buf, &mut at, WIFI_SSID, &self.wifi.ssid)?;
+        put(buf, &mut at, WIFI_PASSPHRASE, &self.wifi.passphrase)?;
         // Alarm slots: only the entries persist - the runtime flags
         // (`active_hw` / `alerting` / `snoozed`) are never encoded.
         for (i, entry) in self.alarms.entries.iter().enumerate() {
@@ -303,6 +341,8 @@ impl Config {
                 TZ_OFFSET_MINUTES => get(val, &mut c.time.tz_offset_minutes),
                 GPS_TRACKING_ENABLED => get(val, &mut c.gps.tracking_enabled),
                 GPS_TRACKING_CADENCE => get(val, &mut c.gps.tracking_cadence),
+                WIFI_SSID => get(val, &mut c.wifi.ssid),
+                WIFI_PASSPHRASE => get(val, &mut c.wifi.passphrase),
                 id if (ALARM_SLOT_BASE..ALARM_SLOT_BASE + MAX_ALARMS as u16)
                     .contains(&id) =>
                 {
@@ -429,8 +469,30 @@ mod tests {
                 tracking_enabled: true,
                 tracking_cadence: GpsTrackingCadence::Every15s,
             },
+            wifi: WifiConfig {
+                ssid: String::try_from("Attic Mesh 5G").unwrap(),
+                passphrase: String::try_from("c0rrect h0rse battery").unwrap(),
+            },
             alarms,
         }
+    }
+
+    #[test]
+    fn wifi_credentials_roundtrip_at_capacity() {
+        // Full-length SSID (32) and passphrase (63) - the longest
+        // values the keyboard can produce - must survive the u8
+        // length header and TAGGED_MAX.
+        let mut cfg = Config::DEFAULT;
+        cfg.wifi.ssid = String::try_from("abcdefghijklmnopqrstuvwxyz012345").unwrap();
+        cfg.wifi.passphrase = String::try_from(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!",
+        )
+        .unwrap();
+        assert_eq!(cfg.wifi.ssid.len(), WifiConfig::SSID_MAX);
+        assert_eq!(cfg.wifi.passphrase.len(), WifiConfig::PASSPHRASE_MAX);
+        let mut buf = [0u8; TAGGED_MAX];
+        let len = cfg.encode_tagged(&mut buf).unwrap();
+        assert_eq!(Config::decode_tagged(&buf[..len]), cfg);
     }
 
     #[test]

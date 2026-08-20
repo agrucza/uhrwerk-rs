@@ -922,7 +922,9 @@ dependencies = [
  "esp-hal",
  "esp-metadata-generated",
  "esp-sync",
+ "esp-wifi-sys-esp32c6",
  "esp-wifi-sys-esp32s3",
+ "esp32c6",
  "esp32s3",
 ]
 
@@ -964,7 +966,9 @@ dependencies = [
  "esp-phy",
  "esp-radio-rtos-driver",
  "esp-sync",
+ "esp-wifi-sys-esp32c6",
  "esp-wifi-sys-esp32s3",
+ "esp32c6",
  "esp32s3",
  "heapless 0.9.2",
  "instability",
@@ -1081,6 +1085,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-wifi-sys-esp32c6"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57649401fc2f906a16e2268de88693724a125adcd0eba89b594a157affcee2d5"
+
+[[package]]
 name = "esp-wifi-sys-esp32s3"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1170,6 +1180,7 @@ dependencies = [
  "esp-bootloader-esp-idf",
  "esp-hal",
  "esp-println",
+ "esp-radio",
  "esp-rtos",
  "esp-storage",
  "esp32c6",
@@ -1210,6 +1221,7 @@ dependencies = [
  "esp-bootloader-esp-idf",
  "esp-hal",
  "esp-println",
+ "esp-radio",
  "esp-rtos",
  "esp-storage",
  "firmware-hal",
@@ -1398,6 +1410,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af2455f757db2b292a9b1768c4b70186d443bcb3b316252d6b540aec1cd89ed"
 dependencies = [
  "hash32",
+ "serde_core",
  "stable_deref_trait",
 ]
 

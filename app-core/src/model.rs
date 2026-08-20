@@ -19,7 +19,9 @@ use embassy_time::{Duration, Instant};
 use heapless::Vec;
 
 use crate::buzz::{BuzzAction, BuzzPattern};
-use crate::commands::{AudioCommand, GpsCommand, ImuCommand, RtcCommand, SleepState};
+use crate::commands::{
+    AudioCommand, GpsCommand, ImuCommand, RtcCommand, SleepState, WifiCommand,
+};
 use crate::config::Config;
 use crate::data::TouchData;
 use crate::events::{
@@ -87,6 +89,12 @@ pub enum Effect {
     /// point is capability-gated, so this only fires where hardware
     /// exists.
     GpsCommand(GpsCommand),
+
+    /// Forward a command to the shared WiFi task via `WIFI_COMMAND`.
+    /// Builds without the WiFi feature have no consumer; the UI entry
+    /// point is capability-gated, so this only fires where the radio
+    /// task exists.
+    WifiCommand(WifiCommand),
 
     /// Immediate shutdown request (Action::Shutdown from a screen).
     Shutdown,
@@ -239,7 +247,7 @@ impl Model {
         // current config through `data.config.*` without any
         // per-screen plumbing. Model keeps this in sync on every
         // config mutation from here on.
-        cached_data.config = config;
+        cached_data.config = config.clone();
         let mut screen = ActiveScreen::new(ScreenId::Clock);
         screen.mount(&cached_data);
         Self {
@@ -547,6 +555,37 @@ impl Model {
                 // on the 1 Hz TimeUpdated tick, same as steps.
                 self.cached_data.gps_fix = Some(*fix);
             }
+            SystemEvent::WifiStatusUpdated { state } => {
+                if self.cached_data.wifi != *state {
+                    // Tactile end-of-session milestone, like the GPS
+                    // sync: the screen may well be dark by the time a
+                    // mid-use session completes. Manager gates the
+                    // pulse on haptics_enabled.
+                    if matches!(state, crate::data::WifiState::Synced { .. }) {
+                        let _ = out.push(Effect::MotorPulse { duration_ms: 350 });
+                    }
+                    self.cached_data.wifi = *state;
+                    self.needs_redraw = true;
+                }
+            }
+            SystemEvent::WifiScanEntry { network } => {
+                // Merge: a network already listed keeps its row and
+                // updates its signal; a new one appends. Per-pass
+                // strongest-first order and SSID dedup are the task's
+                // job, so a fresh list arrives sorted and later passes
+                // only grow it - rows never jump under the finger.
+                // The list only resets on a fresh `Action::WifiScan`.
+                // A full list drops newcomers (the task caps at the
+                // same bound, so only a long merge run gets here).
+                let list = &mut self.cached_data.wifi_scan;
+                if let Some(known) = list.iter_mut().find(|n| n.ssid == network.ssid) {
+                    known.rssi = network.rssi;
+                    known.secured = network.secured;
+                    self.needs_redraw = true;
+                } else if list.push(network.clone()).is_ok() {
+                    self.needs_redraw = true;
+                }
+            }
             SystemEvent::MicLevel { level } => {
                 // Drop stale MicLevel events that arrive after capture
                 // has already been stopped. There's an inherent race
@@ -672,7 +711,7 @@ impl Model {
                                 self.track_failures += 1;
                                 if self.track_failures >= TRACK_AUTO_OFF_FAILURES {
                                     self.config.gps.tracking_enabled = false;
-                                    self.cached_data.config = self.config;
+                                    self.cached_data.config = self.config.clone();
                                     self.config_dirty = true;
                                     self.track_failures = 0;
                                 }
@@ -885,19 +924,19 @@ impl Model {
             }
             Action::ToggleAlwaysOn => {
                 self.config.display.always_on = !self.config.display.always_on;
-                self.cached_data.config = self.config;
+                self.cached_data.config = self.config.clone();
                 self.config_dirty = true;
                 self.needs_redraw = true;
             }
             Action::ToggleHaptics => {
                 self.config.alerts.haptics_enabled = !self.config.alerts.haptics_enabled;
-                self.cached_data.config = self.config;
+                self.cached_data.config = self.config.clone();
                 self.config_dirty = true;
                 self.needs_redraw = true;
             }
             Action::ToggleSound => {
                 self.config.alerts.sound_enabled = !self.config.alerts.sound_enabled;
-                self.cached_data.config = self.config;
+                self.cached_data.config = self.config.clone();
                 self.config_dirty = true;
                 self.needs_redraw = true;
             }
@@ -938,7 +977,7 @@ impl Model {
             }
             Action::ToggleDnd => {
                 self.config.alerts.dnd = !self.config.alerts.dnd;
-                self.cached_data.config = self.config;
+                self.cached_data.config = self.config.clone();
                 self.config_dirty = true;
                 self.needs_redraw = true;
             }
@@ -964,7 +1003,7 @@ impl Model {
                 // auto-lock.
                 self.config.display.dim_timeout_s =
                     ((secs as u64 * 2 / 3)).max(5);
-                self.cached_data.config = self.config;
+                self.cached_data.config = self.config.clone();
                 self.config_dirty = true;
                 self.needs_redraw = true;
             }
@@ -981,13 +1020,13 @@ impl Model {
                 self.config.time.tz_offset_minutes = (self.config.time.tz_offset_minutes
                     + delta_min)
                     .clamp(Config::TZ_OFFSET_MIN, Config::TZ_OFFSET_MAX);
-                self.cached_data.config = self.config;
+                self.cached_data.config = self.config.clone();
                 self.config_dirty = true;
                 self.needs_redraw = true;
             }
             Action::ToggleGpsTracking => {
                 self.config.gps.tracking_enabled = !self.config.gps.tracking_enabled;
-                self.cached_data.config = self.config;
+                self.cached_data.config = self.config.clone();
                 self.config_dirty = true;
                 self.track_failures = 0;
                 self.last_track_kick = None;
@@ -1019,10 +1058,48 @@ impl Model {
             Action::SetGpsCadence { cadence } => {
                 if self.config.gps.tracking_cadence != cadence {
                     self.config.gps.tracking_cadence = cadence;
-                    self.cached_data.config = self.config;
+                    self.cached_data.config = self.config.clone();
                     self.config_dirty = true;
                     self.needs_redraw = true;
                 }
+            }
+            Action::WifiScan | Action::WifiRescan => {
+                // One session at a time: the task serializes on its
+                // signal anyway, but a second kick would replace the
+                // pending command and confuse the status the UI shows.
+                if self.cached_data.wifi.is_busy() {
+                    return;
+                }
+                // Fresh scan = empty list (the view shows SCANNING
+                // until the first entry); a refresh merges into it.
+                if matches!(action, Action::WifiScan) {
+                    self.cached_data.wifi_scan.clear();
+                    self.needs_redraw = true;
+                }
+                let _ = out.push(Effect::WifiCommand(WifiCommand::Scan));
+                // No optimistic status write - the task publishes
+                // Scanning as its first act (the GPS precedent).
+            }
+            Action::SetWifiCredentials { ssid, passphrase } => {
+                // Store first, verify by joining. A wrong passphrase
+                // is stored too - the status line says AUTH FAILED
+                // and the user re-enters; with a single stored
+                // network there is nothing else to protect.
+                self.config.wifi.ssid = ssid;
+                self.config.wifi.passphrase = passphrase;
+                self.cached_data.config = self.config.clone();
+                self.config_dirty = true;
+                self.needs_redraw = true;
+                self.kick_wifi_sync(out);
+            }
+            Action::WifiConnect => {
+                self.kick_wifi_sync(out);
+            }
+            Action::WifiForget => {
+                self.config.wifi = crate::config::WifiConfig::DEFAULT;
+                self.cached_data.config = self.config.clone();
+                self.config_dirty = true;
+                self.needs_redraw = true;
             }
         }
     }
@@ -1044,6 +1121,26 @@ impl Model {
         }));
         self.track_pending = true;
         self.last_track_kick = Some(self.cached_data.uptime_secs);
+    }
+
+    /// Run one WiFi sync session with the stored credentials. Refused
+    /// (silently - the button is drawn disabled for both cases) when
+    /// no network is stored or a sync is already running. A scan
+    /// pass in flight is NOT a reason to refuse: the command signal
+    /// holds the request and the task runs it right after the pass -
+    /// the keyboard's DONE must join even while the list is still
+    /// auto-refreshing behind it.
+    fn kick_wifi_sync(&mut self, out: &mut Effects) {
+        if !self.config.wifi.is_set()
+            || matches!(self.cached_data.wifi, crate::data::WifiState::Connecting)
+        {
+            return;
+        }
+        let _ = out.push(Effect::WifiCommand(WifiCommand::SyncOnce {
+            ssid: self.config.wifi.ssid.clone(),
+            passphrase: self.config.wifi.passphrase.clone(),
+            tz_offset_minutes: self.config.time.tz_offset_minutes,
+        }));
     }
 
     /// Kick the next tracking session when one is due. Runs on every
@@ -1249,7 +1346,7 @@ impl Model {
         let pct = percent.clamp(5, max_pct);
         let hw = (pct as u16 * 255 / 100) as u8;
         self.config.display.brightness_active = hw;
-        self.cached_data.config = self.config;
+        self.cached_data.config = self.config.clone();
         let _ = out.push(Effect::SetDisplayBrightness(hw));
     }
 
@@ -1549,6 +1646,148 @@ mod tests {
             e,
             Effect::GpsCommand(GpsCommand::TrackOnce { .. })
         )));
+    }
+
+    #[test]
+    fn wifi_credentials_store_then_join_then_persist() {
+        use crate::data::{WifiFailure, WifiState};
+        let mut m = fresh();
+        let mut out = Effects::new();
+        // Nothing stored: CONNECT is a no-op at the model too, not
+        // just a disabled button.
+        m.dispatch_action(Action::WifiConnect, &mut out);
+        assert!(out.is_empty());
+
+        let ssid = heapless::String::try_from("Attic").unwrap();
+        let pass = heapless::String::try_from("hunter22").unwrap();
+        m.dispatch_action(
+            Action::SetWifiCredentials { ssid: ssid.clone(), passphrase: pass.clone() },
+            &mut out,
+        );
+        // Stored AND kicked in one action, tz offset from config.
+        assert_eq!(m.cached_data().config.wifi.ssid, ssid);
+        assert_eq!(m.cached_data().config.wifi.passphrase, pass);
+        assert_eq!(
+            out.as_slice(),
+            &[Effect::WifiCommand(WifiCommand::SyncOnce {
+                ssid: ssid.clone(),
+                passphrase: pass.clone(),
+                tz_offset_minutes: Config::DEFAULT.time.tz_offset_minutes,
+            })]
+        );
+        // The DONE tap's release flushes the config.
+        let fx = m.handle_event(&SystemEvent::TouchReleased, Instant::from_millis(0));
+        assert!(fx.iter().any(|e| matches!(e, Effect::SaveConfig)));
+
+        // A scan pass in flight does not block a join: the command
+        // queues behind the pass (DONE while the list auto-refreshes).
+        m.handle_event(
+            &SystemEvent::WifiStatusUpdated { state: WifiState::Scanning },
+            Instant::from_millis(0),
+        );
+        let mut out = Effects::new();
+        m.dispatch_action(Action::WifiConnect, &mut out);
+        assert!(matches!(
+            out.as_slice(),
+            [Effect::WifiCommand(WifiCommand::SyncOnce { .. })]
+        ));
+
+        // Busy: a second CONNECT is refused while the task reports
+        // Connecting; allowed again after a terminal state.
+        m.handle_event(
+            &SystemEvent::WifiStatusUpdated { state: WifiState::Connecting },
+            Instant::from_millis(0),
+        );
+        let mut out = Effects::new();
+        m.dispatch_action(Action::WifiConnect, &mut out);
+        assert!(out.is_empty());
+        m.handle_event(
+            &SystemEvent::WifiStatusUpdated {
+                state: WifiState::Failed(WifiFailure::AuthFailed),
+            },
+            Instant::from_millis(0),
+        );
+        m.dispatch_action(Action::WifiConnect, &mut out);
+        assert!(matches!(
+            out.as_slice(),
+            [Effect::WifiCommand(WifiCommand::SyncOnce { .. })]
+        ));
+
+        // FORGET clears both fields and dirties the config.
+        let mut out = Effects::new();
+        m.dispatch_action(Action::WifiForget, &mut out);
+        assert!(!m.cached_data().config.wifi.is_set());
+        assert!(m.cached_data().config.wifi.passphrase.is_empty());
+        let fx = m.handle_event(&SystemEvent::TouchReleased, Instant::from_millis(0));
+        assert!(fx.iter().any(|e| matches!(e, Effect::SaveConfig)));
+    }
+
+    #[test]
+    fn wifi_scan_list_fills_and_resets_per_session() {
+        use crate::data::{WifiNetwork, WifiState};
+        let mut m = fresh();
+        let net = |name: &str, rssi: i8| SystemEvent::WifiScanEntry {
+            network: WifiNetwork {
+                ssid: heapless::String::try_from(name).unwrap(),
+                rssi,
+                secured: true,
+            },
+        };
+        let mut out = Effects::new();
+        m.dispatch_action(Action::WifiScan, &mut out);
+        assert_eq!(out.as_slice(), &[Effect::WifiCommand(WifiCommand::Scan)]);
+
+        m.handle_event(
+            &SystemEvent::WifiStatusUpdated { state: WifiState::Scanning },
+            Instant::from_millis(0),
+        );
+        // Scanning refuses a second kick.
+        let mut out = Effects::new();
+        m.dispatch_action(Action::WifiScan, &mut out);
+        assert!(out.is_empty());
+
+        m.handle_event(&net("A", -40), Instant::from_millis(0));
+        m.handle_event(&net("B", -70), Instant::from_millis(0));
+        m.handle_event(
+            &SystemEvent::WifiStatusUpdated { state: WifiState::Scanned { count: 2 } },
+            Instant::from_millis(0),
+        );
+        assert_eq!(m.cached_data().wifi_scan.len(), 2);
+        assert_eq!(m.cached_data().wifi_scan[0].ssid.as_str(), "A");
+
+        // A refresh merges: B missed this pass but keeps its row, A
+        // updates its signal in place, C appends at the end.
+        let mut out = Effects::new();
+        m.dispatch_action(Action::WifiRescan, &mut out);
+        assert_eq!(out.as_slice(), &[Effect::WifiCommand(WifiCommand::Scan)]);
+        assert_eq!(m.cached_data().wifi_scan.len(), 2);
+        m.handle_event(
+            &SystemEvent::WifiStatusUpdated { state: WifiState::Scanning },
+            Instant::from_millis(0),
+        );
+        m.handle_event(&net("A", -45), Instant::from_millis(0));
+        m.handle_event(&net("C", -50), Instant::from_millis(0));
+        m.handle_event(
+            &SystemEvent::WifiStatusUpdated { state: WifiState::Scanned { count: 2 } },
+            Instant::from_millis(0),
+        );
+        let list = &m.cached_data().wifi_scan;
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].ssid.as_str(), "A");
+        assert_eq!(list[0].rssi, -45);
+        assert_eq!(list[1].ssid.as_str(), "B");
+        assert_eq!(list[2].ssid.as_str(), "C");
+
+        // A fresh scan starts from an empty list.
+        let mut out = Effects::new();
+        m.dispatch_action(Action::WifiScan, &mut out);
+        assert!(m.cached_data().wifi_scan.is_empty());
+        m.handle_event(
+            &SystemEvent::WifiStatusUpdated { state: WifiState::Scanning },
+            Instant::from_millis(0),
+        );
+        m.handle_event(&net("C", -50), Instant::from_millis(0));
+        assert_eq!(m.cached_data().wifi_scan.len(), 1);
     }
 
     #[test]

@@ -92,7 +92,7 @@ fn draw_tile_icon<D: BlendTarget>(
 }
 
 /// What a tile does on tap, plus how it sources its on-state.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum TileKind {
     /// Backed by a real config bool. `is_on(data)` paints the visual
     /// state; tap fires `action` (typically `Action::Toggle*`).
@@ -106,7 +106,7 @@ enum TileKind {
     Stub,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct TileDef {
     label: &'static str,
     icon: TileIcon,
@@ -255,7 +255,7 @@ impl Screen for QuickAccessScreen {
         // Tile grid.
         for (i, t) in TILES.iter().enumerate() {
             let rect = toggle_rect(i, &data.safe_area);
-            let on = match t.kind {
+            let on = match &t.kind {
                 TileKind::Toggle { is_on, .. } => is_on(data),
                 TileKind::Momentary { .. }     => false,
                 TileKind::Stub                 => self.tiles_on[i],
@@ -344,9 +344,9 @@ impl Screen for QuickAccessScreen {
                 }
                 for (i, t) in TILES.iter().enumerate() {
                     if !toggle_rect(i, &data.safe_area).contains(pt) { continue; }
-                    return match t.kind {
-                        TileKind::Toggle { action, .. } => action,
-                        TileKind::Momentary { action }  => action,
+                    return match &t.kind {
+                        TileKind::Toggle { action, .. } => action.clone(),
+                        TileKind::Momentary { action }  => action.clone(),
                         TileKind::Stub => {
                             self.tiles_on[i] = !self.tiles_on[i];
                             Action::Redraw

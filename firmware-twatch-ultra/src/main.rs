@@ -22,9 +22,6 @@ extern crate alloc;
 
 mod board;
 mod system;
-// Throwaway WiFi credentials (gitignored; template next to it).
-// Dies when on-device provisioning lands.
-mod wifi_secrets;
 
 use crate::system::power::{LoraSleepPins, TwatchUltraBoard};
 use drivers::touch::cst9217::Cst9217;
@@ -119,8 +116,8 @@ struct TwatchUltraBringup {
     /// enabling DLDO1.
     nfc_cs_out: Option<Output<'static>>,
     lpwr: Option<p::LPWR<'static>>,
-    // WiFi radio - session-gated NTP sync, see system-core's wifi
-    // module.
+    // WiFi radio token, handed to the shared session task via
+    // `take_wifi` (see system-core's wifi module).
     wifi: Option<p::WIFI<'static>>,
 }
 
@@ -464,38 +461,22 @@ impl Bringup for TwatchUltraBringup {
             )
             .unwrap(),
         );
-        // WiFi: session-gated NTP sync; credentials are the
-        // throwaway wifi_secrets scheme until on-device provisioning
-        // (scan + on-screen keyboard) lands.
-        spawner.spawn(
-            system_core::wifi::wifi_task(
-                self.wifi.take().unwrap(),
-                crate::wifi_secrets::WIFI_SSID,
-                crate::wifi_secrets::WIFI_PASSWORD,
-            )
-            .unwrap(),
-        );
-        // BRING-UP: one sync per boot so every flash exercises the
-        // whole radio -> NTP -> RTC path without UI. Interim fixed
-        // CEST offset, same as GPS's first phase - the real trigger
-        // carries config.tz_offset_minutes. REMOVE with Phase B.
-        //
-        // Kicked DELAYED: with the radio active during the boot
-        // storm, esp-radio's preemption stretched I2C transactions
-        // past their timeouts - every DRV2605/BHI260 boot-init
-        // failure observed 2026-08-08 landed inside the WiFi session
-        // window. Ten seconds puts the session after the IMU's
-        // ~103 KB firmware upload and the haptics init. The radio-
-        // vs-live-I2C interaction still needs a real look when
-        // sessions start running mid-use (provisioning effort).
-        spawner.spawn(wifi_bringup_kick().unwrap());
     }
 
     /// This board carries a GNSS receiver with a live sync task (the
     /// settings GPS view) and a BHI260AP whose step counter feeds the
-    /// motion pipeline (clock-face steps + MOTION STEPS panel).
+    /// motion pipeline (clock-face steps + MOTION STEPS panel). The
+    /// wifi flag is the system layer's (set from its feature).
     fn capabilities(&self) -> app_core::data::Capabilities {
-        app_core::data::Capabilities { gps: true, steps: true }
+        app_core::data::Capabilities {
+            gps: true,
+            steps: true,
+            ..app_core::data::Capabilities::default()
+        }
+    }
+
+    fn take_wifi(&mut self) -> p::WIFI<'static> {
+        self.wifi.take().unwrap()
     }
 
     /// The watch case's molded lip overhangs the panel: the
@@ -736,20 +717,6 @@ async fn audio_task(
             }
         };
     }
-}
-
-/// BRING-UP: the delayed WiFi sync kick (see its spawn site in
-/// `spawn_audio`). Ten seconds clears the boot storm - the IMU's
-/// ~103 KB firmware upload, haptics init - before the radio session
-/// starts; the boot-time I2C init transients of 2026-08-08 all
-/// happened with the session overlapping that storm. Dies together
-/// with the boot auto-kick when the provisioning UI lands.
-#[embassy_executor::task]
-async fn wifi_bringup_kick() {
-    Timer::after(Duration::from_secs(10)).await;
-    system_core::wifi::WIFI_COMMAND.signal(
-        system_core::wifi::WifiCommand::SyncOnce { tz_offset_minutes: 120 },
-    );
 }
 
 #[esp_rtos::main]

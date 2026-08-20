@@ -53,6 +53,9 @@ struct C6Bringup {
     imu_int1: Option<p::GPIO16<'static>>,
     flash: Option<p::FLASH<'static>>,
     lpwr: Option<p::LPWR<'static>>,
+    // WiFi radio token, handed to the shared session task via
+    // `take_wifi` (see system-core's wifi module).
+    wifi: Option<p::WIFI<'static>>,
     // Audio - full-duplex (speaker TX + mic RX share one I2S).
     i2s0: Option<p::I2S0<'static>>,
     dma_ch1: Option<p::DMA_CH1<'static>>,
@@ -207,6 +210,10 @@ impl Bringup for C6Bringup {
 
     fn make_rtc_ctrl(&mut self) -> esp_hal::rtc_cntl::Rtc<'static> {
         esp_hal::rtc_cntl::Rtc::new(self.lpwr.take().unwrap())
+    }
+
+    fn take_wifi(&mut self) -> p::WIFI<'static> {
+        self.wifi.take().unwrap()
     }
 
     fn spawn_audio(
@@ -446,6 +453,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         imu_int1: Some(peripherals.GPIO16),
         flash: Some(peripherals.FLASH),
         lpwr: Some(peripherals.LPWR),
+        wifi: Some(peripherals.WIFI),
         i2s0: Some(peripherals.I2S0),
         dma_ch1: Some(peripherals.DMA_CH1),
         spk_mclk: Some(peripherals.GPIO19),

@@ -24,7 +24,17 @@ esp-hal = { version = "1.1.0-rc.0", features = [
 ] }
 esp-rtos = { version = "0.3.0", features = [
     "esp32s3",
-    "embassy",  # enables the async executor and time driver
+    "embassy",    # enables the async executor and time driver
+    "esp-radio",  # scheduler hooks for the WiFi driver's tasks
+    "esp-alloc",  # esp-rtos allocates those task stacks from the heap
+] }
+# The WiFi session layer lives in system-core (its `wifi` feature);
+# this dep exists to pin the chip feature, which unification carries
+# into system-core's esp-radio build - the esp-hal pattern.
+esp-radio = { version = "0.18.0", features = [
+    "esp32s3",
+    "wifi",
+    "unstable",
 ] }
 esp-backtrace = { version = "0.19.0", features = [
     "esp32s3",
@@ -61,7 +71,7 @@ embedded-hal-bus   = { version = "0.3.0" }
 app-core     = { path = "../app-core",     features = ["serde"] }
 drivers      = { path = "../drivers",      features = ["display", "qmi8658", "pmu", "rtc", "touch", "sdcard", "es8311", "es7210"] }
 firmware-hal = { path = "../firmware-hal", features = ["psram-fb"] }
-system-core  = { path = "../system-core" }
+system-core  = { path = "../system-core", features = ["wifi"] }
 
 embedded-graphics-core = { workspace = true }
 embedded-graphics      = "0.8.2"

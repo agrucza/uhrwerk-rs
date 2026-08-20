@@ -10,7 +10,7 @@ std     = []
 # Opt-in serde derives on value types the firmware persists to
 # flash via `postcard`. Off by default so pure host tests stay
 # dep-free.
-serde = ["dep:serde", "dep:postcard"]
+serde = ["dep:serde", "dep:postcard", "heapless/serde"]
 
 [dependencies]
 defmt                  = { workspace = true, optional = true }
@@ -28,7 +28,9 @@ embedded-graphics      = "0.8.2"
 # fetch it, keeping logic host-testable.
 embassy-time = "0.5.1"
 
-# Static collections used by UI nav stack / screen state.
+# Static collections used by UI nav stack / screen state. Its
+# `serde` feature rides on ours: the config's WiFi credentials are
+# heapless Strings inside the tagged store.
 heapless = "0.9.2"
 
 # Driver-side value types carried inside system events and snapshot

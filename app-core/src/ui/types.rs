@@ -101,7 +101,10 @@ pub enum ScreenId {
 ///
 /// [`SwitchScreen`]: Action::SwitchScreen
 /// [`Back`]: Action::Back
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Clone`, not `Copy`: `SetWifiCredentials` carries the typed
+/// strings. Every other variant is still plain data.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Nothing to do.
     None,
@@ -273,6 +276,37 @@ pub enum Action {
     /// CONT/15S/30S/60S buttons). A remembered preference - takes
     /// effect from the next kick when tracking is enabled.
     SetGpsCadence { cadence: crate::config::GpsTrackingCadence },
+
+    /// Start a fresh WiFi scan (the settings WIFI view's SCAN button,
+    /// or the network list's empty-state tap): the Model clears
+    /// `wifi_scan` and forwards `Effect::WifiCommand(Scan)` unless a
+    /// session is already running; entries come back as
+    /// `SystemEvent::WifiScanEntry`.
+    WifiScan,
+
+    /// Refresh the list in place (the network list re-kicks this
+    /// every time a scan finishes while it is open): same command,
+    /// but known networks keep their row and only update their
+    /// signal, new ones append - the list grows stable under the
+    /// finger instead of flickering per pass.
+    WifiRescan,
+
+    /// Store the single WiFi network (the settings network list's
+    /// pick + passphrase DONE) and immediately run a sync session
+    /// with it - the join IS the verification of what was typed.
+    /// Marks config dirty; persisted on the next `TouchReleased`.
+    SetWifiCredentials {
+        ssid: heapless::String<{ crate::config::WifiConfig::SSID_MAX }>,
+        passphrase: heapless::String<{ crate::config::WifiConfig::PASSPHRASE_CAP }>,
+    },
+
+    /// Run a sync session with the stored credentials (the settings
+    /// WIFI view's CONNECT button, disabled while unset or busy).
+    WifiConnect,
+
+    /// Clear the stored WiFi network (the settings WIFI view's
+    /// FORGET button). Marks config dirty.
+    WifiForget,
 }
 
 // -- Persistent app state ----------------------------------------------------
@@ -860,6 +894,16 @@ pub struct SystemData {
     /// (powered down, waiting) instead of parroting the previous
     /// session's outcome.
     pub gps_next_session_secs: Option<u32>,
+
+    /// Progress of the latest WiFi session (scan or sync), from
+    /// `SystemEvent::WifiStatusUpdated`. Only ever leaves `Idle` on
+    /// boards whose capabilities include WiFi.
+    pub wifi: crate::data::WifiState,
+
+    /// Access points from the latest scan session, strongest first,
+    /// accumulated from `SystemEvent::WifiScanEntry` and cleared when
+    /// the next scan starts. RAM-only.
+    pub wifi_scan: crate::data::WifiScanList,
 }
 
 // -- Screen trait -------------------------------------------------------------

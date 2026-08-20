@@ -79,6 +79,9 @@ struct S3Bringup {
     sd_miso: Option<p::GPIO3<'static>>,
     sd_cs: Option<p::GPIO17<'static>>,
     lpwr: Option<p::LPWR<'static>>,
+    // WiFi radio token, handed to the shared session task via
+    // `take_wifi` (see system-core's wifi module).
+    wifi: Option<p::WIFI<'static>>,
     // Audio - full-duplex (speaker TX + mic RX share one I2S).
     i2s0: Option<p::I2S0<'static>>,
     dma_ch1: Option<p::DMA_CH1<'static>>,
@@ -240,6 +243,10 @@ impl Bringup for S3Bringup {
 
     fn make_rtc_ctrl(&mut self) -> esp_hal::rtc_cntl::Rtc<'static> {
         esp_hal::rtc_cntl::Rtc::new(self.lpwr.take().unwrap())
+    }
+
+    fn take_wifi(&mut self) -> p::WIFI<'static> {
+        self.wifi.take().unwrap()
     }
 
     fn spawn_audio(
@@ -471,6 +478,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         sd_miso: Some(peripherals.GPIO3),
         sd_cs: Some(peripherals.GPIO17),
         lpwr: Some(peripherals.LPWR),
+        wifi: Some(peripherals.WIFI),
         i2s0: Some(peripherals.I2S0),
         dma_ch1: Some(peripherals.DMA_CH1),
         spk_mclk: Some(peripherals.GPIO16),

@@ -171,6 +171,24 @@ pub enum SystemEvent {
         fix: crate::data::GpsFix,
     },
 
+    // -- WiFi --
+    /// Progress of the current WiFi session (scan or sync), emitted
+    /// by the WiFi task. Cached in `cached_data.wifi` for the
+    /// settings WIFI views. Same activity/wake rules as
+    /// `GpsSyncUpdated`: neither activity nor a wake source.
+    WifiStatusUpdated {
+        state: crate::data::WifiState,
+    },
+    /// One access point from a running scan session, strongest
+    /// first. Deliberately one network per event rather than the
+    /// whole list: `EVENTS` is sized by its largest variant and a
+    /// list payload would cost kilobytes of static RAM. The Model
+    /// clears `cached_data.wifi_scan` on `Scanning` and appends each
+    /// entry.
+    WifiScanEntry {
+        network: crate::data::WifiNetwork,
+    },
+
     // -- Flash-backed storage --
     /// Fresh flash-filesystem usage snapshot. Emitted by the
     /// manager once at boot (after the initial load), and after
@@ -353,6 +371,8 @@ pub fn classify_for_log(event: &SystemEvent) -> Option<LoggedEvent> {
         // chatter and NoSignal is the common indoor outcome.
         SystemEvent::GpsSyncUpdated { state: crate::data::GpsSyncState::Synced { .. } } =>
             LoggedEvent { tag: "gps_sync", detail: None },
+        SystemEvent::WifiStatusUpdated { state: crate::data::WifiState::Synced { .. } } =>
+            LoggedEvent { tag: "wifi_sync", detail: None },
         _ => return None,
     })
 }

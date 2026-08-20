@@ -20,7 +20,3 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 memory
-# Throwaway WiFi credentials for radio bring-up - copy
-# wifi_secrets.example.rs to wifi_secrets.rs and fill in your
-# network. Never commit it.
-firmware-twatch-ultra/src/wifi_secrets.rs

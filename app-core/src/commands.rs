@@ -9,7 +9,9 @@
 //! `SLEEP_WATCH`) still live on the firmware side and re-export
 //! these via `pub use`.
 
+use crate::config::WifiConfig;
 use crate::events::SelfTestId;
+use heapless::String;
 
 /// Broadcast on the SLEEP_WATCH `Watch` so subscribers (IMU task,
 /// touch task, power task) can flip between awake and low-power
@@ -90,6 +92,30 @@ pub enum GpsCommand {
     /// session): rail down, publish `Idle`. Ignored when no session
     /// is running.
     Abort,
+}
+
+/// Main-loop -> WiFi task commands. The radio exists only for the
+/// seconds a session runs; every variant is one complete session
+/// (radio up -> work -> radio off). Carries the credentials so the
+/// task stays config-blind, like the GPS task carries its timezone.
+/// `Clone`, not `Copy`: the credentials are heapless Strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WifiCommand {
+    /// One scan session: bring the radio up, list the visible access
+    /// points, radio off. Results stream back as
+    /// `SystemEvent::WifiScanEntry` (strongest first, SSIDs deduped),
+    /// bracketed by `WifiStatusUpdated { Scanning }` and
+    /// `{ Scanned { count } }`.
+    Scan,
+    /// One join -> DHCP -> NTP -> RTC-set session with the given
+    /// credentials (an empty passphrase = open network). Progress
+    /// comes back as `SystemEvent::WifiStatusUpdated`. Carries the
+    /// configured local-time offset for the RTC write.
+    SyncOnce {
+        ssid: String<{ WifiConfig::SSID_MAX }>,
+        passphrase: String<{ WifiConfig::PASSPHRASE_CAP }>,
+        tz_offset_minutes: i16,
+    },
 }
 
 /// Main-loop -> IMU task commands.

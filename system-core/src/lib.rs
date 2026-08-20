@@ -38,8 +38,10 @@ pub mod display;
 pub mod tasks;
 pub mod manager;
 
-// Session-based WiFi (NTP time sync). Feature-gated so bins that
-// haven't wired WiFi yet don't pay esp-radio's build cost - the same
-// opt-in idea as the drivers crate's per-chip features.
+// Session-based WiFi (scan + NTP time sync). Feature-gated: the
+// feature both spawns the task (manager::run) and sets the wifi
+// capability, so a bin without it builds no radio stack and shows no
+// WIFI row - the same opt-in idea as the drivers crate's per-chip
+// features.
 #[cfg(feature = "wifi")]
 pub mod wifi;

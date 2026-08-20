@@ -557,6 +557,7 @@ impl<B: Board> SystemManager<'static, B> {
                     }
                 }
                 Effect::GpsCommand(cmd) => crate::bus::GPS_COMMAND.signal(cmd),
+                Effect::WifiCommand(cmd) => crate::bus::WIFI_COMMAND.signal(cmd),
                 Effect::Shutdown => {
                     log::info!("System: shutdown requested");
                     self.board.shutdown();
@@ -1527,10 +1528,21 @@ pub trait Bringup {
     /// Which optional hardware this board carries. Cached into
     /// `SystemData` before the model is built; the shared UI gates
     /// board-specific rows/views on it. Default: none - a board
-    /// declares only what it actually spawns a task for.
+    /// declares only what it actually spawns a task for. The `wifi`
+    /// flag is NOT the bin's to set: `run` fills it from this crate's
+    /// `wifi` feature, which is also what spawns the radio task.
     fn capabilities(&self) -> app_core::data::Capabilities {
         app_core::data::Capabilities::default()
     }
+
+    /// Hand over the WIFI peripheral token. `run` spawns the shared
+    /// WiFi session task with it (the task is board-agnostic; the
+    /// chip feature on the bin's `esp-radio` dep selects the
+    /// silicon). Only exists in builds with the `wifi` feature, so
+    /// every bin enabling it must wire the token - the compiler
+    /// enforces the pairing.
+    #[cfg(feature = "wifi")]
+    fn take_wifi(&mut self) -> esp_hal::peripherals::WIFI<'static>;
 
     /// Panel pixels physically masked by this device's case/bezel,
     /// measured per board (bezel-ruler probe). Cached into
@@ -1614,7 +1626,12 @@ pub async fn run<T: Bringup>(
         rtc_state,
         imu,
         power: power_state,
-        capabilities: bringup.capabilities(),
+        capabilities: app_core::data::Capabilities {
+            // The radio task is spawned below under the same feature:
+            // the UI row exists exactly where the consumer does.
+            wifi: cfg!(feature = "wifi"),
+            ..bringup.capabilities()
+        },
         safe_area: bringup.safe_area(),
         config,
     });
@@ -1630,6 +1647,11 @@ pub async fn run<T: Bringup>(
     // Board-specific: the speaker task, where the board has one. Owns
     // the I2S / DMA / speaker pins; lazy bring-up on the first tone.
     bringup.spawn_audio(spawner, i2c_bus);
+    // Shared: the WiFi session task (scan / NTP sync on command). The
+    // radio is off between sessions, so spawning costs nothing until
+    // the settings WIFI view asks for a session.
+    #[cfg(feature = "wifi")]
+    spawner.spawn(crate::wifi::wifi_task(bringup.take_wifi()).unwrap());
 
     // Boot reveal: the panel is initialized but dark (init_display
     // stops before DISPON - power-on GRAM is random per datasheet
