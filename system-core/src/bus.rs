@@ -135,6 +135,19 @@ pub static GPS_COMMAND: Signal<CriticalSectionRawMutex, GpsCommand> = Signal::ne
 /// Single-consumer: only the WiFi task should call `wait()` on this.
 pub static WIFI_COMMAND: Signal<CriticalSectionRawMutex, WifiCommand> = Signal::new();
 
+/// Out-of-band stop for a running file-serving session.
+///
+/// The scan and sync sessions finish on their own, so they are driven
+/// entirely by [`WIFI_COMMAND`]. A serve session does not: it ends
+/// when the user leaves the screen, and by then the task is inside
+/// the session rather than waiting on the command signal. Hence a
+/// second signal the serve loop can select on.
+///
+/// Signalling it while nothing is serving is harmless - the serve
+/// loop clears it on entry, so a stale stop cannot kill the next
+/// session before it starts.
+pub static WIFI_STOP: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 /// Count of live wake holds - sessions that need the executor and
 /// peripheral clocks continuously up (a GPS sync session's UART
 /// today; audio playback/capture is the planned second holder).

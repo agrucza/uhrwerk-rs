@@ -24,6 +24,7 @@
 mod battery;
 mod clock;
 mod display;
+mod fileserver;
 mod gps;
 mod index;
 mod mic;
@@ -125,6 +126,10 @@ enum SettingsView {
     StorageSd,
     StorageRestoreFlash,
     StorageFactoryReset,
+    /// Serve the log directory over HTTP while this view is open.
+    /// Reached from the Storage sub-index; gated on the wifi
+    /// capability. Entering starts the session, leaving stops it.
+    StorageFileServer,
     /// Display preferences (brightness slider + auto-lock). Stub
     /// for now; real contents land in W3d.
     Display,
@@ -250,6 +255,7 @@ impl Screen for SettingsScreen {
             SettingsView::StorageSd => self.render_storage_sd(display, data, ctx),
             SettingsView::StorageRestoreFlash => self.render_storage_restore(display, data, ctx),
             SettingsView::StorageFactoryReset => self.render_storage_factory_reset(display, data, ctx),
+            SettingsView::StorageFileServer => self.render_file_server(display, data, ctx),
             SettingsView::Display   => self.render_display(display, data, ctx),
             SettingsView::Wifi      => self.render_wifi(display, data, ctx),
             SettingsView::WifiScan  => self.render_wifi_scan(display, data, ctx),
@@ -278,6 +284,7 @@ impl Screen for SettingsScreen {
             SettingsView::StorageSd => self.storage_sd_event(event, data),
             SettingsView::StorageRestoreFlash => self.storage_restore_event(event, data),
             SettingsView::StorageFactoryReset => self.storage_factory_reset_event(event, data),
+            SettingsView::StorageFileServer => self.file_server_event(event, data),
             SettingsView::Display => self.display_event(event, data),
             SettingsView::Wifi => self.wifi_event(event, data),
             SettingsView::WifiScan => self.wifi_scan_event(event, data),

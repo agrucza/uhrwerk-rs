@@ -93,6 +93,15 @@ const STORAGE_INDEX_ROWS: &[IndexRow] = &[
         kind: RowKind::Navigate { target: SettingsView::StorageRestoreFlash, value_fn: storage_restore_value },
     },
     IndexRow {
+        label: "SERVE OVER WIFI",
+        icon: RowIcon::Wifi,
+        visible: super::fileserver::index_visible,
+        kind: RowKind::Navigate {
+            target: SettingsView::StorageFileServer,
+            value_fn: super::fileserver::index_value,
+        },
+    },
+    IndexRow {
         label: "FACTORY RESET",
         icon: RowIcon::Skull,
         visible: always,
@@ -165,6 +174,13 @@ impl SettingsScreen {
                     0, &index_viewport_rect(&data.safe_area),
                     &mut self.view,
                 ) {
+                    // Opening the file server starts the session, the
+                    // same way opening MIC TEST starts capture: the
+                    // view being open is what authorises the radio,
+                    // and every exit path from it stops the session.
+                    if matches!(self.view, SettingsView::StorageFileServer) {
+                        return Action::StartFileServer;
+                    }
                     return action;
                 }
                 Action::None

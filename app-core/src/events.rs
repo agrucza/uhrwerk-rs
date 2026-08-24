@@ -56,6 +56,12 @@ pub enum SystemEvent {
     /// Battery state-of-charge changed. The power task emits this
     /// whenever the fuel-gauge percentage differs from its last
     /// poll; the new value is in the payload.
+    /// The file server did something worth recording. See
+    /// [`crate::data::FileServerEvent`]; `BadToken` is a wake source
+    /// (below) because it means someone is trying paths at a watch
+    /// that may be in a pocket.
+    FileServerActivity { kind: crate::data::FileServerEvent },
+
     /// Battery percent changed. Carries the cell voltage read in the
     /// same PMU snapshot: percent comes from the AXP2101's LEARNING
     /// fuel gauge, voltage straight from the ADC, so keeping the pair
@@ -343,6 +349,11 @@ pub fn is_wake_source(event: &SystemEvent) -> bool {
             | SystemEvent::WakeInterrupt
             | SystemEvent::AlarmFired { .. }
             | SystemEvent::TimerExpired { .. }
+            // A wrong-token request only: the served and timed-out
+            // kinds are records, not reasons to light the screen.
+            | SystemEvent::FileServerActivity {
+                kind: crate::data::FileServerEvent::BadToken,
+            }
     )
 }
 

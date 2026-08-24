@@ -116,6 +116,16 @@ pub enum WifiCommand {
         passphrase: String<{ WifiConfig::PASSPHRASE_CAP }>,
         tz_offset_minutes: i16,
     },
+    /// One file-serving session: join with the given credentials, then
+    /// answer HTTP on the LAN until the UI stops it or the session
+    /// budget runs out. Unlike the other two this session has no work
+    /// of its own to finish - it is ended from outside, by
+    /// `bus::WIFI_STOP` or its timeout, because the thing that decides
+    /// it is done is the user leaving the screen.
+    Serve {
+        ssid: String<{ WifiConfig::SSID_MAX }>,
+        passphrase: String<{ WifiConfig::PASSPHRASE_CAP }>,
+    },
 }
 
 /// Main-loop -> IMU task commands.

@@ -87,6 +87,11 @@ fn wifi_status_line(data: &SystemData) -> String<28> {
                 WifiState::Failed(WifiFailure::NoLease) => "NO DHCP LEASE",
                 WifiState::Failed(WifiFailure::NoNtp) => "NO TIME SERVER",
                 WifiState::Failed(WifiFailure::Timeout) => "TIMED OUT",
+                WifiState::Failed(WifiFailure::LinkLost) => "LINK LOST",
+                // The file server owns its own screen and shows the
+                // address there; from here it reads as "radio busy",
+                // which is exactly what it means for this view.
+                WifiState::Serving { .. } => "SERVING FILES",
                 WifiState::Scanned { .. } | WifiState::Synced { .. } => "",
             });
         }
@@ -252,7 +257,9 @@ impl SettingsScreen {
             // re-kicks once it is free.
             let (line, hint) = match data.wifi {
                 WifiState::Scanning => ("SCANNING", ""),
-                WifiState::Connecting => ("RADIO BUSY", "TAP TO RETRY"),
+                WifiState::Connecting | WifiState::Serving { .. } => {
+                    ("RADIO BUSY", "TAP TO RETRY")
+                }
                 WifiState::Scanned { .. } => ("NO NETWORKS FOUND", "TAP TO RESCAN"),
                 WifiState::Failed(_) => ("SCAN FAILED", "TAP TO RETRY"),
                 WifiState::Idle | WifiState::Synced { .. } => ("", "TAP TO SCAN"),

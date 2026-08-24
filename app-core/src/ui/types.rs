@@ -316,6 +316,18 @@ pub enum Action {
     /// Clear the stored WiFi network (the settings WIFI view's
     /// FORGET button). Marks config dirty.
     WifiForget,
+
+    /// Start a file-serving session (entering the settings FILE
+    /// SERVER view). Needs the wifi capability and a stored network;
+    /// the Model refuses it otherwise, and the view renders the
+    /// button Ghost in the same states.
+    StartFileServer,
+
+    /// End the file-serving session (leaving that view, or its STOP
+    /// button). Emitted on every exit path from the view - the
+    /// session is bounded by the screen being open, so a missed stop
+    /// would leave the radio up.
+    StopFileServer,
 }
 
 // -- Persistent app state ----------------------------------------------------
@@ -738,6 +750,10 @@ pub enum NotificationSeverity {
 pub enum NotificationSource {
     Alarm,
     Timer,
+    /// Something touched the device from outside - today only the
+    /// file server. Named for the concern, not the feature, so the
+    /// next thing that exposes the watch to a network can reuse it.
+    Security,
 }
 
 impl NotificationSource {
@@ -746,6 +762,11 @@ impl NotificationSource {
         match self {
             Self::Alarm => ScreenId::Alarm,
             Self::Timer => ScreenId::Timer,
+            // The nearest addressable screen: the file server lives
+            // in a settings sub-view, and only top-level screens have
+            // a `ScreenId`. Lands on the settings index rather than
+            // the server view itself.
+            Self::Security => ScreenId::Settings,
         }
     }
 
@@ -754,6 +775,7 @@ impl NotificationSource {
         match self {
             Self::Alarm => "ALARM",
             Self::Timer => "TIMER",
+            Self::Security => "ACCESS",
         }
     }
 
@@ -762,6 +784,7 @@ impl NotificationSource {
         match self {
             Self::Alarm => "!",
             Self::Timer => "*",
+            Self::Security => "@",
         }
     }
 }

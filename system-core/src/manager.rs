@@ -571,6 +571,7 @@ impl<B: Board> SystemManager<'static, B> {
                 }
                 Effect::GpsCommand(cmd) => crate::bus::GPS_COMMAND.signal(cmd),
                 Effect::WifiCommand(cmd) => crate::bus::WIFI_COMMAND.signal(cmd),
+                Effect::WifiStopServer => crate::bus::WIFI_STOP.signal(()),
                 Effect::Shutdown => {
                     log::info!("System: shutdown requested");
                     self.board.shutdown();
@@ -1679,11 +1680,12 @@ pub async fn run<T: Bringup>(
     // Board-specific: the speaker task, where the board has one. Owns
     // the I2S / DMA / speaker pins; lazy bring-up on the first tone.
     bringup.spawn_audio(spawner, i2c_bus);
-    // Shared: the WiFi session task (scan / NTP sync on command). The
-    // radio is off between sessions, so spawning costs nothing until
-    // the settings WIFI view asks for a session.
+    // Shared: the WiFi session task (scan / NTP sync / file serve on
+    // command). The radio is off between sessions, so spawning costs
+    // nothing until a settings view asks for a session. It gets the
+    // shared store because the serve session reads files out of it.
     #[cfg(feature = "wifi")]
-    spawner.spawn(crate::wifi::wifi_task(bringup.take_wifi()).unwrap());
+    spawner.spawn(crate::wifi::wifi_task(bringup.take_wifi(), manager.store).unwrap());
 
     // Boot reveal: the panel is initialized but dark (init_display
     // stops before DISPON - power-on GRAM is random per datasheet

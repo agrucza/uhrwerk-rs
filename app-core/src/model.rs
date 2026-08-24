@@ -96,6 +96,11 @@ pub enum Effect {
     /// task exists.
     WifiCommand(WifiCommand),
 
+    /// End a running file-serving session. Not a `WifiCommand`: the
+    /// task is inside its session, not waiting on the command signal,
+    /// so this is delivered out of band on `bus::WIFI_STOP`.
+    WifiStopServer,
+
     /// Immediate shutdown request (Action::Shutdown from a screen).
     Shutdown,
 
@@ -661,6 +666,60 @@ impl Model {
                 self.surface_notifications();
                 self.needs_redraw = true;
             }
+            SystemEvent::FileServerActivity { kind } => {
+                use crate::data::FileServerEvent;
+                match kind {
+                    FileServerEvent::Served(name) => {
+                        let mut subtitle: heapless::String<32> = heapless::String::new();
+                        let _ = subtitle.push_str("SENT ");
+                        let _ = subtitle.push_str(name.as_str());
+                        self.push_notification_owned(
+                            NotificationSeverity::Info,
+                            NotificationSource::Security,
+                            subtitle,
+                        );
+                    }
+                    FileServerEvent::BadToken => {
+                        // Critical because the two explanations are
+                        // "you mistyped" and "someone is guessing",
+                        // and the second one matters enough to
+                        // interrupt for. The session has already
+                        // closed itself - the task decides that, at
+                        // the point it sees the request - so there is
+                        // nothing to stop from here.
+                        self.push_notification(
+                            NotificationSeverity::Critical,
+                            NotificationSource::Security,
+                            "BAD TOKEN - SERVER OFF",
+                        );
+                        // One pulse, not the alarm's nagging pattern:
+                        // this reports something that already
+                        // happened and is already contained, so it
+                        // does not need dismissing to fall silent.
+                        let _ = out.push(Effect::MotorPulse { duration_ms: 350 });
+                        self.surface_notifications();
+                    }
+                    FileServerEvent::TimedOut => {
+                        self.push_notification(
+                            NotificationSeverity::Info,
+                            NotificationSource::Security,
+                            "SERVER TIMED OUT",
+                        );
+                    }
+                    FileServerEvent::LinkLost => {
+                        // Warning, not Info: the session ended for a
+                        // reason the user did not choose and probably
+                        // did not see, having walked away from a
+                        // screen that was showing a working address.
+                        self.push_notification(
+                            NotificationSeverity::Warning,
+                            NotificationSource::Security,
+                            "SERVER LINK LOST",
+                        );
+                    }
+                }
+                self.needs_redraw = true;
+            }
             SystemEvent::SelfTestUpdated { id, result } => {
                 let idx = *id as usize;
                 if idx < NUM_SELF_TESTS {
@@ -1135,6 +1194,30 @@ impl Model {
             }
             Action::WifiConnect => {
                 self.kick_wifi_sync(out);
+            }
+            Action::StartFileServer => {
+                // Same gate as the sync sessions: a radio, a stored
+                // network, and nothing else already using it. The view
+                // renders the control Ghost in exactly these states,
+                // so this is the tap-side half of that contract.
+                if !self.cached_data.capabilities.wifi
+                    || !self.config.wifi.is_set()
+                    || self.cached_data.wifi.is_busy()
+                {
+                    return;
+                }
+                let _ = out.push(Effect::WifiCommand(WifiCommand::Serve {
+                    ssid: self.config.wifi.ssid.clone(),
+                    passphrase: self.config.wifi.passphrase.clone(),
+                }));
+            }
+            Action::StopFileServer => {
+                // Unconditional: this fires on every exit path from
+                // the view, including ones where no session is
+                // running. A stray stop is harmless (the signal is
+                // simply never observed); a missed one leaves the
+                // radio up with nobody watching.
+                let _ = out.push(Effect::WifiStopServer);
             }
             Action::WifiForget => {
                 self.config.wifi = crate::config::WifiConfig::DEFAULT;
@@ -1848,6 +1931,53 @@ mod tests {
             },
             &mut out,
         );
+    }
+
+    #[test]
+    fn file_server_starts_only_with_a_radio_and_a_stored_network() {
+        use crate::data::WifiState;
+        // No radio: nothing, even though a network could be stored.
+        let mut m = with_caps(false, false);
+        let mut out = Effects::new();
+        m.dispatch_action(Action::StartFileServer, &mut out);
+        assert!(out.is_empty());
+
+        // Radio but nothing stored: nothing to join, so nothing to
+        // serve on.
+        let mut m = with_caps(true, false);
+        let mut out = Effects::new();
+        m.dispatch_action(Action::StartFileServer, &mut out);
+        assert!(out.is_empty());
+
+        // Radio + stored network: a serve session with those creds.
+        store_network(&mut m);
+        let mut out = Effects::new();
+        m.dispatch_action(Action::StartFileServer, &mut out);
+        assert!(matches!(
+            out.as_slice(),
+            [Effect::WifiCommand(WifiCommand::Serve { .. })]
+        ));
+
+        // Radio already busy: refused, so a serve request cannot
+        // interrupt a sync mid-flight.
+        m.handle_event(
+            &SystemEvent::WifiStatusUpdated { state: WifiState::Connecting },
+            Instant::from_millis(0),
+        );
+        let mut out = Effects::new();
+        m.dispatch_action(Action::StartFileServer, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn file_server_stop_is_unconditional() {
+        // Leaving the view must always emit the stop, including when
+        // no session is running: a stray stop is inert, a missed one
+        // leaves the radio up with nobody watching the screen.
+        let mut m = with_caps(true, false);
+        let mut out = Effects::new();
+        m.dispatch_action(Action::StopFileServer, &mut out);
+        assert_eq!(out.as_slice(), &[Effect::WifiStopServer]);
     }
 
     #[test]

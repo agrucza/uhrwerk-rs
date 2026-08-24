@@ -33,9 +33,17 @@
 //! Progress is published as `SystemEvent::WifiStatusUpdated`
 //! (plus `WifiScanEntry` per network) for the settings WIFI views.
 
-use app_core::data::{WifiFailure, WifiNetwork, WifiState, MAX_WIFI_NETWORKS};
+use app_core::data::{
+    looks_like_file_server_token_guess, FileServerEvent, WifiFailure, WifiNetwork,
+    WifiState, FILE_SERVER_TOKEN_ALPHABET, FILE_SERVER_TOKEN_LEN, MAX_WIFI_NETWORKS,
+};
 use app_core::events::SystemEvent;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select3, Either, Either3};
+// Two `Write`s, both used here and neither namable at a call site:
+// `core::fmt` backs the `write!` macro into heapless strings, and
+// `embedded_io_async` backs `write_all` on the socket.
+use core::fmt::Write as _;
+use embedded_io_async::Write as _;
 use embassy_net::dns::DnsQueryType;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{IpAddress, StackResources};
@@ -115,7 +123,10 @@ const PUBLISH_WAIT_SECS: u64 = 2;
 /// via `reborrow()` so the token is ready again for the next one -
 /// the same session-scoped peripheral pattern as audio's I2S0.
 #[embassy_executor::task]
-pub async fn wifi_task(mut wifi: p::WIFI<'static>) {
+pub async fn wifi_task(
+    mut wifi: p::WIFI<'static>,
+    store: &'static bus::SharedStore,
+) {
     loop {
         let cmd = WIFI_COMMAND.wait().await;
         // Hardware light sleep would gate the radio's clocks
@@ -134,6 +145,16 @@ pub async fn wifi_task(mut wifi: p::WIFI<'static>) {
                     ssid.as_str(),
                     passphrase.as_str(),
                     tz_offset_minutes,
+                )
+                .await;
+            }
+            WifiCommand::Serve { ssid, passphrase } => {
+                log::info!("WiFi: serve session start ({})", ssid.as_str());
+                run_serve_session(
+                    wifi.reborrow(),
+                    ssid.as_str(),
+                    passphrase.as_str(),
+                    store,
                 )
                 .await;
             }
@@ -554,3 +575,506 @@ fn civil_from_unix(secs: u64) -> (u16, u8, u8, u8, u8, u8) {
     let year = (yoe + era * 400 + i64::from(month <= 2)) as u16;
     (year, month, day, hour, minute, second)
 }
+
+// -- Serve session -------------------------------------------------------------
+//
+// A file-serving session: join the stored network, then answer HTTP
+// on the LAN until the UI stops it or the budget expires. Unlike the
+// other two sessions this one has no work of its own to finish - the
+// user leaving the screen is what ends it.
+//
+// Read-only by design. There is no upload path, so the worst a
+// request can do is read a file this device already shows on screen.
+
+/// Longest a serve session may run unattended. The UI stops the
+/// session when the view closes, so this only catches the case where
+/// that never happens (a crash on the UI side, or a screen left open
+/// in a pocket). Long enough to pull a log over a slow link, short
+/// enough that a forgotten session cannot flatten the battery.
+const SERVE_BUDGET_SECS: u64 = 15 * 60;
+
+/// Listening port. Not 80: that would need a privileged port on some
+/// clients' tooling and offers nothing here.
+const SERVE_PORT: u16 = 8080;
+
+/// The one directory exposed. Logs are the reason this exists - the
+/// battery percent/voltage trace in particular - and confining the
+/// server to a single directory is what keeps path handling trivial:
+/// there are no subdirectories to walk and nothing to escape from.
+const SERVE_DIR: &str = "/system/logs";
+
+// The token alphabet and the "is this a guess?" predicate live in
+// app-core (`data::FILE_SERVER_TOKEN_ALPHABET`,
+// `data::looks_like_file_server_token_guess`) - this crate has no host
+// tests, and that predicate decides whether the server is usable at
+// all, so it belongs where it can be tested.
+
+/// How long a single client connection may stall before it is
+/// dropped, so one wedged peer cannot hold the session's only socket.
+const SERVE_SOCKET_TIMEOUT_SECS: u64 = 10;
+
+/// Bytes read from flash per chunk while streaming a file. Small on
+/// purpose: every chunk is a BLOCKING flash read taken under the
+/// store mutex, so this is how long the UI can be stalled at a
+/// stretch. See the lock discipline on [`bus::SharedStore`].
+const SERVE_CHUNK: usize = 512;
+
+/// Generate a fresh session token.
+fn make_token(rng: &mut Rng) -> [u8; FILE_SERVER_TOKEN_LEN] {
+    let mut token = [0u8; FILE_SERVER_TOKEN_LEN];
+    for slot in token.iter_mut() {
+        let idx = (rng.random() as usize) % FILE_SERVER_TOKEN_ALPHABET.len();
+        *slot = FILE_SERVER_TOKEN_ALPHABET[idx];
+    }
+    token
+}
+
+/// One serve session: radio up, join, lease, listen until stopped.
+async fn run_serve_session(
+    wifi: p::WIFI<'_>,
+    ssid: &str,
+    passphrase: &str,
+    store: &'static bus::SharedStore,
+) {
+    // A stop signalled while nothing was serving must not kill this
+    // session before it starts.
+    bus::WIFI_STOP.reset();
+
+    publish(WifiState::Connecting).await;
+    let (mut controller, interfaces) =
+        match esp_radio::wifi::new(wifi, ControllerConfig::default()) {
+            Ok(pair) => pair,
+            Err(e) => {
+                log::warn!("WiFi: radio init failed: {:?}", e);
+                publish(WifiState::Failed(WifiFailure::RadioInit)).await;
+                return;
+            }
+        };
+
+    let mut station = StationConfig::default()
+        .with_ssid(ssid)
+        .with_password(String::from(passphrase));
+    if passphrase.is_empty() {
+        station = station.with_auth_method(AuthenticationMethod::None);
+    }
+    if let Err(e) = controller.set_config(&WifiConfig::Station(station)) {
+        log::warn!("WiFi: station config rejected: {:?}", e);
+        publish(WifiState::Failed(WifiFailure::RadioInit)).await;
+        return;
+    }
+
+    // Sockets in play: DHCP + the listener. (DNS is not needed - this
+    // session never resolves a name.)
+    let mut resources: StackResources<3> = StackResources::new();
+    let mut rng = Rng::new();
+    let seed = ((rng.random() as u64) << 32) | rng.random() as u64;
+    let (stack, mut runner) = embassy_net::new(
+        interfaces.station,
+        embassy_net::Config::dhcpv4(dhcp_config()),
+        &mut resources,
+        seed,
+    );
+
+    let token = make_token(&mut rng);
+    let outcome = match select3(
+        runner.run(),
+        with_timeout(
+            Duration::from_secs(SERVE_BUDGET_SECS),
+            serve_once(&mut controller, stack, store, token),
+        ),
+        bus::WIFI_STOP.wait(),
+    )
+    .await
+    {
+        Either3::First(never) => match never {},
+        Either3::Second(Ok(state)) => state,
+        Either3::Second(Err(_)) => {
+            log::info!("WiFi: serve budget ({}s) reached", SERVE_BUDGET_SECS);
+            // Worth a notification: this ending is the one the user
+            // did not ask for, so without a row there is nothing to
+            // explain why the server stopped answering.
+            publish_server_event(FileServerEvent::TimedOut).await;
+            WifiState::Idle
+        }
+        Either3::Third(()) => {
+            log::info!("WiFi: serve stopped by UI");
+            WifiState::Idle
+        }
+    };
+    publish(outcome).await;
+}
+
+/// Associate, lease, then answer requests until cancelled. Only
+/// returns on failure - a healthy session is ended from outside.
+async fn serve_once(
+    controller: &mut WifiController<'_>,
+    stack: embassy_net::Stack<'_>,
+    store: &'static bus::SharedStore,
+    token: [u8; FILE_SERVER_TOKEN_LEN],
+) -> WifiState {
+    match controller.connect_async().await {
+        Ok(info) => log::info!("WiFi: connected: {:?}", info),
+        Err(e) => {
+            log::warn!("WiFi: connect failed: {:?}", e);
+            return WifiState::Failed(classify_connect_error(&e));
+        }
+    }
+
+    if with_timeout(Duration::from_secs(LEASE_BUDGET_SECS), stack.wait_config_up())
+        .await
+        .is_err()
+    {
+        log::warn!("WiFi: no DHCP lease within {}s", LEASE_BUDGET_SECS);
+        return WifiState::Failed(WifiFailure::NoLease);
+    }
+    let Some(cfg) = stack.config_v4() else {
+        log::warn!("WiFi: link up but no IPv4 config");
+        return WifiState::Failed(WifiFailure::NoLease);
+    };
+    let ip = cfg.address.address().octets();
+
+    // The address and token only exist here, and the user cannot use
+    // the server without both - so this publish IS the feature's
+    // output, not a status nicety.
+    log::info!(
+        "WiFi: serving http://{}.{}.{}.{}:{}/{}/",
+        ip[0], ip[1], ip[2], ip[3], SERVE_PORT,
+        core::str::from_utf8(&token).unwrap_or("?"),
+    );
+    publish(WifiState::Serving { ip, port: SERVE_PORT, token }).await;
+
+    let mut rx_buf = [0u8; 1024];
+    let mut tx_buf = [0u8; 1024];
+    loop {
+        let mut socket = embassy_net::tcp::TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+        socket.set_timeout(Some(Duration::from_secs(SERVE_SOCKET_TIMEOUT_SECS)));
+        // Wait for a client, but not forever if the link is gone.
+        match select(socket.accept(SERVE_PORT), link_lost(controller)).await {
+            Either::First(Ok(())) => {}
+            Either::First(Err(e)) => {
+                log::warn!("WiFi: accept failed: {:?}", e);
+                continue;
+            }
+            Either::Second(info) => {
+                // The reason code is the whole point of logging this:
+                // an AP dropping an idle station, a beacon timeout and
+                // us being deauthenticated are three different bugs
+                // with three different fixes.
+                match info {
+                    Some(d) => log::warn!(
+                        "serve: link lost (reason {:?}, rssi {}) - ending session",
+                        d.reason, d.rssi,
+                    ),
+                    None => log::warn!(
+                        "serve: link lost (no reason reported) - ending session",
+                    ),
+                }
+                publish_server_event(FileServerEvent::LinkLost).await;
+                return WifiState::Failed(WifiFailure::LinkLost);
+            }
+        }
+        let verdict = handle_request(&mut socket, store, &token).await;
+        socket.close();
+        // Give the peer a moment to see the FIN before the buffers are
+        // reused by the next connection.
+        socket.flush().await.ok();
+        socket.abort();
+        if verdict.is_err() {
+            // Fail closed on a token guess. The token dies with the
+            // session, so whatever was guessing has to start over
+            // against a value that no longer exists - and the user
+            // has already been told.
+            log::warn!("serve: bad token - ending session");
+            return WifiState::Idle;
+        }
+    }
+}
+
+/// Backstop poll interval for the link watch. The disconnect EVENT is
+/// the primary signal; this only covers the case where the link went
+/// down in the window before the wait was registered, when there is
+/// no event left to receive.
+const LINK_CHECK_SECS: u64 = 5;
+
+/// Resolves when the station is no longer associated, with the reason
+/// if the driver reported one.
+///
+/// Raced against `accept()` because an idle listener is indefinitely
+/// patient: nothing about a socket that never receives anything
+/// distinguishes "no one has connected yet" from "the AP dropped us
+/// ten minutes ago". Without this the view keeps showing an address
+/// that cannot work, which is worse than showing a failure - it looks
+/// exactly like the device having hung.
+///
+/// Event AND poll, deliberately. `wait_for_disconnect_async` gives the
+/// 802.11 reason code and the RSSI at the moment of the drop, which is
+/// what tells an idle-timeout deauthentication apart from signal loss.
+/// But a disconnect that happened before the wait was registered has
+/// no event left to deliver, and waiting forever for it would
+/// reproduce exactly the silent-dead-link bug this exists to prevent -
+/// hence the parallel state poll.
+async fn link_lost(
+    controller: &WifiController<'_>,
+) -> Option<esp_radio::wifi::DisconnectedStationInfo> {
+    let poll = async {
+        loop {
+            embassy_time::Timer::after(Duration::from_secs(LINK_CHECK_SECS)).await;
+            if !controller.is_connected() {
+                return;
+            }
+        }
+    };
+    match select(controller.wait_for_disconnect_async(), poll).await {
+        Either::First(Ok(info)) => Some(info),
+        Either::First(Err(e)) => {
+            log::warn!("serve: disconnect wait failed: {:?}", e);
+            None
+        }
+        Either::Second(()) => None,
+    }
+}
+
+/// Report a file-server event for the notification list.
+async fn publish_server_event(kind: FileServerEvent) {
+    let event = SystemEvent::FileServerActivity { kind };
+    if EVENTS.try_send(event.clone()).is_ok() {
+        return;
+    }
+    if with_timeout(Duration::from_secs(PUBLISH_WAIT_SECS), EVENTS.send(event))
+        .await
+        .is_err()
+    {
+        log::warn!("serve: event channel full - activity dropped");
+    }
+}
+
+/// Read one request, answer it. Errors close the connection - there
+/// is no keep-alive, so every request gets a fresh socket and a fresh
+/// parse, and a malformed request costs nothing but that connection.
+///
+/// `Err(())` means the SESSION should end, not just this connection:
+/// today that is a wrong-token guess, which fails closed.
+async fn handle_request(
+    socket: &mut embassy_net::tcp::TcpSocket<'_>,
+    store: &'static bus::SharedStore,
+    token: &[u8; FILE_SERVER_TOKEN_LEN],
+) -> Result<(), ()> {
+    // Only the request line is of interest, and it is bounded: a
+    // longer one is either a path we would reject anyway or a client
+    // doing something we do not support.
+    let mut buf = [0u8; 512];
+    let mut used = 0;
+    let line_end = loop {
+        let Ok(n) = socket.read(&mut buf[used..]).await else { return Ok(()) };
+        if n == 0 {
+            return Ok(());
+        }
+        used += n;
+        if let Some(pos) = buf[..used].windows(2).position(|w| w == b"\r\n") {
+            break pos;
+        }
+        if used == buf.len() {
+            let _ = send_status(socket, "414 URI Too Long", "uri too long\n").await;
+            return Ok(());
+        }
+    };
+
+    let Ok(line) = core::str::from_utf8(&buf[..line_end]) else {
+        let _ = send_status(socket, "400 Bad Request", "bad request\n").await;
+        return Ok(());
+    };
+    let mut parts = line.split(' ');
+    let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
+        let _ = send_status(socket, "400 Bad Request", "bad request\n").await;
+        return Ok(());
+    };
+    if method != "GET" {
+        let _ = send_status(socket, "405 Method Not Allowed", "GET only\n").await;
+        return Ok(());
+    }
+
+    // Token gate. Everything below this point has been authorised, so
+    // this check is the ONLY thing between the network and the files.
+    // Answering 404 rather than 403 keeps a wrong-token probe
+    // indistinguishable from a wrong path.
+    let Ok(token_str) = core::str::from_utf8(token) else { return Ok(()) };
+    let Some(rest) = path
+        .strip_prefix('/')
+        .and_then(|p| p.strip_prefix(token_str))
+    else {
+        let _ = send_status(socket, "404 Not Found", "not found\n").await;
+        if looks_like_file_server_token_guess(path) {
+            // Shaped like a token but wrong: report it and let the
+            // caller end the session. Not reported for ordinary junk
+            // paths - see `looks_like_token_guess`.
+            publish_server_event(FileServerEvent::BadToken).await;
+            return Err(());
+        }
+        return Ok(());
+    };
+
+    match rest {
+        "" | "/" => send_index(socket, store).await,
+        _ => {
+            // `strip_prefix`, not `&rest[1..]`: slicing a `str` at a
+            // byte offset PANICS when that offset is not a character
+            // boundary, so a path with a multi-byte character right
+            // after the token would take the whole watch down - and a
+            // panic here halts with interrupts disabled, which no
+            // wake source can recover from. Never index a str by a
+            // byte offset derived from network input.
+            let Some(name) = rest.strip_prefix('/') else {
+                let _ = send_status(socket, "404 Not Found", "not found\n").await;
+                return Ok(());
+            };
+            // One directory, no subdirectories: any separator or
+            // parent reference in the name is a traversal attempt, not
+            // a filename we could serve.
+            if name.is_empty() || name.contains('/') || name.contains("..") {
+                let _ = send_status(socket, "404 Not Found", "not found\n").await;
+                return Ok(());
+            }
+            if send_file(socket, store, name).await {
+                // Only a COMPLETED download is reported. A connection
+                // that died halfway is not something the user did.
+                let mut sent: heapless::String<24> = heapless::String::new();
+                let _ = sent.push_str(name);
+                publish_server_event(FileServerEvent::Served(sent)).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Minimal status response with a plain-text body.
+async fn send_status(
+    socket: &mut embassy_net::tcp::TcpSocket<'_>,
+    status: &str,
+    body: &str,
+) -> Result<(), ()> {
+    let mut head: heapless::String<128> = heapless::String::new();
+    if write!(
+        &mut head,
+        "HTTP/1.1 {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        body.len(),
+    )
+    .is_err()
+    {
+        return Err(());
+    }
+    socket.write_all(head.as_bytes()).await.map_err(|_| ())?;
+    socket.write_all(body.as_bytes()).await.map_err(|_| ())
+}
+
+/// Directory index: one link per file in [`SERVE_DIR`].
+async fn send_index(
+    socket: &mut embassy_net::tcp::TcpSocket<'_>,
+    store: &'static bus::SharedStore,
+) {
+    // Collect names under the lock, render after releasing it - the
+    // listing is a blocking filesystem walk and the writes below
+    // await.
+    let mut names: Vec<heapless::String<64>, 24> = Vec::new();
+    {
+        let mut guard = store.lock().await;
+        guard.flash_mut().for_each_file(SERVE_DIR, |name| {
+            let mut owned: heapless::String<64> = heapless::String::new();
+            if owned.push_str(name).is_ok() && names.push(owned).is_ok() {
+                core::ops::ControlFlow::Continue(())
+            } else {
+                // Out of slots: stop walking rather than silently
+                // listing a truncated directory as if it were whole.
+                core::ops::ControlFlow::Break(())
+            }
+        });
+    }
+
+    // Relative hrefs, so the token in the current URL carries over
+    // without the page having to know it.
+    let mut body: heapless::String<1024> = heapless::String::new();
+    let _ = body.push_str("<!doctype html><meta charset=utf-8><title>uhrwerk</title><h1>logs</h1><ul>");
+    for name in names.iter() {
+        if write!(&mut body, "<li><a href=\"{}\">{}</a></li>", name, name).is_err() {
+            break;
+        }
+    }
+    let _ = body.push_str("</ul>");
+
+    let mut head: heapless::String<128> = heapless::String::new();
+    if write!(
+        &mut head,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len(),
+    )
+    .is_err()
+    {
+        return;
+    }
+    if socket.write_all(head.as_bytes()).await.is_err() {
+        return;
+    }
+    let _ = socket.write_all(body.as_bytes()).await;
+}
+
+/// Stream one file out of [`SERVE_DIR`], a chunk at a time. Returns
+/// true only if the whole file reached the client.
+async fn send_file(
+    socket: &mut embassy_net::tcp::TcpSocket<'_>,
+    store: &'static bus::SharedStore,
+    name: &str,
+) -> bool {
+    let mut path: heapless::String<96> = heapless::String::new();
+    if write!(&mut path, "{}/{}", SERVE_DIR, name).is_err() {
+        let _ = send_status(socket, "404 Not Found", "not found\n").await;
+        return false;
+    }
+
+    let size = { store.lock().await.flash_mut().file_size(&path) };
+    let Some(size) = size else {
+        let _ = send_status(socket, "404 Not Found", "not found\n").await;
+        return false;
+    };
+
+    let mut head: heapless::String<160> = heapless::String::new();
+    if write!(
+        &mut head,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        size,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    if socket.write_all(head.as_bytes()).await.is_err() {
+        return false;
+    }
+
+    // Lock, read one chunk, release, write, yield. The store's methods
+    // are blocking, so holding the guard across the socket write would
+    // stall the UI for a whole network round trip; the yield gives the
+    // render loop a slot between chunks.
+    let mut offset = 0u32;
+    let mut chunk = [0u8; SERVE_CHUNK];
+    while offset < size {
+        let read = {
+            let mut guard = store.lock().await;
+            guard.flash_mut().read_file_range(&path, offset, &mut chunk)
+        };
+        let Some(n) = read else { return false };
+        if n == 0 {
+            // Short read before Content-Length: the file shrank under
+            // us (a log reset mid-download). Nothing honest left to
+            // send - drop the connection rather than pad it.
+            log::warn!("serve: {} ended early at {}/{}", path, offset, size);
+            return false;
+        }
+        if socket.write_all(&chunk[..n]).await.is_err() {
+            return false;
+        }
+        offset += n as u32;
+        embassy_futures::yield_now().await;
+    }
+    true
+}
+

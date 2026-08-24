@@ -58,9 +58,13 @@ embassy-net = { version = "0.9.1", features = [
     "proto-ipv4",
     "medium-ethernet",
     "udp",
+    "tcp",
     "dns",
     "dhcpv4",
 ], optional = true }
+# The async Write trait for the file server's socket writes. Version
+# matches what embassy-net 0.9.1 depends on, so cargo unifies.
+embedded-io-async = { version = "0.7.0", optional = true }
 # Direct dep purely to configure the DHCP client: `DhcpConfig`'s
 # `retry_config` field is smoltcp's `RetryConfig`, and embassy-net
 # re-exports neither it nor `smoltcp::time::Duration` - so the
@@ -84,4 +88,4 @@ firmware-hal = { path = "../firmware-hal" }
 # Session-based WiFi (src/wifi.rs). The enabling bin must also add
 # `esp-radio` itself with its chip feature, and give `esp-rtos` its
 # `esp-radio` scheduler feature.
-wifi = ["dep:esp-radio", "dep:embassy-net", "dep:smoltcp"]
+wifi = ["dep:esp-radio", "dep:embassy-net", "dep:smoltcp", "dep:embedded-io-async"]

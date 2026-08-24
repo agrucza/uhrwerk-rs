@@ -133,7 +133,11 @@ impl Screen for NotificationsScreen {
         }
         let hdr = corner_safe_header_rect(app_header_rect(&data.safe_area), &data.safe_area);
         if ctx.intersects_y(hdr.top_left.y, hdr.top_left.y + hdr.size.height as i32 + 8) {
-            header(display, hdr, "ALERTS", tele.as_str(), ACCENT);
+            // "NOTIFICATIONS", not "ALERTS": the list carries
+            // informational rows (a file served) alongside ones
+            // demanding action (an alarm firing), and "alerts"
+            // overpromises urgency for the former.
+            header(display, hdr, "NOTIFICATIONS", tele.as_str(), ACCENT);
         }
 
         if data.notifications.entries.is_empty() {
@@ -265,6 +269,13 @@ fn dismiss_row(data: &mut SystemData, vec_idx: usize, gesture: RowGesture) -> Ac
         // Timer rows have no snooze concept - any dismissal just
         // stops the buzz.
         (_, NotificationSource::Timer) => Action::StopBuzz,
+        // Security rows are a record of something that already
+        // happened and is already contained: removing the row from
+        // the list above is the whole interaction. Nothing is still
+        // running to stop, so there is no action to emit - and no
+        // buzz to silence, since these pulse once rather than
+        // nagging.
+        (_, NotificationSource::Security) => Action::Redraw,
     }
 }
 

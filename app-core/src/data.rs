@@ -232,12 +232,133 @@ pub enum WifiState {
     Synced { hour: u8, minute: u8 },
     /// The session ended without doing its job.
     Failed(WifiFailure),
+    /// A file-serving session is up and reachable at this address.
+    ///
+    /// Fixed-size fields on purpose: `WifiState` is `Copy` and rides
+    /// the event channel, so no `String` may appear here. `token` is
+    /// ASCII, generated fresh per session - it is the whole access
+    /// control, so it must reach the screen for the user to type.
+    Serving {
+        ip: [u8; 4],
+        port: u16,
+        token: [u8; FILE_SERVER_TOKEN_LEN],
+    },
+}
+
+/// Something the file server did that the user should know about.
+///
+/// Edge-triggered, unlike [`WifiState`] which is a level. The
+/// notification list is the record of these - there is deliberately
+/// no counter anywhere, because a count vanishes when the view
+/// closes and a notification does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileServerEvent {
+    /// A file was downloaded. Carries the name for the notification.
+    Served(heapless::String<24>),
+    /// A request arrived whose first path segment was SHAPED like a
+    /// token but did not match one. Either the user mistyped it or
+    /// something is guessing; both are worth interrupting for, and
+    /// the session closes itself either way.
+    ///
+    /// Requests that look nothing like a token (a browser's
+    /// `favicon.ico`, a scanner's `robots.txt`) are NOT this - they
+    /// get a silent 404. Treating them as attempts would close the
+    /// server every time a browser opened it.
+    BadToken,
+    /// The session ended because its budget expired rather than
+    /// because the user stopped it.
+    TimedOut,
+    /// The access point dropped the station mid-session. Worth its
+    /// own kind: without it a server whose link died looks identical
+    /// to one that is simply idle, and the address on screen keeps
+    /// promising something that cannot work.
+    LinkLost,
+}
+
+/// Length of the per-session file-server token. Six characters from an
+/// unambiguous alphabet is enough to stop a casual passer-by on the
+/// same network and short enough to retype from a watch screen; it is
+/// not a secret worth defending against an attacker who can capture
+/// the plaintext HTTP traffic.
+pub const FILE_SERVER_TOKEN_LEN: usize = 6;
+
+/// Alphabet session tokens are drawn from. No `0`/`O`, no `1`/`I`/`l`:
+/// the token is read off a watch screen and typed into a browser, so
+/// ambiguous glyphs cost real user time.
+pub const FILE_SERVER_TOKEN_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+/// True when `path`'s first segment is SHAPED like a session token -
+/// right length, right alphabet - without necessarily being one.
+///
+/// This is the line between "someone is guessing" and the ordinary
+/// junk every browser and scanner sends. It has to be here, in a
+/// crate with tests, because being wrong in either direction breaks
+/// the feature: too strict and a real guess passes unnoticed; too
+/// loose and the server shuts itself down every time a browser opens
+/// it, since browsers fetch `/favicon.ico` with no token at all.
+pub fn looks_like_file_server_token_guess(path: &str) -> bool {
+    let first = path.trim_start_matches('/').split('/').next().unwrap_or("");
+    first.len() == FILE_SERVER_TOKEN_LEN
+        && first.bytes().all(|b| FILE_SERVER_TOKEN_ALPHABET.contains(&b))
+}
+
+#[cfg(test)]
+mod file_server_tests {
+    use super::*;
+
+    #[test]
+    fn browser_and_scanner_noise_is_not_a_guess() {
+        // The one that matters most: a browser fetches this on every
+        // page load. Counting it would close the server instantly,
+        // every time, making the feature unusable.
+        assert!(!looks_like_file_server_token_guess("/favicon.ico"));
+        assert!(!looks_like_file_server_token_guess("/robots.txt"));
+        assert!(!looks_like_file_server_token_guess("/.well-known/foo"));
+        assert!(!looks_like_file_server_token_guess("/"));
+        assert!(!looks_like_file_server_token_guess(""));
+        // Right length, wrong alphabet - lowercase and the excluded
+        // ambiguous glyphs are not token material.
+        assert!(!looks_like_file_server_token_guess("/abcdef"));
+        assert!(!looks_like_file_server_token_guess("/ABC0IL"));
+        // Wrong length either way.
+        assert!(!looks_like_file_server_token_guess("/ABCDE"));
+        assert!(!looks_like_file_server_token_guess("/ABCDEFG"));
+    }
+
+    #[test]
+    fn token_shaped_first_segment_is_a_guess() {
+        assert!(looks_like_file_server_token_guess("/K7MNQ4"));
+        assert!(looks_like_file_server_token_guess("/K7MNQ4/"));
+        assert!(looks_like_file_server_token_guess("/K7MNQ4/events.log"));
+        // Judged on the FIRST segment only: what follows is a path
+        // under a token that was already wrong.
+        assert!(looks_like_file_server_token_guess("/ZZZZZZ/anything/else"));
+    }
+
+    #[test]
+    fn every_generated_token_would_be_recognised_as_a_guess() {
+        // The generator draws from this alphabet at this length, so a
+        // wrong-but-plausible token must always trip the detector -
+        // otherwise a real guessing attempt slips through silently.
+        let sample: heapless::String<16> = {
+            let mut s = heapless::String::new();
+            let _ = s.push('/');
+            for i in 0..FILE_SERVER_TOKEN_LEN {
+                let _ = s.push(FILE_SERVER_TOKEN_ALPHABET[i] as char);
+            }
+            s
+        };
+        assert!(looks_like_file_server_token_guess(sample.as_str()));
+    }
 }
 
 impl WifiState {
     /// A session is in flight - the UI refuses a second kick.
     pub fn is_busy(self) -> bool {
-        matches!(self, WifiState::Scanning | WifiState::Connecting)
+        matches!(
+            self,
+            WifiState::Scanning | WifiState::Connecting | WifiState::Serving { .. },
+        )
     }
 }
 
@@ -262,6 +383,11 @@ pub enum WifiFailure {
     NoNtp,
     /// The whole-session budget ran out.
     Timeout,
+    /// The link went down mid-session after a successful join - the
+    /// AP dropped an idle station, or the signal was lost. Distinct
+    /// from [`Self::ConnectFailed`], which is a join that never
+    /// succeeded in the first place.
+    LinkLost,
 }
 
 /// One access point from a scan session, as shown in the settings

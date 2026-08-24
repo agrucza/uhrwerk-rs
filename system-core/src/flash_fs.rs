@@ -43,7 +43,7 @@ use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
 use esp_hal::peripherals::FLASH;
 use esp_storage::{FlashStorage, FlashStorageError};
 use littlefs_rust::{
-    Config as LfsConfig, FileType, Filesystem, OpenFlags,
+    Config as LfsConfig, FileType, Filesystem, OpenFlags, SeekFrom,
     Storage as LfsStorage,
 };
 pub use littlefs_rust::Error as LfsError;
@@ -319,6 +319,44 @@ impl<'d> FlashFs<'d> {
     /// I/O errors so callers can treat "read failed" uniformly.
     pub fn read_file(&mut self, path: &str) -> Option<Vec<u8>> {
         self.read_file_inner(path)
+    }
+
+    /// Size of the file at `path` in bytes, or `None` if it is
+    /// missing. Needed before serving a file so the response can
+    /// carry a `Content-Length`.
+    pub fn file_size(&self, path: &str) -> Option<u32> {
+        let file = self.fs.open(path, OpenFlags::READ).ok()?;
+        let size = file.size();
+        let _ = file.close();
+        Some(size)
+    }
+
+    /// Read at most `buf.len()` bytes starting at `offset`, returning
+    /// how many were read (0 at end of file), or `None` if the file is
+    /// missing or the read failed.
+    ///
+    /// Deliberately STATELESS - opens, seeks, reads and closes on
+    /// every call rather than handing back a file handle. The file
+    /// server reads one chunk at a time and releases the store's
+    /// mutex between chunks so the UI keeps running; a handle held
+    /// across those gaps would pin the filesystem while another task
+    /// could be writing to it. Paying an open+seek per chunk is the
+    /// price of that safety, and a download is not a hot path.
+    pub fn read_file_range(
+        &self, path: &str, offset: u32, buf: &mut [u8],
+    ) -> Option<usize> {
+        let file = self.fs.open(path, OpenFlags::READ).ok()?;
+        let result = file
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read(buf));
+        let _ = file.close();
+        match result {
+            Ok(n) => Some(n as usize),
+            Err(e) => {
+                log::warn!("flash_fs: read {} @{} failed: {:?}", path, offset, e);
+                None
+            }
+        }
     }
 
     /// Enumerate regular files in `dir`, invoking `callback` with
