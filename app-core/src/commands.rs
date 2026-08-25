@@ -49,7 +49,7 @@ pub enum AudioCommand {
     /// (see `StopAlarm` on why stops are mode-specific).
     StopCapture,
     /// Play the speaker-test tone sweep once (three short tones).
-    /// Interrupts an active capture/loopback session; when the sweep
+    /// Interrupts an active capture/clip session; when the sweep
     /// finishes naturally the audio task emits
     /// `SystemEvent::TonesDone` so the mic-test view can restart the
     /// level meter it paused.
@@ -58,17 +58,23 @@ pub enum AudioCommand {
     /// No `TonesDone` is emitted on this path. Ignored by the other
     /// modes' sessions.
     StopTones,
-    /// Start the LOOP test: repeating record-then-playback "parrot"
-    /// cycles (~1.0 s of mic audio recorded with the speaker muted,
-    /// then replayed with the mic ignored), with
-    /// `SystemEvent::MicLevel` feeding the level meter while
-    /// recording.
-    /// Deliberately not a live monitor - see the audio task on why
-    /// that howls on this hardware.
-    StartLoopback,
-    /// Stop loopback. Ignored by the other modes' sessions (see
+    /// Record one fixed-length clip (~2 s of mic audio, speaker
+    /// muted, `SystemEvent::MicLevel` feeding the level meter). The
+    /// clip replaces any previous one and persists in RAM until the
+    /// next recording or reboot; `SystemEvent::RecordingDone` fires
+    /// when it is full and the session ends. Deliberately not a live
+    /// mic->speaker monitor - see the audio task on why that howls
+    /// on this hardware.
+    RecordClip,
+    /// Play the stored clip once through the speaker (mic ignored);
+    /// `SystemEvent::PlaybackDone` fires at the end. A no-op session
+    /// if nothing has been recorded - the UI disables PLAY without a
+    /// clip, this is the backstop.
+    PlayClip,
+    /// Cancel an active clip recording or playback (leave-screen /
+    /// sleep safety nets). Ignored by the other modes' sessions (see
     /// `StopAlarm` on why stops are mode-specific).
-    StopLoopback,
+    StopClip,
 }
 
 /// Main-loop -> GPS task commands. Boards without a GPS task have

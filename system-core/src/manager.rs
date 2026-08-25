@@ -553,7 +553,7 @@ impl<B: Board> SystemManager<'static, B> {
                     // gates on `haptics_enabled` just above). StopAlarm
                     // always forwards so toggling sound off mid-alert
                     // still silences the speaker, and the mic-test
-                    // commands (capture, tone sweep, loopback) are a
+                    // commands (capture, tone sweep, clip test) are a
                     // separate user-initiated diagnostic, unaffected
                     // by the alert-sound setting.
                     let forward = match cmd {
@@ -563,8 +563,9 @@ impl<B: Board> SystemManager<'static, B> {
                         | AudioCommand::StopCapture
                         | AudioCommand::PlayTones
                         | AudioCommand::StopTones
-                        | AudioCommand::StartLoopback
-                        | AudioCommand::StopLoopback => true,
+                        | AudioCommand::RecordClip
+                        | AudioCommand::PlayClip
+                        | AudioCommand::StopClip => true,
                     };
                     // Non-blocking: a full queue means the audio task
                     // has been wedged for several commands' worth of

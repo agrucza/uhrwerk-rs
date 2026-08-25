@@ -629,9 +629,10 @@ fn tune_pdm_rx() {
 ///
 /// Two session kinds, routed per command: pure playback (PlayAlarm /
 /// PlayTones) runs `run_session_tx` - no RX DMA, the mic clock never
-/// starts, the mic stays in its 12 uA sleep. The capture modes
-/// (StartCapture / StartLoopback) run `run_session_pdm_mic` with
-/// `tune_pdm_rx` flipping the RX unit into PDM mode each session.
+/// starts, the mic stays in its 12 uA sleep. The capture-side modes
+/// (StartCapture / RecordClip / PlayClip - clip playback drains RX
+/// too) run `run_session_pdm_mic` with `tune_pdm_rx` flipping the RX
+/// unit into PDM mode each session.
 /// Neither device needs an enable line or codec init: the amp wakes
 /// on BCLK and the mic on its PDM clock, and both self-idle when the
 /// session's transfer drop stops the clocks.
@@ -670,11 +671,12 @@ async fn audio_task(
             AudioCommand::StopAlarm
             | AudioCommand::StopCapture
             | AudioCommand::StopTones
-            | AudioCommand::StopLoopback => continue,
+            | AudioCommand::StopClip => continue,
             AudioCommand::PlayAlarm => SessionMode::Play,
             AudioCommand::PlayTones => SessionMode::Tones,
             AudioCommand::StartCapture => SessionMode::Capture,
-            AudioCommand::StartLoopback => SessionMode::Loopback,
+            AudioCommand::RecordClip => SessionMode::RecordClip,
+            AudioCommand::PlayClip => SessionMode::PlayClip,
         };
         pending = match mode {
             SessionMode::Play | SessionMode::Tones => {
@@ -695,7 +697,7 @@ async fn audio_task(
                 )
                 .await
             }
-            SessionMode::Capture | SessionMode::Loopback => {
+            SessionMode::Capture | SessionMode::RecordClip | SessionMode::PlayClip => {
                 run_session_pdm_mic(
                     mode,
                     i2s.reborrow(),

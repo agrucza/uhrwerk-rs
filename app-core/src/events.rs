@@ -129,6 +129,14 @@ pub enum SystemEvent {
     /// via `StopTones`. Like `MicLevel`, neither user activity nor a
     /// wake source.
     TonesDone,
+    /// A clip recording filled its buffer and the session ended. The
+    /// model marks a clip as available (enabling the PLAY button) and
+    /// the mic-test view restarts the level meter. Like `MicLevel`,
+    /// neither user activity nor a wake source.
+    RecordingDone,
+    /// Clip playback finished naturally (not via `StopClip`). The
+    /// mic-test view restarts the level meter. Same non-wake rules.
+    PlaybackDone,
 
     // -- Snapshot refreshes --
     /// Fresh RTC snapshot (calendar date + time of day). Emitted

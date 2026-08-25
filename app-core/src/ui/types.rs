@@ -215,7 +215,7 @@ pub enum Action {
     StartMicTest,
     /// End the mic-test diagnostic: Model emits the stop command for
     /// whichever mic-test audio mode is active (meter capture, tone
-    /// sweep, or loopback). Emitted when the Mic Test view is left
+    /// sweep, or clip record/playback). Emitted when the Mic Test view is left
     /// (leaving Settings any other way is caught by the model's
     /// safety net).
     StopMicTest,
@@ -225,13 +225,16 @@ pub enum Action {
     /// sweep, and emits `SystemEvent::TonesDone`, which the view
     /// answers by restarting the meter.
     PlayToneTest,
-    /// Switch the mic test to the LOOP test: record-then-playback
-    /// "parrot" cycles that replay short mic recordings through the
-    /// speaker. Model emits `Effect::AudioCommand(StartLoopback)`; the
-    /// running capture session hands the I2S to the parrot session and
-    /// the level meter keeps updating once per cycle. `StartMicTest`
-    /// switches back to meter-only capture.
-    StartLoopbackTest,
+    /// Record one ~2 s clip from the Mic Test view. Model emits
+    /// `Effect::AudioCommand(RecordClip)`; the running capture
+    /// session hands the I2S to the record session (meter live),
+    /// which ends itself with `SystemEvent::RecordingDone`.
+    RecordClipTest,
+    /// Play the stored clip from the Mic Test view. Model emits
+    /// `Effect::AudioCommand(PlayClip)`; the session ends itself
+    /// with `SystemEvent::PlaybackDone`. The view only offers this
+    /// once `data.has_recording` is set.
+    PlayClipTest,
 
     /// Flip `config.alerts.dnd`. Pure config flip today - the alarm and
     /// notification routing that should respect this lands when
@@ -850,6 +853,10 @@ pub struct SystemData {
     /// diagnostic is capturing; 0 otherwise. Updated from
     /// `SystemEvent::MicLevel`.
     pub mic_level: u8,
+    /// A recorded mic clip exists (RAM, survives until overwritten
+    /// or reboot). Set on `SystemEvent::RecordingDone`; gates the
+    /// mic-test PLAY button.
+    pub has_recording: bool,
     /// Flash-filesystem occupancy. Updated at boot and after
     /// every save / reset via `SystemEvent::StorageUsageUpdated`.
     pub storage: StorageUsage,

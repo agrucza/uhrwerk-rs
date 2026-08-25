@@ -253,10 +253,11 @@ impl SettingsScreen {
                 ) {
                     // Opening the mic-test view starts capture: the
                     // model turns this into StartCapture so the audio
-                    // task begins streaming MicLevel. The LOOP toggle
-                    // always starts fresh (off).
+                    // task begins streaming MicLevel. The one-shot
+                    // flags always start fresh.
                     if matches!(self.view, SettingsView::MicTest) {
-                        self.mic_loopback = false;
+                        self.mic_recording = false;
+                        self.mic_playing = false;
                         return Action::StartMicTest;
                     }
                     return action;

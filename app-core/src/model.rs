@@ -226,8 +226,12 @@ enum MicTestMode {
     Capture,
     /// One-shot speaker tone sweep (`PlayTones` / `StopTones`).
     Tones,
-    /// Mic -> speaker loopback (`StartLoopback` / `StopLoopback`).
-    Loopback,
+    /// One-shot clip recording (`RecordClip` / `StopClip`); ends
+    /// itself with `RecordingDone`.
+    RecordingClip,
+    /// One-shot clip playback (`PlayClip` / `StopClip`); ends itself
+    /// with `PlaybackDone`.
+    PlayingClip,
 }
 
 impl MicTestMode {
@@ -237,7 +241,9 @@ impl MicTestMode {
             MicTestMode::Off => None,
             MicTestMode::Capture => Some(AudioCommand::StopCapture),
             MicTestMode::Tones => Some(AudioCommand::StopTones),
-            MicTestMode::Loopback => Some(AudioCommand::StopLoopback),
+            MicTestMode::RecordingClip | MicTestMode::PlayingClip => {
+                Some(AudioCommand::StopClip)
+            }
         }
     }
 }
@@ -485,15 +491,14 @@ impl Model {
                 let _ = out.push(Effect::AudioCommand(stop));
             }
             // Stopped by sleep while still on Settings: pause, resume
-            // on wake. Stopped by leaving the screen: a real exit. A
-            // cancelled tone sweep resumes as the meter, not a replay
-            // (the sweep is one-shot; its TonesDone will never come).
+            // on wake. Stopped by leaving the screen: a real exit.
+            // Every mode resumes as the plain meter: the one-shots
+            // (tone sweep, clip record, clip playback) were cancelled
+            // mid-flight and their Done events will never come;
+            // silently re-running them on wake would surprise.
             self.mic_resume_on_wake =
                 if self.sleeping && self.screen.id() == ScreenId::Settings {
-                    Some(match self.mic_test {
-                        MicTestMode::Tones => MicTestMode::Capture,
-                        m => m,
-                    })
+                    Some(MicTestMode::Capture)
                 } else {
                     None
                 };
@@ -613,7 +618,7 @@ impl Model {
                 // reported (~90% in the bug we hit).
                 // Also only repaint on actual change, so the meter
                 // doesn't drive a redraw on every chunk in silence.
-                if matches!(self.mic_test, MicTestMode::Capture | MicTestMode::Loopback)
+                if matches!(self.mic_test, MicTestMode::Capture | MicTestMode::RecordingClip)
                     && self.cached_data.mic_level != *level
                 {
                     self.cached_data.mic_level = *level;
@@ -624,11 +629,27 @@ impl Model {
                 // Sweep finished naturally. Clear the mode here; the
                 // event then dispatches to the settings screen, which
                 // (if still on the MicTest view) answers with
-                // StartMicTest / StartLoopbackTest to bring the meter
-                // back.
+                // StartMicTest to bring the meter back.
                 if self.mic_test == MicTestMode::Tones {
                     self.mic_test = MicTestMode::Off;
                 }
+            }
+            SystemEvent::RecordingDone => {
+                // A clip exists from here on (RAM - survives until the
+                // next recording or reboot); the PLAY button un-ghosts.
+                // Mode clearing mirrors TonesDone: the settings screen
+                // answers with StartMicTest if still on the view.
+                self.cached_data.has_recording = true;
+                if self.mic_test == MicTestMode::RecordingClip {
+                    self.mic_test = MicTestMode::Off;
+                }
+                self.needs_redraw = true;
+            }
+            SystemEvent::PlaybackDone => {
+                if self.mic_test == MicTestMode::PlayingClip {
+                    self.mic_test = MicTestMode::Off;
+                }
+                self.needs_redraw = true;
             }
             SystemEvent::TimerExpired { time } => {
                 self.cached_data.time = *time;
@@ -1044,17 +1065,26 @@ impl Model {
                 self.needs_redraw = true;
             }
             Action::PlayToneTest => {
-                // The running capture/loopback session hands the I2S
+                // The running capture/clip session hands the I2S
                 // to the sweep on its own (interrupt handoff); no stop
                 // command needed first.
                 self.mic_test = MicTestMode::Tones;
                 let _ = out.push(Effect::AudioCommand(AudioCommand::PlayTones));
                 self.needs_redraw = true;
             }
-            Action::StartLoopbackTest => {
-                self.mic_test = MicTestMode::Loopback;
-                let _ = out.push(Effect::AudioCommand(AudioCommand::StartLoopback));
+            Action::RecordClipTest => {
+                self.mic_test = MicTestMode::RecordingClip;
+                let _ = out.push(Effect::AudioCommand(AudioCommand::RecordClip));
                 self.needs_redraw = true;
+            }
+            Action::PlayClipTest => {
+                // Backstop mirror of the view's ghosting: without a
+                // clip the audio task would run a no-op session.
+                if self.cached_data.has_recording {
+                    self.mic_test = MicTestMode::PlayingClip;
+                    let _ = out.push(Effect::AudioCommand(AudioCommand::PlayClip));
+                    self.needs_redraw = true;
+                }
             }
             Action::ToggleDnd => {
                 self.config.alerts.dnd = !self.config.alerts.dnd;
@@ -1514,21 +1544,11 @@ impl Model {
         // the speaker: any session start would interrupt the alarm
         // session, so the mic test must not auto-resume over it. Drop
         // the resume entirely; re-opening the view is one tap.
-        if let Some(mode) = self.mic_resume_on_wake.take().filter(|_| self.buzz.is_none()) {
-            let cmd = match mode {
-                MicTestMode::Loopback => AudioCommand::StartLoopback,
-                // Capture, or the Tones->Capture mapping the safety
-                // net already applied. (If the paused mode was the
-                // sweep while the LOOP toggle was on, the view's
-                // toggle state may briefly disagree with the resumed
-                // meter mode - it self-heals on the next LOOP tap.)
-                _ => AudioCommand::StartCapture,
-            };
-            self.mic_test = match mode {
-                MicTestMode::Loopback => MicTestMode::Loopback,
-                _ => MicTestMode::Capture,
-            };
-            let _ = out.push(Effect::AudioCommand(cmd));
+        if self.mic_resume_on_wake.take().filter(|_| self.buzz.is_none()).is_some() {
+            // The safety net stores Capture for every paused mode
+            // (one-shots don't replay themselves on wake).
+            self.mic_test = MicTestMode::Capture;
+            let _ = out.push(Effect::AudioCommand(AudioCommand::StartCapture));
         }
         let _ = out.push(Effect::BroadcastSleep(SleepState::Awake));
         let _ = out.push(Effect::TransitionDisplay {
@@ -2261,20 +2281,21 @@ mod tests {
     }
 
     #[test]
-    fn sleep_pauses_loopback_and_tones_resume_as_meter() {
-        // Loopback pauses and resumes as loopback.
+    fn sleep_pauses_one_shots_and_resumes_as_meter() {
+        // A cancelled clip recording resumes as the meter, not as a
+        // silent re-record.
         let mut m = fresh();
         let mut out: Effects = Vec::new();
         m.dispatch_action(Action::SwitchScreen(ScreenId::Settings), &mut out);
-        m.dispatch_action(Action::StartLoopbackTest, &mut out);
+        m.dispatch_action(Action::RecordClipTest, &mut out);
         let off_timeout = m.config.display.off_timeout_s;
         let fx = m.tick(Instant::from_millis((off_timeout as u64 + 1) * 1000), 0);
-        assert!(fx.contains(&Effect::AudioCommand(AudioCommand::StopLoopback)));
+        assert!(fx.contains(&Effect::AudioCommand(AudioCommand::StopClip)));
         let fx = m.handle_event(
             &SystemEvent::BootButtonPressed,
             Instant::from_millis((off_timeout as u64 + 2) * 1000),
         );
-        assert!(fx.contains(&Effect::AudioCommand(AudioCommand::StartLoopback)));
+        assert!(fx.contains(&Effect::AudioCommand(AudioCommand::StartCapture)));
 
         // A cancelled tone sweep resumes as the meter (Capture), not
         // as a replay of the one-shot sweep.
@@ -2289,6 +2310,23 @@ mod tests {
             Instant::from_millis((off_timeout as u64 + 2) * 1000),
         );
         assert!(fx.contains(&Effect::AudioCommand(AudioCommand::StartCapture)));
+    }
+
+    #[test]
+    fn play_clip_gated_on_recording_present() {
+        let mut m = fresh();
+        let mut out: Effects = Vec::new();
+        m.dispatch_action(Action::SwitchScreen(ScreenId::Settings), &mut out);
+        // No clip yet: PLAY is a no-op even if an action slips through
+        // the view's ghosting.
+        m.dispatch_action(Action::PlayClipTest, &mut out);
+        assert!(!out.contains(&Effect::AudioCommand(AudioCommand::PlayClip)));
+        // Record completes: clip available, PLAY now works.
+        let _ = m.handle_event(&SystemEvent::RecordingDone, Instant::from_millis(0));
+        assert!(m.cached_data().has_recording);
+        let mut out: Effects = Vec::new();
+        m.dispatch_action(Action::PlayClipTest, &mut out);
+        assert!(out.contains(&Effect::AudioCommand(AudioCommand::PlayClip)));
     }
 
     #[test]

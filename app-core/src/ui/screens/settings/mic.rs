@@ -20,26 +20,31 @@ use crate::ui::widgets::{
 
 use super::{draw_header, header_back_hit, leaf_top_y, SettingsScreen, SettingsView};
 
-/// MicTest sub-view layout: (level panel, TONES button, LOOP button).
-/// Shared by render and hit-testing so the tap targets always match
-/// what's drawn.
-fn mic_test_slots(safe: &crate::data::SafeArea) -> (Rectangle, Rectangle, Rectangle) {
+/// MicTest sub-view layout: (level panel, RECORD button, PLAY
+/// button, TONES button). Shared by render and hit-testing so the
+/// tap targets always match what's drawn.
+fn mic_test_slots(
+    safe: &crate::data::SafeArea,
+) -> (Rectangle, Rectangle, Rectangle, Rectangle) {
     let mut s = layout::VStack::new(leaf_top_y(safe));
     let panel = s.slot(96);
     s.gap(18);
-    let (tones, loop_b) = s.pair(36, 12);
-    (panel, tones, loop_b)
+    let (record, play) = s.pair(36, 12);
+    s.gap(12);
+    let tones = s.slot(36);
+    (panel, record, play, tones)
 }
 
 impl SettingsScreen {
     /// Live microphone level meter plus the speaker-side tests. The
     /// bar's fill tracks `data.mic_level` (0..=255), updated from
-    /// `SystemEvent::MicLevel` while capture or the LOOP test runs.
-    /// TONES plays the 440/1000/880 Hz sweep once (the meter restarts
-    /// itself off `TonesDone`); LOOP toggles the record-then-playback
-    /// "parrot" test, which replays ~1.0 s mic snippets through the
-    /// speaker. Together they prove the ES7210 RX and ES8311 TX paths
-    /// on hardware before any networking is involved.
+    /// `SystemEvent::MicLevel` while capture or a clip recording
+    /// runs. RECORD captures one ~2 s clip (meter live, speaker
+    /// muted); PLAY replays the stored clip once and stays Disabled
+    /// until a clip exists; TONES plays the 440/1000/880 Hz sweep.
+    /// Each one-shot restarts the meter off its Done event. Together
+    /// they prove the mic RX and speaker TX paths on hardware before
+    /// any networking is involved.
     pub(super) fn render_mic_test<D: BlendTarget>(
         &self,
         display: &mut D,
@@ -48,7 +53,7 @@ impl SettingsScreen {
     ) {
         draw_header(display, data, "MIC TEST", theme::ACCENT, ctx);
 
-        let (panel, tones_rect, loop_rect) = mic_test_slots(&data.safe_area);
+        let (panel, record_rect, play_rect, tones_rect) = mic_test_slots(&data.safe_area);
         chamfered_panel(display, panel, NOTCH, theme::BORDER, 1);
         tag_label(
             display, panel.top_left.x, panel.top_left.y,
@@ -83,60 +88,95 @@ impl SettingsScreen {
             display, &fonts::value(), buf.as_str(), label_rect, theme::FG_DIM,
         );
 
-        // Speaker-side tests: momentary TONES sweep + LOOP toggle,
-        // Primary-filled while loopback is live.
-        chamfered_button(
-            display, tones_rect, "TONES",
-            ButtonVariant::Ghost, theme::BORDER,
-        );
-        if self.mic_loopback {
+        // RECORD: Primary while a clip recording is in flight.
+        if self.mic_recording {
             chamfered_button(
-                display, loop_rect, "LOOP ON",
+                display, record_rect, "REC...",
                 ButtonVariant::Primary, theme::ACCENT,
             );
         } else {
             chamfered_button(
-                display, loop_rect, "LOOP",
+                display, record_rect, "RECORD",
                 ButtonVariant::Ghost, theme::BORDER,
             );
         }
+        // PLAY: Disabled (and tap-dropped below) until a clip
+        // exists; Primary while replaying.
+        if !data.has_recording {
+            chamfered_button(
+                display, play_rect, "PLAY",
+                ButtonVariant::Disabled, theme::BORDER,
+            );
+        } else if self.mic_playing {
+            chamfered_button(
+                display, play_rect, "PLAYING",
+                ButtonVariant::Primary, theme::ACCENT,
+            );
+        } else {
+            chamfered_button(
+                display, play_rect, "PLAY",
+                ButtonVariant::Ghost, theme::BORDER,
+            );
+        }
+        chamfered_button(
+            display, tones_rect, "TONES",
+            ButtonVariant::Ghost, theme::BORDER,
+        );
     }
 
     /// Mic-test back / swipe-right both leave to the Index and emit
     /// StopMicTest, which ends whichever audio mode is active.
     /// (Leaving Settings by any other path is caught by the model's
-    /// `mic_test` safety net.) TONES / LOOP taps drive the speaker
-    /// tests; `TonesDone` restarts the meter the sweep paused.
+    /// `mic_test` safety net.) RECORD / PLAY / TONES taps drive the
+    /// one-shot sessions; each Done event restarts the meter.
     pub(super) fn mic_test_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
         match event {
             SystemEvent::Tap { x, y } if header_back_hit(*x, *y, &data.safe_area) => {
                 self.view = SettingsView::Index;
-                self.mic_loopback = false;
+                self.mic_recording = false;
+                self.mic_playing = false;
                 Action::StopMicTest
             }
             SystemEvent::Tap { x, y } => {
-                let (_, tones_rect, loop_rect) = mic_test_slots(&data.safe_area);
-                if rect_hit(tones_rect, *x, *y) {
-                    return Action::PlayToneTest;
+                let (_, record_rect, play_rect, tones_rect) =
+                    mic_test_slots(&data.safe_area);
+                if rect_hit(record_rect, *x, *y) {
+                    // Ignore while a one-shot is already in flight;
+                    // re-record is one tap after RecordingDone.
+                    if !self.mic_recording && !self.mic_playing {
+                        self.mic_recording = true;
+                        return Action::RecordClipTest;
+                    }
+                    return Action::None;
                 }
-                if rect_hit(loop_rect, *x, *y) {
-                    self.mic_loopback = !self.mic_loopback;
-                    return if self.mic_loopback {
-                        Action::StartLoopbackTest
-                    } else {
-                        Action::StartMicTest
-                    };
+                if rect_hit(play_rect, *x, *y) {
+                    // Disabled visual + tap drop are the same
+                    // condition: no clip, no action.
+                    if data.has_recording && !self.mic_recording && !self.mic_playing {
+                        self.mic_playing = true;
+                        return Action::PlayClipTest;
+                    }
+                    return Action::None;
+                }
+                if rect_hit(tones_rect, *x, *y) {
+                    // The sweep interrupts an in-flight one-shot; its
+                    // Done event will never come, so clear the flags.
+                    self.mic_recording = false;
+                    self.mic_playing = false;
+                    return Action::PlayToneTest;
                 }
                 Action::None
             }
-            SystemEvent::TonesDone => {
-                // Sweep finished: restart whichever meter mode the
-                // LOOP toggle says was active.
-                if self.mic_loopback {
-                    Action::StartLoopbackTest
-                } else {
-                    Action::StartMicTest
-                }
+            // Each one-shot finished: clear its flag and bring the
+            // level meter back.
+            SystemEvent::TonesDone => Action::StartMicTest,
+            SystemEvent::RecordingDone => {
+                self.mic_recording = false;
+                Action::StartMicTest
+            }
+            SystemEvent::PlaybackDone => {
+                self.mic_playing = false;
+                Action::StartMicTest
             }
             SystemEvent::Swipe {
                 dir: crate::events::SwipeDir::Right,
@@ -144,7 +184,8 @@ impl SettingsScreen {
                 ..
             } => {
                 self.view = SettingsView::Index;
-                self.mic_loopback = false;
+                self.mic_recording = false;
+                self.mic_playing = false;
                 Action::StopMicTest
             }
             _ => Action::None,

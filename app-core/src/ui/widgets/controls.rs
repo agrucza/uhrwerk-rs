@@ -185,6 +185,11 @@ pub enum ButtonVariant {
     /// Steel border, transparent body, FG label. The "cancel /
     /// non-destructive" affordance.
     Ghost,
+    /// Dimmed border and label, transparent body: the "present but
+    /// currently unavailable" affordance. The visual is NOT the
+    /// guard - the screen must also drop taps on it (the `accent`
+    /// parameter is ignored; everything renders FG_DIM).
+    Disabled,
 }
 
 /// Draw a chamfered hex button into `rect`.
@@ -248,6 +253,12 @@ pub fn chamfered_button<D: BlendTarget>(
             chamfered_panel(display, rect, notch, accent, 1);
             fonts::draw_centered_in_rect(
                 display, &fonts::caption(), label, rect, theme::FG,
+            );
+        }
+        ButtonVariant::Disabled => {
+            chamfered_panel(display, rect, notch, theme::FG_DIM, 1);
+            fonts::draw_centered_in_rect(
+                display, &fonts::caption(), label, rect, theme::FG_DIM,
             );
         }
     }

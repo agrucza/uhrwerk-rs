@@ -392,7 +392,7 @@ async fn audio_task(
             AudioCommand::StopAlarm
             | AudioCommand::StopCapture
             | AudioCommand::StopTones
-            | AudioCommand::StopLoopback => {
+            | AudioCommand::StopClip => {
                 // No active session here - the inner loops own their
                 // own stop response. Defensive amp mute.
                 amp.disable();
@@ -401,7 +401,8 @@ async fn audio_task(
             AudioCommand::PlayAlarm => SessionMode::Play,
             AudioCommand::StartCapture => SessionMode::Capture,
             AudioCommand::PlayTones => SessionMode::Tones,
-            AudioCommand::StartLoopback => SessionMode::Loopback,
+            AudioCommand::RecordClip => SessionMode::RecordClip,
+            AudioCommand::PlayClip => SessionMode::PlayClip,
         };
         pending = run_session(
             mode,

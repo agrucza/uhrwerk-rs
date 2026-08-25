@@ -174,9 +174,12 @@ pub struct SettingsScreen {
     /// Last MotionData rendered into the MOTION sub-view, used to
     /// suppress redraws when the values haven't changed materially.
     motion_last: Option<crate::data::MotionData>,
-    /// MicTest sub-view LOOP toggle: true while mic -> speaker
-    /// loopback is the active meter mode (vs. meter-only capture).
-    mic_loopback: bool,
+    /// MicTest sub-view: a clip recording is in flight (RECORD shows
+    /// Primary "REC..."); cleared by `RecordingDone` or on leave.
+    mic_recording: bool,
+    /// MicTest sub-view: clip playback is in flight (PLAY shows
+    /// Primary "PLAYING"); cleared by `PlaybackDone` or on leave.
+    mic_playing: bool,
     /// Entry state of the WifiPassphrase sub-view's text field. 63 =
     /// the WPA2 passphrase maximum.
     wifi_passphrase_keyboard: Keyboard,
@@ -208,7 +211,8 @@ impl SettingsScreen {
             battery_scroll: layout::ScrollState::new(),
             motion_phase: 0,
             motion_last: None,
-            mic_loopback: false,
+            mic_recording: false,
+            mic_playing: false,
             wifi_passphrase_keyboard: Keyboard::new(
                 crate::config::WifiConfig::PASSPHRASE_MAX,
             ),

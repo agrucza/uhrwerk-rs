@@ -13,7 +13,7 @@ use esp_hal::{
 
 
 // ---- Audio task: alarm tone (TX), mic capture (RX), speaker-test ----------
-// ---- tone sweep (TX) and mic->speaker loopback (full duplex) --------------
+// ---- tone sweep (TX) and mic clip record/playback (full duplex) -----------
 
 /// Alert-tone pitch. A square wave near 880 Hz (A5) - bright and
 /// audible over ambient noise on the small NS4150-driven speaker.
@@ -50,16 +50,29 @@ const TX_RING_BYTES: usize = 4096;
 /// only after this has drained.
 const TONE_LEAD_MS: u64 = 150;
 
-/// LOOP-test parrot recording buffer size in bytes. The recording is
-/// stored mono at 8 kHz (adjacent-frame average of the left mic -
-/// telephone quality, 4x smaller than the stereo 16 kHz wire format),
-/// so 16 000 bytes is 1.0 s of speech. Heap-bounded: it lives
-/// alongside the 32 KB pop buffer plus baseline heap use (~13 KB
-/// measured, more under load - 48 KB of audio buffers OOM'd the C6's
-/// old 64 KB heap; both bins run 128 KB now). The record and playback
-/// phases both drain the RX ring continuously, so unlike the buffer
-/// size, the *duration* has no DMA-imposed ceiling.
-const PARROT_RECORD_BYTES: usize = 16_000;
+/// Recorded-clip size in bytes. The clip is stored mono at 8 kHz
+/// (adjacent-frame average of the left mic - telephone quality, 4x
+/// smaller than the stereo 16 kHz wire format), so 32 000 bytes is
+/// 2.0 s of speech. Heap-bounded: during a record session the
+/// build-up Vec lives alongside the 32 KB pop buffer (the previous
+/// [`CLIP`] is freed before the build starts) plus baseline heap use
+/// (~21 KB measured at boot; 48 KB of audio buffers OOM'd the C6's
+/// old 64 KB heap; both bins run 128 KB now). The record and
+/// playback loops both drain the RX ring continuously, so unlike
+/// the buffer size, the *duration* has no DMA-imposed ceiling.
+const CLIP_BYTES: usize = 32_000;
+
+/// The stored mic clip: mono 8 kHz s16, play-conditioned at store
+/// time, RAM-resident until the next recording or reboot. Written
+/// once per record session; playback reads it chunk-wise under
+/// short locks inside the TX push closure (never across an await).
+/// Empty = nothing recorded yet.
+static CLIP: embassy_sync::blocking_mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    core::cell::RefCell<alloc::vec::Vec<u8>>,
+> = embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(
+    alloc::vec::Vec::new(),
+));
 
 /// Mic-capture pop-buffer size (bytes).
 ///
@@ -167,13 +180,14 @@ async fn play_until_interrupt<B>(
                 // test) must not silence the alarm.
                 AudioCommand::StopCapture
                 | AudioCommand::StopTones
-                | AudioCommand::StopLoopback => {}
+                | AudioCommand::StopClip => {}
                 AudioCommand::PlayAlarm => {} // already playing
                 // Mic-test starts are explicit user actions; hand the
                 // I2S over (speaker muted first).
                 cmd @ (AudioCommand::StartCapture
                 | AudioCommand::PlayTones
-                | AudioCommand::StartLoopback) => {
+                | AudioCommand::RecordClip
+                | AudioCommand::PlayClip) => {
                     amp.disable();
                     return Some(cmd);
                 }
@@ -243,7 +257,7 @@ fn mic_stats(buf: &[u8]) -> MicStats {
 /// ADC's +30 dB analog PGA before quantization; a raw PDM mic has no
 /// gain stage anywhere (and this silicon's PDM-to-PCM block has no
 /// amplify stage either), so its -26 dBFS-sensitivity stream arrives
-/// ~30x smaller than the levels the meter constants and the parrot
+/// ~30x smaller than the levels the meter constants and the clip
 /// playback were calibrated against. Chosen from first-hardware
 /// readings: normal-volume ambient sound measured dev ~400-800 raw,
 /// so x8 maps it to ~3200-6400 - the mid-to-high bar zone the meter
@@ -289,11 +303,12 @@ fn pdm_condition_rx(buf: &mut [u8]) {
 /// mean-abs, ~10 dB under the tone sweep's 0x1800 amplitude that
 /// the user hears as normal volume, and speech's crest factor makes
 /// it read quieter still. +12 dB closes that gap; loud peaks
-/// saturate softly, which a diagnostic parrot can live with.
+/// saturate softly, which a diagnostic clip can live with.
 const PDM_PLAY_GAIN_SHIFT: u32 = 2;
 
-/// Playback-side conditioning for [`run_session_pdm_mic`]'s parrot:
-/// the saturating [`PDM_PLAY_GAIN_SHIFT`] gain. No DC handling - the
+/// Playback-side conditioning for the PDM boards' recorded clip:
+/// the saturating [`PDM_PLAY_GAIN_SHIFT`] gain, applied once at
+/// store time by `record_clip_until_done`. No DC handling - the
 /// recording was already conditioned chunk-by-chunk on capture.
 fn pdm_condition_play(buf: &mut [u8]) {
     for s in buf.chunks_exact_mut(2) {
@@ -354,7 +369,7 @@ fn rx_align_offset(buf: &[u8]) -> Option<usize> {
     }
 }
 
-/// Shared level-meter state for the capture and loopback loops: EMA
+/// Shared level-meter state for the capture and clip-record loops: EMA
 /// smoothing, rate-limited [`SystemEvent::MicLevel`] emission, and the
 /// 1 Hz `mic:` diagnostic log line.
 struct LevelMeter {
@@ -443,12 +458,13 @@ async fn capture_until_interrupt<B>(
             AudioCommand::StopCapture => return None,
             cmd @ (AudioCommand::PlayAlarm
             | AudioCommand::PlayTones
-            | AudioCommand::StartLoopback) => return Some(cmd),
+            | AudioCommand::RecordClip
+            | AudioCommand::PlayClip) => return Some(cmd),
             // Skipping the drain on a stray command costs at most one
             // garbage level reading; the EMA below swallows it.
             AudioCommand::StopAlarm
             | AudioCommand::StopTones
-            | AudioCommand::StopLoopback
+            | AudioCommand::StopClip
             | AudioCommand::StartCapture => {}
         },
     }
@@ -495,7 +511,7 @@ async fn capture_until_interrupt<B>(
                 // so staying in this loop would also starve the
                 // command queue (observed on hw: "command queue full"
                 // drops until reboot). Rebuild the session with fresh
-                // rings, same recovery as the parrot.
+                // rings, same recovery as the clip sessions.
                 log::warn!("rx.pop err: {:?}, rebuilding session", e);
                 return Some(AudioCommand::StartCapture);
             }
@@ -506,11 +522,12 @@ async fn capture_until_interrupt<B>(
                 // streams from cancelling each other (see play side).
                 AudioCommand::StopAlarm
                 | AudioCommand::StopTones
-                | AudioCommand::StopLoopback => {}
+                | AudioCommand::StopClip => {}
                 AudioCommand::StartCapture => {} // already capturing
                 cmd @ (AudioCommand::PlayAlarm
                 | AudioCommand::PlayTones
-                | AudioCommand::StartLoopback) => return Some(cmd),
+                | AudioCommand::RecordClip
+                | AudioCommand::PlayClip) => return Some(cmd),
             },
         }
     }
@@ -572,7 +589,8 @@ async fn play_tones_until_done<B>(
                     }
                     cmd @ (AudioCommand::PlayAlarm
                     | AudioCommand::StartCapture
-                    | AudioCommand::StartLoopback) => {
+                    | AudioCommand::RecordClip
+                    | AudioCommand::PlayClip) => {
                         log::info!("tones: interrupted by {:?}", cmd);
                         amp.disable();
                         return Some(cmd);
@@ -580,7 +598,7 @@ async fn play_tones_until_done<B>(
                     AudioCommand::PlayTones => {} // already playing
                     AudioCommand::StopAlarm
                     | AudioCommand::StopCapture
-                    | AudioCommand::StopLoopback => {}
+                    | AudioCommand::StopClip => {}
                 },
             }
         }
@@ -592,194 +610,252 @@ async fn play_tones_until_done<B>(
     None
 }
 
-/// LOOP test: "parrot" record-then-playback. Records ~1.0 s of mic
-/// audio (mono 8 kHz, [`PARROT_RECORD_BYTES`]) with the speaker
-/// muted, replays it with the mic ignored, and repeats until an
-/// interrupting command arrives. The strict phase separation means the live mic and the
-/// speaker are never acoustically coupled, so unlike a live monitor it
-/// cannot howl. That's not over-caution: with the mics millimetres
-/// from the speaker and 30 dB of PGA, the raw acoustic loop sits far
-/// above the feedback threshold at any audible volume - the board's
-/// reference stack (Waveshare's esp-brookesia voice pipeline) draws
-/// the same conclusion and only ever runs the mic through an AEC DSP,
-/// never raw into the speaker.
-async fn loopback_until_interrupt<BT, BR>(
-    tx: &mut esp_hal::i2s::master::asynch::I2sWriteDmaTransferAsync<'_, BT>,
+/// Record one clip: ~2.0 s of mic audio (mono 8 kHz, [`CLIP_BYTES`])
+/// with the speaker muted and the level meter live, stored into
+/// [`CLIP`], then the session ends itself with
+/// `SystemEvent::RecordingDone`. Playback is a separate session
+/// ([`play_clip_until_done`]); the strict separation means the live
+/// mic and the speaker are never acoustically coupled, so unlike a
+/// live monitor it cannot howl. That's not over-caution: with the
+/// mics millimetres from the speaker and 30 dB of PGA, the raw
+/// acoustic loop sits far above the feedback threshold at any
+/// audible volume - the board's reference stack (Waveshare's
+/// esp-brookesia voice pipeline) draws the same conclusion and only
+/// ever runs the mic through an AEC DSP, never raw into the speaker.
+///
+/// `condition_play` is applied once here, at store time, so playback
+/// (possibly many replays) never re-applies backend gain conditioning
+/// to already-conditioned samples.
+async fn record_clip_until_done<BR>(
     rx: &mut esp_hal::i2s::master::asynch::I2sReadDmaTransferAsync<'_, BR>,
     amp: &mut SpeakerAmp<'_>,
     buf: &mut [u8],
     condition_rx: fn(&mut [u8]),
     condition_play: fn(&mut [u8]),
 ) -> Option<AudioCommand> {
+    // Free the previous clip BEFORE allocating the new build buffer:
+    // holding both plus the 32 KB pop buffer would peak ~96 KB and
+    // crowd the C6's 128 KB heap. Cost: a record session interrupted
+    // mid-way leaves no clip (the UI's has_recording may then be
+    // stale-true; playback of nothing skips with PlaybackDone, so
+    // the button unsticks - acceptable for a diagnostic screen).
+    CLIP.lock(|c| *c.borrow_mut() = alloc::vec::Vec::new());
     // The mono 8 kHz accumulation buffer the recording lands in (the
-    // pop buffer comes from `run_session`).
-    let mut rec = alloc::vec![0u8; PARROT_RECORD_BYTES];
+    // pop buffer comes from the session dispatcher). Built locally
+    // and moved into [`CLIP`] at the end - no lock is ever held
+    // across an await.
+    let mut rec = alloc::vec![0u8; CLIP_BYTES];
     let mut meter = LevelMeter::new();
     // Per-session stream alignment, detected once there's enough
     // signal (see `rx_align_offset`). Without the correction a
     // displaced stream records as `sample << 8` - ambient noise
     // played back at +48 dB.
     let mut rx_off: Option<usize> = None;
-    // FIRST action: drain what accumulated since `run_session`'s
-    // early drain (codec-init garbage, mostly), so the session
-    // starts from fresh audio and the ring stays far from capacity.
+    // Discard everything captured since the dispatcher's early drain
+    // (codec-init garbage, mostly), so the clip starts from fresh
+    // audio and the ring stays far from capacity.
     match select(rx.pop(&mut *buf), AUDIO_COMMAND.receive()).await {
         Either::First(_) => {}
         Either::Second(cmd) => {
-            if let Some(r) = loopback_command(cmd, amp) {
+            if let Some(r) = clip_command(cmd, AudioCommand::RecordClip, amp) {
                 return r;
             }
         }
     }
-    // Flush the pre-session TX ring once, muted, so the first unmute
-    // doesn't replay a stale lap. Later cycles are covered by their
-    // own trailing silence.
-    if let Some(r) = parrot_push_silence(tx, amp, TX_RING_BYTES).await {
-        return r;
-    }
-    loop {
-        // -- Record phase: speaker muted, pops accumulate into `rec`
-        // until it's full. Popping continuously keeps the RX ring
-        // drained, so the phase length has no DMA ceiling.
-        amp.disable();
-        // Discard everything captured so far: codec-startup garbage on
-        // the first cycle, our own playback on later ones.
+    let rec_start = Instant::now();
+    let mut w = 0;
+    while w < rec.len() {
         match select(rx.pop(&mut *buf), AUDIO_COMMAND.receive()).await {
-            Either::First(_) => {}
+            Either::First(Ok(n)) => {
+                // Whole frames only; a straggling 1-3 bytes would
+                // slip the L/R alignment.
+                let n = n / 4 * 4;
+                // Re-evaluated every chunk, same reasoning as the
+                // capture loop: never latch a startup-garbage
+                // misread for the session.
+                if let Some(off) = rx_align_offset(&buf[..n]) {
+                    if rx_off != Some(off) {
+                        log::info!("mic: rx alignment offset -> {}", off);
+                        rx_off = Some(off);
+                    }
+                }
+                let off = rx_off.unwrap_or(0);
+                // Condition before both consumers: the meter and
+                // the recording (so the clip replays at the
+                // conditioned level, not the raw one).
+                condition_rx(&mut buf[off..n]);
+                meter.feed(&mic_stats(&buf[off..n]));
+                // Decimate stereo 16 kHz -> mono 8 kHz by
+                // averaging the left (MIC1) samples of each frame
+                // pair. The average is a crude anti-alias filter;
+                // plain drop-every-2nd-frame folds 4-8 kHz speech
+                // content into the audible band, which reads as a
+                // deeper, garbled ("slowed down") voice.
+                for pair in buf[off..n].chunks_exact(8) {
+                    if w + 2 > rec.len() {
+                        break;
+                    }
+                    let a = i16::from_le_bytes([pair[0], pair[1]]) as i32;
+                    let b = i16::from_le_bytes([pair[4], pair[5]]) as i32;
+                    let s = ((a + b) / 2) as i16;
+                    rec[w..w + 2].copy_from_slice(&s.to_le_bytes());
+                    w += 2;
+                }
+            }
+            Either::First(Err(e)) => {
+                // `Late` (RX ring overran) permanently wedges a
+                // circular transfer - esp-hal has no reset API, so
+                // retrying can never recover. End the session and
+                // hand RecordClip back to the dispatcher: the
+                // rebuilt transfers start with fresh rings.
+                log::warn!("clip rx.pop err: {:?}, rebuilding session", e);
+                return Some(AudioCommand::RecordClip);
+            }
             Either::Second(cmd) => {
-                if let Some(r) = loopback_command(cmd, amp) {
+                if let Some(r) = clip_command(cmd, AudioCommand::RecordClip, amp) {
                     return r;
                 }
             }
         }
-        let rec_start = Instant::now();
-        let mut w = 0;
-        while w < rec.len() {
-            match select(rx.pop(&mut *buf), AUDIO_COMMAND.receive()).await {
-                Either::First(Ok(n)) => {
-                    // Whole frames only; a straggling 1-3 bytes would
-                    // slip the L/R alignment.
-                    let n = n / 4 * 4;
-                    // Re-evaluated every chunk, same reasoning as the
-                    // capture loop: never latch a startup-garbage
-                    // misread for the session.
-                    if let Some(off) = rx_align_offset(&buf[..n]) {
-                        if rx_off != Some(off) {
-                            log::info!("mic: rx alignment offset -> {}", off);
-                            rx_off = Some(off);
-                        }
-                    }
-                    let off = rx_off.unwrap_or(0);
-                    // Condition before both consumers: the meter and
-                    // the recording (so the parrot replays at the
-                    // conditioned level, not the raw one).
-                    condition_rx(&mut buf[off..n]);
-                    meter.feed(&mic_stats(&buf[off..n]));
-                    // Decimate stereo 16 kHz -> mono 8 kHz by
-                    // averaging the left (MIC1) samples of each frame
-                    // pair. The average is a crude anti-alias filter;
-                    // plain drop-every-2nd-frame folds 4-8 kHz speech
-                    // content into the audible band, which reads as a
-                    // deeper, garbled ("slowed down") voice.
-                    for pair in buf[off..n].chunks_exact(8) {
-                        if w + 2 > rec.len() {
-                            break;
-                        }
-                        let a = i16::from_le_bytes([pair[0], pair[1]]) as i32;
-                        let b = i16::from_le_bytes([pair[4], pair[5]]) as i32;
-                        let s = ((a + b) / 2) as i16;
-                        rec[w..w + 2].copy_from_slice(&s.to_le_bytes());
-                        w += 2;
-                    }
-                }
-                Either::First(Err(e)) => {
-                    // `Late` (RX ring overran) permanently wedges a
-                    // circular transfer - esp-hal has no reset API, so
-                    // retrying can never recover. End the session and
-                    // hand StartLoopback back to the dispatcher: the
-                    // rebuilt transfers start with fresh rings.
-                    log::warn!("loopback rx.pop err: {:?}, rebuilding session", e);
-                    return Some(AudioCommand::StartLoopback);
-                }
-                Either::Second(cmd) => {
-                    if let Some(r) = loopback_command(cmd, amp) {
-                        return r;
-                    }
-                }
+    }
+    // Store play-conditioned (see the fn doc), replacing any
+    // previous clip; the old Vec frees here. The pre/post mean-abs
+    // pair is gain telemetry: on passthrough backends the numbers
+    // match; on the PDM boards post should read ~4x pre (the +12 dB
+    // makeup shift). A missing gain shows up here, not in ears.
+    let pre_abs = clip_mean_abs(&rec[..w]);
+    condition_play(&mut rec[..w]);
+    let post_abs = clip_mean_abs(&rec[..w]);
+    rec.truncate(w);
+    CLIP.lock(|c| *c.borrow_mut() = rec);
+    log::info!(
+        "clip: recorded {} ms ({} B, mean-abs {} -> {})",
+        rec_start.elapsed().as_millis(),
+        w,
+        pre_abs,
+        post_abs,
+    );
+    let _ = EVENTS.try_send(SystemEvent::RecordingDone);
+    None
+}
+
+/// Mean absolute value of a little-endian i16 stream - the stored
+/// clip's loudness, for the store-time gain telemetry.
+fn clip_mean_abs(data: &[u8]) -> u32 {
+    let mut sum: u64 = 0;
+    let mut n: u32 = 0;
+    for s in data.chunks_exact(2) {
+        sum += (i16::from_le_bytes([s[0], s[1]]) as i32).unsigned_abs() as u64;
+        n += 1;
+    }
+    if n == 0 { 0 } else { (sum / n as u64) as u32 }
+}
+
+/// Play the stored clip once (mic ignored, RX ring kept drained),
+/// then end the session with `SystemEvent::PlaybackDone`. A no-op
+/// session when nothing has been recorded - the UI disables PLAY,
+/// this is the backstop (the Done event still fires so a stale UI
+/// unsticks).
+async fn play_clip_until_done<BT, BR>(
+    tx: &mut esp_hal::i2s::master::asynch::I2sWriteDmaTransferAsync<'_, BT>,
+    rx: &mut esp_hal::i2s::master::asynch::I2sReadDmaTransferAsync<'_, BR>,
+    amp: &mut SpeakerAmp<'_>,
+    buf: &mut [u8],
+) -> Option<AudioCommand> {
+    // Stable for the whole session: the audio task is the only
+    // writer, and it is here, not recording.
+    let clip_len = CLIP.lock(|c| c.borrow().len());
+    if clip_len == 0 {
+        log::warn!("clip: nothing recorded, playback skipped");
+        let _ = EVENTS.try_send(SystemEvent::PlaybackDone);
+        return None;
+    }
+    // FIRST action: drain what accumulated since the dispatcher's
+    // early drain (~300 ms of codec-init garbage). Without this the
+    // loop below starts with the RX ring near its ~512 ms capacity
+    // and scheduling jitter tips it into the permanent `Late` wedge
+    // (hardware-observed: two rebuild loops before a playback got
+    // through).
+    match select(rx.pop(&mut *buf), AUDIO_COMMAND.receive()).await {
+        Either::First(_) => {}
+        Either::Second(cmd) => {
+            if let Some(r) = clip_command(cmd, AudioCommand::PlayClip, amp) {
+                return r;
             }
         }
-
-        // -- Playback phase: replay `rec`, expanding each mono 8 kHz
-        // sample into two identical stereo 16 kHz frames. Pushed one
-        // TX ring (~64 ms) at a time, with an RX discard pop between
-        // chunks so the RX ring stays drained however long the
-        // recording is. A trailing ring of silence stops the tail
-        // from stutter-looping through the next record phase (and
-        // pre-cleans the ring for the next unmute).
-        condition_play(&mut rec[..w]);
-        amp.enable();
-        let rec_ms = rec_start.elapsed().as_millis();
-        let play_start = Instant::now();
-        let mut roff = 0;
-        while roff < w {
-            let push = tx.push_with(|out| {
-                // 8 output bytes per stored mono sample (2 bytes).
-                let out_max = out.len().min((w - roff) * 4).min(TX_RING_BYTES);
-                let take = out_max / 8 * 8;
+    }
+    // Flush the pre-session TX ring once, muted, so the unmute
+    // doesn't replay a stale lap.
+    if let Some(r) = clip_push_silence(tx, amp, TX_RING_BYTES).await {
+        return r;
+    }
+    amp.enable();
+    let play_start = Instant::now();
+    let mut roff = 0;
+    while roff < clip_len {
+        let push = tx.push_with(|out| {
+            // 8 output bytes per stored mono sample (2 bytes): each
+            // mono 8 kHz sample expands into two identical stereo
+            // 16 kHz frames. Chunk data is copied out of [`CLIP`]
+            // under a short lock inside this sync closure.
+            let out_max = out.len().min((clip_len - roff) * 4).min(TX_RING_BYTES);
+            let take = out_max / 8 * 8;
+            CLIP.lock(|c| {
+                let rec = c.borrow();
                 for (k, o) in out[..take].chunks_exact_mut(8).enumerate() {
                     let i = roff + k * 2;
                     let (lo, hi) = (rec[i], rec[i + 1]);
                     o.copy_from_slice(&[lo, hi, lo, hi, lo, hi, lo, hi]);
                 }
-                take
             });
-            // Push and RX-discard CONCURRENTLY. Both waits are
-            // descriptor-paced (~64 ms each); running them serially
-            // halved the playback data rate and let the underfed TX
-            // ring stutter-replay - the "slowed down" playback
-            // (measured: rec 1.0 s, play 1.8 s). An interrupted push
-            // is safe to drop: its closure never ran, so no data or
-            // `roff` progress is lost.
-            match select3(push, rx.pop(&mut *buf), AUDIO_COMMAND.receive()).await {
-                // 0-byte grant (ring space < one expanded sample):
-                // yield briefly instead of spinning.
-                Either3::First(Ok(0)) => {
-                    Timer::after(Duration::from_millis(1)).await;
-                }
-                Either3::First(Ok(k)) => roff += k / 4,
-                // TX error: abandon this playback, cycle onwards.
-                Either3::First(Err(_)) => break,
-                // RX discarded; keep the ring drained while playing.
-                Either3::Second(Ok(_)) => {}
-                Either3::Second(Err(e)) => {
-                    // An instantly-failing pop would win every select
-                    // and starve the push - same permanent `Late`
-                    // wedge as the record phase, same recovery.
-                    log::warn!("loopback rx.pop err: {:?}, rebuilding session", e);
-                    amp.disable();
-                    return Some(AudioCommand::StartLoopback);
-                }
-                Either3::Third(cmd) => {
-                    if let Some(r) = loopback_command(cmd, amp) {
-                        return r;
-                    }
+            take
+        });
+        // Push and RX-discard CONCURRENTLY. Both waits are
+        // descriptor-paced (~64 ms each); running them serially
+        // halved the playback data rate and let the underfed TX
+        // ring stutter-replay - the "slowed down" playback
+        // (measured on the parrot predecessor: rec 1.0 s, play
+        // 1.8 s). An interrupted push is safe to drop: its closure
+        // never ran, so no data or `roff` progress is lost.
+        match select3(push, rx.pop(&mut *buf), AUDIO_COMMAND.receive()).await {
+            // 0-byte grant (ring space < one expanded sample):
+            // yield briefly instead of spinning.
+            Either3::First(Ok(0)) => {
+                Timer::after(Duration::from_millis(1)).await;
+            }
+            Either3::First(Ok(k)) => roff += k / 4,
+            // TX error: abandon the playback.
+            Either3::First(Err(_)) => break,
+            // RX discarded; keep the ring drained while playing.
+            Either3::Second(Ok(_)) => {}
+            Either3::Second(Err(e)) => {
+                // An instantly-failing pop would win every select
+                // and starve the push - a permanent `Late` wedge;
+                // rebuild with fresh rings.
+                log::warn!("clip rx.pop err: {:?}, rebuilding session", e);
+                amp.disable();
+                return Some(AudioCommand::PlayClip);
+            }
+            Either3::Third(cmd) => {
+                if let Some(r) = clip_command(cmd, AudioCommand::PlayClip, amp) {
+                    return r;
                 }
             }
         }
-        // Speed telemetry: record and playback should report the same
-        // duration (~1000 ms each). Diverging numbers mean a real
-        // resampling bug; matching numbers with an odd-sounding voice
-        // point at reproduction quality instead.
-        log::info!(
-            "parrot: rec {} ms, play {} ms ({} B)",
-            rec_ms,
-            play_start.elapsed().as_millis(),
-            w,
-        );
-        if let Some(r) = parrot_push_silence(tx, amp, TX_RING_BYTES).await {
-            return r;
-        }
     }
+    log::info!(
+        "clip: played {} ms ({} B)",
+        play_start.elapsed().as_millis(),
+        clip_len,
+    );
+    // Trailing silence stops the tail from stutter-looping in the
+    // ring; then mute and end.
+    if let Some(r) = clip_push_silence(tx, amp, TX_RING_BYTES).await {
+        return r;
+    }
+    amp.disable();
+    let _ = EVENTS.try_send(SystemEvent::PlaybackDone);
+    None
 }
 
 /// Queue `len` bytes of silence into the TX ring, racing the command
@@ -787,7 +863,7 @@ async fn loopback_until_interrupt<BT, BR>(
 /// ended the session, `None` once the bytes are fully queued (a TX
 /// error abandons the push but keeps the session alive).
 #[allow(clippy::option_option)]
-async fn parrot_push_silence<B>(
+async fn clip_push_silence<B>(
     tx: &mut esp_hal::i2s::master::asynch::I2sWriteDmaTransferAsync<'_, B>,
     amp: &mut SpeakerAmp<'_>,
     len: usize,
@@ -806,7 +882,9 @@ async fn parrot_push_silence<B>(
             Either::First(Ok(k)) => off += k,
             Either::First(Err(_)) => return None,
             Either::Second(cmd) => {
-                if let Some(r) = loopback_command(cmd, amp) {
+                // The silence flush runs inside playback sessions;
+                // treat commands as that session would.
+                if let Some(r) = clip_command(cmd, AudioCommand::PlayClip, amp) {
                     return Some(r);
                 }
             }
@@ -815,27 +893,36 @@ async fn parrot_push_silence<B>(
     None
 }
 
-/// Shared command handling for the parrot loop's select points.
-/// `None` = command ignored, keep looping. `Some(r)` = end the session
-/// and give `r` back to the dispatcher (`Some(Some(cmd))` hands the
-/// command off, `Some(None)` is a plain stop).
+/// Shared command handling for the clip sessions' select points.
+/// `own` is the session's start command (a duplicate of it is
+/// ignored, not a restart). `None` = command ignored, keep going.
+/// `Some(r)` = end the session and give `r` back to the dispatcher
+/// (`Some(Some(cmd))` hands the command off, `Some(None)` is a
+/// plain stop).
 #[allow(clippy::option_option)]
-fn loopback_command(
+fn clip_command(
     cmd: AudioCommand,
+    own: AudioCommand,
     amp: &mut SpeakerAmp<'_>,
 ) -> Option<Option<AudioCommand>> {
+    if cmd == own {
+        return None; // already running this one-shot
+    }
     match cmd {
-        AudioCommand::StopLoopback => {
+        AudioCommand::StopClip => {
             amp.disable();
             Some(None)
         }
+        // The other clip one-shot included: RECORD tapped during
+        // playback (or vice versa) hands the I2S straight over.
         cmd @ (AudioCommand::PlayAlarm
         | AudioCommand::PlayTones
-        | AudioCommand::StartCapture) => {
+        | AudioCommand::StartCapture
+        | AudioCommand::RecordClip
+        | AudioCommand::PlayClip) => {
             amp.disable();
             Some(Some(cmd))
         }
-        AudioCommand::StartLoopback => None, // already looping
         AudioCommand::StopAlarm
         | AudioCommand::StopCapture
         | AudioCommand::StopTones => None,
@@ -884,11 +971,14 @@ pub enum SessionMode {
     /// Speaker test: play the three-tone sweep once, emit
     /// `SystemEvent::TonesDone`, and end the session.
     Tones,
-    /// LOOP test: record-then-playback "parrot" cycles (mic and
-    /// speaker never live simultaneously - see
-    /// `loopback_until_interrupt` on why a live monitor howls here),
-    /// level meter included, until `StopLoopback` arrives.
-    Loopback,
+    /// Record one ~2 s mic clip into RAM (speaker muted, level meter
+    /// live - record and playback are never simultaneous; see
+    /// `record_clip_until_done` on why a live monitor howls here),
+    /// then end the session with `SystemEvent::RecordingDone`.
+    RecordClip,
+    /// Play the stored clip once (mic ignored) and end the session
+    /// with `SystemEvent::PlaybackDone`.
+    PlayClip,
 }
 
 /// Run **one** audio session: build the I2S + DMA stack from the
@@ -902,7 +992,8 @@ pub enum SessionMode {
 /// second), the transfer enters a permanently-stuck `Late` state. The
 /// only recovery is to drop the whole transfer and rebuild fresh. So
 /// instead of a "build-once-forever" task, every session-starting
-/// command (`PlayAlarm`, `StartCapture`, `PlayTones`, `StartLoopback`)
+/// command (`PlayAlarm`, `StartCapture`, `PlayTones`, `RecordClip`,
+/// `PlayClip`)
 /// invokes this function with `Peri::reborrow()`'d
 /// peripheral tokens; the transfer lives for exactly one session and
 /// the reborrows release on session end, leaving the caller's tokens
@@ -1038,12 +1129,10 @@ pub async fn run_session<'d>(
             amp.disable();
             capture_until_interrupt(&mut rx, &mut buf, condition_passthrough).await
         }
-        SessionMode::Loopback => {
-            // The loop unmutes itself after the startup drain, so the
-            // codec init burst never reaches the speaker.
+        SessionMode::RecordClip => {
+            // Speaker muted for the whole recording.
             amp.disable();
-            loopback_until_interrupt(
-                &mut tx,
+            record_clip_until_done(
                 &mut rx,
                 amp,
                 &mut buf,
@@ -1051,6 +1140,12 @@ pub async fn run_session<'d>(
                 condition_passthrough,
             )
             .await
+        }
+        SessionMode::PlayClip => {
+            // The playback unmutes itself after its silence flush, so
+            // the codec init burst never reaches the speaker.
+            amp.disable();
+            play_clip_until_done(&mut tx, &mut rx, amp, &mut buf).await
         }
     };
 
@@ -1072,7 +1167,7 @@ pub async fn run_session<'d>(
 /// loops themselves are the shared ones.
 ///
 /// Only `Play` and `Tones` are playable here. The capture modes
-/// (`Capture`, `Loopback`) need a capture backend this session kind
+/// (`Capture`, `RecordClip`, `PlayClip`) need a capture backend this session kind
 /// doesn't build (a board whose mic is a PDM device routes them to
 /// [`run_session_pdm_mic`] instead); a dispatcher shouldn't send
 /// them here, and defensively they end the session immediately.
@@ -1119,7 +1214,7 @@ pub async fn run_session_tx<'d>(
             amp.disable();
             play_tones_until_done(&mut tx, amp, phase).await
         }
-        SessionMode::Capture | SessionMode::Loopback => {
+        SessionMode::Capture | SessionMode::RecordClip | SessionMode::PlayClip => {
             log::warn!("Audio: {:?} not supported on a TX-only backend", mode);
             None
         }
@@ -1223,7 +1318,7 @@ pub async fn run_session_pdm_mic<'d>(
     // hardware-observed still climbing through raw 0x1d0c ~150 ms in
     // - past every drain above. The moving ramp defeats the per-chunk
     // mean subtraction, so undrained it reads as a phantom mid-bar
-    // level blip at session open (and the first parrot cycle records
+    // level blip at session open (and a clip recording records
     // its tail as a click). Wait it out, then discard; the ~250 ms
     // accumulation sits well under the RX ring's ~512 ms capacity,
     // and the codec session kind spends a comparable span on codec
@@ -1249,10 +1344,9 @@ pub async fn run_session_pdm_mic<'d>(
             amp.disable();
             capture_until_interrupt(&mut rx, &mut buf, pdm_condition_rx).await
         }
-        SessionMode::Loopback => {
+        SessionMode::RecordClip => {
             amp.disable();
-            loopback_until_interrupt(
-                &mut tx,
+            record_clip_until_done(
                 &mut rx,
                 amp,
                 &mut buf,
@@ -1260,6 +1354,10 @@ pub async fn run_session_pdm_mic<'d>(
                 pdm_condition_play,
             )
             .await
+        }
+        SessionMode::PlayClip => {
+            amp.disable();
+            play_clip_until_done(&mut tx, &mut rx, amp, &mut buf).await
         }
     }
     // tx and rx drop here, stopping both DMA transfers and both
