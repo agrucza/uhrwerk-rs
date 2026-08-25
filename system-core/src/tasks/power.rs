@@ -88,6 +88,9 @@ pub async fn power_task(bus: &'static SharedI2c, mut state: PowerTaskState) {
     let mut prev = PowerData::default();
     let mut first = true;
     let mut interval_ms = POLL_INTERVAL_MS;
+    // VBUS-aware sleep policy, see below. `Some` while external
+    // power is present.
+    let mut vbus_hold: Option<crate::bus::WakeHold> = None;
 
     loop {
         match select(
@@ -144,6 +147,33 @@ pub async fn power_task(bus: &'static SharedI2c, mut state: PowerTaskState) {
                 }).await;
             }
         }
+        // VBUS-aware sleep: while external power is present, hold
+        // hardware light sleep off (same RAII hold the WiFi/audio
+        // sessions use - the manager idles dark instead of calling
+        // `rtc.sleep()`). Rationale: light sleep exists to save the
+        // battery, and on VBUS the system draws from USB through the
+        // AXP's power path - gating the clocks buys nothing and
+        // charging is unaffected. Staying awake keeps USB-Serial-JTAG
+        // enumerated (debugging survives the dark screen) and the
+        // watch reachable while docked - the natural window for the
+        // file server and future USB roles. Sleep MODE is untouched:
+        // the display still dims and turns off, wake-on-motion still
+        // arms. Level-checked (not edge) so a boot or task start with
+        // the cable already attached takes the hold too. Worst-case
+        // release latency is one sleep-cadence poll (5 s) after
+        // unplugging.
+        match (&vbus_hold, fresh.vbus_good) {
+            (None, true) => {
+                log::info!("Power: VBUS present - hardware sleep held off");
+                vbus_hold = Some(crate::bus::WakeHold::new());
+            }
+            (Some(_), false) => {
+                log::info!("Power: VBUS gone - hardware sleep re-enabled");
+                vbus_hold = None;
+            }
+            _ => {}
+        }
+
         prev = fresh;
         first = false;
     }
