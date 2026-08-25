@@ -205,4 +205,19 @@ impl<'d> Board for PowerControls<'d> {
         cfg.set_xtal_fpu(false);
         cfg.set_light_slp_reject(false);
     }
+
+    /// 30 s guard around every sleep. This board's own recipe notes
+    /// name the failure mode of a wrong sleep config: a SILENT HANG -
+    /// sleeps, never wakes. With the guard, that ends in a SysRtcWdt
+    /// self-reset 30 s later (boot log names the cause) instead of a
+    /// dead watch until someone power-cycles it. The heartbeat wakes
+    /// every 5 s, so a healthy cycle disarms far inside the timeout.
+    /// NOTE: watchdog-ticks-through-light-sleep is hardware-verified
+    /// on the C6 only; on this chip it is the same RTC-domain
+    /// watchdog and expected to behave the same - the soak test
+    /// (10+ min unplugged sleep, then wake, zero SysRtcWdt boots)
+    /// verifies it.
+    fn sleep_watchdog_timeout(&self) -> Option<esp_hal::time::Duration> {
+        Some(esp_hal::time::Duration::from_secs(30))
+    }
 }

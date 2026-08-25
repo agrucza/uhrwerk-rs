@@ -401,4 +401,16 @@ impl Board for TwatchUltraBoard {
         cfg.set_xtal_fpu(false);
         cfg.set_light_slp_reject(false);
     }
+
+    /// 30 s guard around every sleep: a sleep the chip never wakes
+    /// from ends in a SysRtcWdt self-reset (boot log names the
+    /// cause) instead of a dead watch until a power cycle. The 5 s
+    /// heartbeat disarms healthy cycles far inside the timeout.
+    /// NOTE: watchdog-ticks-through-light-sleep is hardware-verified
+    /// on the C6 only; same RTC-domain watchdog here - the soak test
+    /// (10+ min unplugged sleep, then wake, zero SysRtcWdt boots)
+    /// verifies it.
+    fn sleep_watchdog_timeout(&self) -> Option<esp_hal::time::Duration> {
+        Some(esp_hal::time::Duration::from_secs(30))
+    }
 }
