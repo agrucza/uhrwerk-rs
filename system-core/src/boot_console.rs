@@ -210,17 +210,6 @@ impl BootConsole {
         .await;
     }
 
-    /// Rewrite the status column of the last row (a `log_begin` line).
-    pub async fn log_update(&mut self, d: &mut Display<'_>, status: &str) {
-        let idx = self.rows.len() - 1;
-        if let Some(Row::Log { status: s, .. }) = self.rows.last_mut() {
-            *s = String::from(status);
-        }
-        let (top, h) = self.row_span(idx);
-        self.flush_range(d, top, top + h).await;
-        Timer::after(Duration::from_millis(BURST_MS)).await;
-    }
-
     /// Rewrite the status of the most recent log row carrying
     /// `label` - task reports land in whatever order the hardware
     /// finishes, so the row is found by label, not position. Appends
