@@ -122,8 +122,14 @@ impl Board for C6Board {
     }
 
     /// C6 family: `PMU.slp_wakeup_status0`.
+    ///
+    /// Also the sleep-breadcrumb completion marker: the manager calls
+    /// this exactly once, right after `rtc.sleep()` returns, so it
+    /// closes the cycle the LP-SRAM record opened in
+    /// `tune_sleep_config`.
     fn wake_cause_raw(&self) -> u32 {
         use esp_hal::peripherals::PMU;
+        esp_hal::rtc_cntl::sleep::sleep_diag::note_returned();
         PMU::regs().slp_wakeup_status0().read().wakeup_cause().bits()
     }
 
@@ -155,9 +161,57 @@ impl Board for C6Board {
     /// and C6 hardware light-sleep is not yet validated - the default
     /// config is the correct starting point until the C6 sleep
     /// recipe is brought up.
+    ///
+    /// Doubles as the sleep-breadcrumb arm point: the manager calls
+    /// this once per sleep entry, right before `rtc.sleep()`, which
+    /// is exactly where the LP-SRAM record (docs/esp-hal-patch.md)
+    /// wants its "a sleep cycle is starting" marker. After a freeze,
+    /// the next boot logs how far past this marker the cycle got.
     fn tune_sleep_config(
         &self,
         _cfg: &mut esp_hal::rtc_cntl::sleep::RtcSleepConfig,
     ) {
+        esp_hal::rtc_cntl::sleep::sleep_diag::arm();
+    }
+
+    /// The C6 sleep path re-calibrates RC_FAST_DIV on every
+    /// `rtc.sleep()` and divides by the result (PMU wait times). Ask
+    /// the same calibration, same cycle count, so the manager sees
+    /// what the sleep code is about to see. 0 = the TIMG calibration
+    /// timed out - the exact condition that, unpatched, is a
+    /// divide-by-zero inside `rtc.sleep()`. Via the vendored esp-hal's
+    /// `calibrate_rc_fast_div` (see docs/esp-hal-patch.md); no
+    /// register access of our own.
+    fn sleep_clock_probe(&self) -> Option<u32> {
+        let cal = esp_hal::clock::RtcClock::calibrate_rc_fast_div(2048);
+        // Breadcrumb sub-stage: `calibrate` busy-waits on a TIMG
+        // ready bit, making this probe itself a hang suspect. Stuck
+        // at ARMED = died in the wait above; the vendored stages
+        // from SLEEP_CALLED onward pinpoint `rtc.sleep()` itself.
+        // (2026-08-24 capture: probe exonerated - the freeze died
+        // after PROBE_DONE.)
+        esp_hal::rtc_cntl::sleep::sleep_diag::note_probe_done();
+        // Hand the value to the sleep path so `rtc.sleep()` skips
+        // its own in-sleep measurement - whose clock-node restore
+        // re-enables the PLL mid-entry and deadlocks (the post-WiFi
+        // freeze, PATCH.md capture 3). This probe runs while the PLL
+        // is still the root clock, where the same measurement is
+        // safe. A 0 (measurement timeout) provides nothing: the
+        // sleep path then measures as before, watchdog as the net.
+        if cal != 0 {
+            esp_hal::rtc_cntl::sleep::provide_fastclk_period(cal);
+        }
+        Some(cal)
+    }
+
+    /// 30 s guard around every sleep while the post-WiFi freeze is
+    /// under investigation. The heartbeat wakes every 5 s, so 30 s of
+    /// unbroken sleep means the chip is stuck; the LP watchdog then
+    /// resets it. Unlike the PWR long-press (an AXP power cycle,
+    /// which wipes LP SRAM), a watchdog reset keeps the sleep
+    /// breadcrumb alive for the next boot to report. Remove together
+    /// with the breadcrumb once the freeze is understood.
+    fn sleep_watchdog_timeout(&self) -> Option<esp_hal::time::Duration> {
+        Some(esp_hal::time::Duration::from_secs(30))
     }
 }

@@ -32,7 +32,7 @@ License 1.1 - license text in `assets/fonts/LICENSE.txt`.
 | Touch | working (FT3168) | working (FT3168) | working (CST9217/9220) |
 | PMU (AXP2101) | working | working | working |
 | RTC + alarms/timers (PCF85063) | working | working | working (backup cell keeps time through power-off) |
-| Light sleep / wake | working | working | working |
+| Light sleep / wake | working | working (sleep after a WiFi session needs the patched esp-hal fork - see docs/esp-hal-patch.md) | working |
 | Storage - internal flash | working | working | working |
 | Storage - SD card | working | no slot | working (hotplug via card detect) |
 | Speaker | working (ES8311) | working (ES8311) | working (MAX98357A) |

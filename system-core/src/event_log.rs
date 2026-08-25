@@ -214,8 +214,28 @@ pub fn try_log(store: &mut Store, time: &TimeData, event: &SystemEvent) {
 /// there's no `SystemEvent::Boot` - boot is just "we started
 /// running", emitted directly from the manager after the RTC +
 /// Store are up.
-pub fn log_boot(store: &mut Store, time: &TimeData) {
-    write_line(store, time, LoggedEvent { tag: "boot", detail: None, detail2: None });
+///
+/// `reset_reason` is the SoC's reset cause as a raw discriminant
+/// (esp-hal `SocResetReason`), so a log read back after a freeze says
+/// what kind of restart followed it: power-on means someone reset it
+/// by hand, a brownout or watchdog code means the chip did it itself.
+pub fn log_boot(store: &mut Store, time: &TimeData, reset_reason: Option<u32>) {
+    write_line(store, time, LoggedEvent { tag: "boot", detail: reset_reason, detail2: None });
+}
+
+/// Record a firmware-internal diagnostic line with a static tag and
+/// up to two integer details. Same file, same format, same
+/// best-effort rules as every other line; for things the firmware
+/// notices about itself rather than user-visible events, where the
+/// point is that the evidence survives a reboot or a USB drop.
+pub fn log_diag(
+    store: &mut Store,
+    time: &TimeData,
+    tag: &'static str,
+    detail: Option<u32>,
+    detail2: Option<u32>,
+) {
+    write_line(store, time, LoggedEvent { tag, detail, detail2 });
 }
 
 fn write_line(store: &mut Store, time: &TimeData, event: LoggedEvent) {

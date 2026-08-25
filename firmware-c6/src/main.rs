@@ -414,6 +414,50 @@ async fn audio_task(
     }
 }
 
+/// One post-mortem line from the LP-SRAM sleep breadcrumb (see
+/// docs/esp-hal-patch.md). Shared by the boot readout and the
+/// repeater so both print the identical evidence.
+fn log_sleep_postmortem(
+    reset: &Option<esp_hal::rtc_cntl::SocResetReason>,
+    r: &esp_hal::rtc_cntl::sleep::sleep_diag::Record,
+) {
+    use esp_hal::rtc_cntl::sleep::sleep_diag;
+    log::warn!(
+        "sleep-diag: DIED MID-SLEEP-CYCLE (reset {:?}): cycle {}, stage {} = {}, cal {} ({} attempts, fallback {}), pmu int_raw {:#x}",
+        reset,
+        r.seq,
+        r.stage,
+        sleep_diag::stage_name(r.stage),
+        r.cal_value,
+        r.cal_attempts,
+        r.cal_fallback,
+        r.wake_int_raw,
+    );
+}
+
+/// Re-logs a died-mid-sleep-cycle post-mortem every 10 s, forever,
+/// and holds light sleep off for the rest of this boot. The hold is
+/// what makes the evidence readable at all: sleeping again would
+/// re-arm the breadcrumb and overwrite the died record in LP SRAM,
+/// and would drop the USB-Serial-JTAG tty so every repeat lands in
+/// the host's resync blackout. Awake, the tty stays up - attach the
+/// monitor whenever, or hit Ctrl+R for the full boot log (a USB
+/// reset preserves LP SRAM, and the un-slept record replays). The
+/// device won't sleep again until reflash or power-cycle; that's the
+/// point of a post-mortem boot. Runs only after a freeze; a clean
+/// boot never spawns it.
+#[embassy_executor::task]
+async fn sleep_diag_repeater(
+    reset: Option<esp_hal::rtc_cntl::SocResetReason>,
+    r: esp_hal::rtc_cntl::sleep::sleep_diag::Record,
+) {
+    let _wake = system_core::bus::WakeHold::new();
+    loop {
+        Timer::after(Duration::from_secs(10)).await;
+        log_sleep_postmortem(&reset, &r);
+    }
+}
+
 #[esp_rtos::main]
 async fn main(spawner: embassy_executor::Spawner) {
     let peripherals = esp_hal::init(esp_hal::Config::default());
@@ -433,6 +477,78 @@ async fn main(spawner: embassy_executor::Spawner) {
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
     esp_println::logger::init_logger(log::LevelFilter::Info);
     log::info!("--- ESP32-C6-Touch-AMOLED-2.06 booting ---");
+
+    // Post-mortem readout of the LP-SRAM sleep breadcrumb (see
+    // docs/esp-hal-patch.md). LP SRAM survives every reset except
+    // a power cycle -
+    // after a sleep freeze, this record is the only evidence of how
+    // far the fatal cycle got. The freeze signature is a cycle stuck
+    // before RETURNED combined with a SysRtcWdt reset; a RETURNED
+    // record just means the last sleep before this reboot completed
+    // normally.
+    //
+    // The freeze also tears the USB-Serial-JTAG tty off the host, so
+    // no monitor can be attached during the first boot lines after
+    // the watchdog reset - a died-mid-cycle record therefore spawns
+    // a repeater that re-logs the evidence every 10 s and holds
+    // sleep off for the rest of this boot (see its doc for why both
+    // halves matter). Attach the monitor at leisure and wait one
+    // interval, or Ctrl+R for the full boot log.
+    {
+        use esp_hal::rtc_cntl::sleep::sleep_diag;
+        use esp_hal::rtc_cntl::SocResetReason;
+        let reset = esp_hal::system::reset_reason();
+        match sleep_diag::snapshot() {
+            // A mid-cycle record is a freeze ONLY when the LP
+            // watchdog ended it (the guard around every rtc.sleep()
+            // - the one way a real freeze terminates). Gating on the
+            // reset reason matters because the device sleeps most of
+            // the time, so any OTHER reset - Ctrl+R, an espflash
+            // attach, the flash after a build - usually lands
+            // mid-sleep and would fake the same signature; treating
+            // those as post-mortems held the device awake until a
+            // power cycle (observed 2026-08-24).
+            Some(r) if r.stage >= sleep_diag::STAGE_ARMED
+                && r.stage < sleep_diag::STAGE_RETURNED
+                && reset == Some(SocResetReason::SysRtcWdt) =>
+            {
+                log_sleep_postmortem(&reset, &r);
+                spawner.spawn(sleep_diag_repeater(reset, r).unwrap());
+                // Deliberately NOT marked reported: attaching the
+                // monitor can itself reset the chip (espflash toggles
+                // the serial lines), and that second boot must still
+                // see the evidence. The next armed sleep cycle
+                // overwrites the record anyway.
+            }
+            Some(r) if r.stage >= sleep_diag::STAGE_ARMED
+                && r.stage < sleep_diag::STAGE_RETURNED =>
+            {
+                // A reset (not the watchdog) interrupted a healthy
+                // sleep cycle. Normal life, not evidence - report
+                // one line and sleep as usual.
+                log::info!(
+                    "sleep-diag: reset {:?} interrupted sleep cycle {} at stage {} ({}) - not a freeze",
+                    reset,
+                    r.seq,
+                    r.stage,
+                    sleep_diag::stage_name(r.stage),
+                );
+                sleep_diag::mark_reported();
+            }
+            Some(r) => {
+                log::info!(
+                    "sleep-diag: reset {:?}, last cycle {} ended clean ({})",
+                    reset,
+                    r.seq,
+                    sleep_diag::stage_name(r.stage),
+                );
+                sleep_diag::mark_reported();
+            }
+            None => {
+                log::info!("sleep-diag: no record (reset {:?} - power-on clears LP SRAM)", reset);
+            }
+        }
+    }
 
     let bringup = C6Bringup {
         i2c0: Some(peripherals.I2C0),

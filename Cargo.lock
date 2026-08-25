@@ -822,8 +822,7 @@ dependencies = [
 [[package]]
 name = "esp-config"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d9b92fd9cfb0b4f8f1b6219b9763269a335571e307b014903b8201619374b80"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
 dependencies = [
  "document-features",
  "esp-metadata-generated",
@@ -835,8 +834,7 @@ dependencies = [
 [[package]]
 name = "esp-hal"
 version = "1.1.0-rc.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3599174af043c640b89d5950558bc40bd448f6e1d56ae43880a0d8530b4f82c"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
 dependencies = [
  "bitfield",
  "bitflags 2.11.0",
@@ -875,6 +873,7 @@ dependencies = [
  "esp32s3",
  "fugit",
  "instability",
+ "log",
  "nb 1.1.0",
  "paste",
  "portable-atomic",
@@ -891,8 +890,7 @@ dependencies = [
 [[package]]
 name = "esp-hal-procmacros"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6aebfabb2c21bec45e575e4f6cb6bb7aa8e1b33e7ac45b5dffa0f9d33ff59105"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
 dependencies = [
  "document-features",
  "object",
@@ -906,8 +904,7 @@ dependencies = [
 [[package]]
 name = "esp-metadata-generated"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42c2ee95b945a4780796e4359e72c033aed3b45073880e8029458f538532db8a"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
 
 [[package]]
 name = "esp-phy"
@@ -993,8 +990,7 @@ dependencies = [
 [[package]]
 name = "esp-riscv-rt"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66a814ae91452de56a5e74f69aebfee40579511756837d3774a56fd24cf0ab79"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
 dependencies = [
  "document-features",
  "riscv",
@@ -1004,8 +1000,7 @@ dependencies = [
 [[package]]
 name = "esp-rom-sys"
 version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eae852ccb08971155023d1371c96d5490cbc26860f06aee2d629ef73f1a890c3"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
 dependencies = [
  "cfg-if",
  "document-features",
@@ -1058,8 +1053,7 @@ dependencies = [
 [[package]]
 name = "esp-sync"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4736bfbbb9e3f6353344e14fc61b6d18d3b877c3286914cf8c0a037be0ed224"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
 dependencies = [
  "cfg-if",
  "document-features",
@@ -2121,6 +2115,7 @@ dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
  "embedded-hal-bus",
+ "embedded-io-async 0.7.0",
  "embedded-storage",
  "esp-alloc",
  "esp-hal",
@@ -2392,8 +2387,7 @@ dependencies = [
 [[package]]
 name = "xtensa-lx"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e012d667b0aa6d2592ace8ef145a98bff3e76cca7a644f4181ecd7a916ed289b"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
 dependencies = [
  "critical-section",
 ]
@@ -2401,8 +2395,7 @@ dependencies = [
 [[package]]
 name = "xtensa-lx-rt"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "409a9b4629d429e995cde4dfbd9fe562ccae66f7624514e200733fc5d0ea8905"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
 dependencies = [
  "document-features",
  "xtensa-lx",
@@ -2412,8 +2405,7 @@ dependencies = [
 [[package]]
 name = "xtensa-lx-rt-proc-macros"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96fb42cd29c42f8744c74276e9f5bee7b06685bbe5b88df891516d72cb320450"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
 dependencies = [
  "proc-macro2",
  "quote",

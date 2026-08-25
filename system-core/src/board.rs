@@ -144,4 +144,37 @@ pub trait Board {
         &self,
         cfg: &mut esp_hal::rtc_cntl::sleep::RtcSleepConfig,
     );
+
+    /// The calibration value this chip's sleep path will divide by on
+    /// the next `rtc.sleep()`, for boards whose sleep code has one.
+    ///
+    /// PMU-based chips (the C6) re-calibrate the RC_FAST_DIV clock at
+    /// every sleep entry and derive the PMU's hardware wait times from
+    /// the result; a calibration that times out yields 0, and unpatched
+    /// esp-hal divides by it inside `rtc.sleep()` - the device halts
+    /// dark. The manager calls this just before sleeping, logs the
+    /// value when it deviates from the boot baseline or reads 0, and
+    /// writes an event-log line so the evidence survives on a board
+    /// whose USB dies in sleep. `None` = this chip has no such value
+    /// (the S3's sleep path does no fast-clock calibration).
+    fn sleep_clock_probe(&self) -> Option<u32> {
+        None
+    }
+
+    /// Timeout for an RTC-watchdog guard around `rtc.sleep()`.
+    /// `Some(t)` makes the manager arm the RTC watchdog (stage 0 =
+    /// reset the system) right before sleeping and disarm it right
+    /// after waking: a sleep the chip never wakes from self-resets
+    /// after `t` instead of needing a power cycle - a silent sleep
+    /// hang on a wristwatch is otherwise a dead watch until someone
+    /// power-cycles it. On boards with an LP-SRAM sleep breadcrumb
+    /// the watchdog reset additionally preserves the evidence (power
+    /// loss wipes it). Pick `t` with a wide margin over the
+    /// heartbeat period so a healthy cycle can never trip it.
+    /// `None` (the trait default) = no guard; the goal state is
+    /// `Some` on every board, gated per board on a soak test
+    /// (watchdog-ticks-through-light-sleep is verified per silicon).
+    fn sleep_watchdog_timeout(&self) -> Option<esp_hal::time::Duration> {
+        None
+    }
 }

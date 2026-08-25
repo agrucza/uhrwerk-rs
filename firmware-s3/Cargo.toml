@@ -18,7 +18,12 @@ bench = false
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
 
 # --- Espressif HAL ---
-esp-hal = { version = "1.1.0-rc.0", features = [
+# `=` pin: the workspace patches esp-hal with the fork carrying the
+# C6 sleep-freeze fix (docs/esp-hal-patch.md), and a [patch] only
+# applies when the graph resolves to its exact version - a floating
+# requirement would let newer registry releases win and silently
+# drop the patch.
+esp-hal = { version = "=1.1.0-rc.0", features = [
     "esp32s3",
     "unstable",     # required for many APIs in 1.x
 ] }

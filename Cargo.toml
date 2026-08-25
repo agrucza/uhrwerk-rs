@@ -23,6 +23,31 @@ default-members = [
     "firmware-s3",
     "firmware-twatch-ultra",
 ]
+# Soft fork of esp-hal: 1.1.0-rc.0 plus the fix for the C6
+# post-WiFi light-sleep freeze and its sleep-entry diagnostics - see
+# docs/esp-hal-patch.md for the investigation record and the exact
+# delta. The fork keeps the same version number, so every crate in
+# the graph (esp-rtos, esp-radio, esp-storage, ...) sees one esp-hal.
+# Upstream syncs are merges of release commits into the fork's
+# `uhrwerk-rs` branch. Drop this block the moment an upstream release
+# carries an equivalent fix.
+[patch.crates-io]
+esp-hal = { git = "https://github.com/agrucza/esp-hal", branch = "uhrwerk-rs" }
+# esp-hal's in-tree sibling crates must come from the same source:
+# the git esp-hal pulls them from its own repo, and without these
+# entries the registry crates (esp-radio, esp-rtos, ...) would pull
+# second copies from crates.io - cargo then rejects the duplicate
+# `links` natives (xtensa-lx-rt/esp-riscv-rt) or splits types across
+# two instances. Same repo, same branch, same versions as the
+# registry releases (the branch base is the release commit).
+esp-rom-sys            = { git = "https://github.com/agrucza/esp-hal", branch = "uhrwerk-rs" }
+esp-config             = { git = "https://github.com/agrucza/esp-hal", branch = "uhrwerk-rs" }
+esp-metadata-generated = { git = "https://github.com/agrucza/esp-hal", branch = "uhrwerk-rs" }
+esp-sync               = { git = "https://github.com/agrucza/esp-hal", branch = "uhrwerk-rs" }
+esp-hal-procmacros     = { git = "https://github.com/agrucza/esp-hal", branch = "uhrwerk-rs" }
+esp-riscv-rt           = { git = "https://github.com/agrucza/esp-hal", branch = "uhrwerk-rs" }
+xtensa-lx              = { git = "https://github.com/agrucza/esp-hal", branch = "uhrwerk-rs" }
+xtensa-lx-rt           = { git = "https://github.com/agrucza/esp-hal", branch = "uhrwerk-rs" }
 
 # Shared dependency versions - single source of truth to avoid mismatches.
 [workspace.dependencies]

@@ -368,7 +368,12 @@ impl<B: Board> SystemManager<'static, B> {
         }
         let sd_online = false;
 
-        crate::event_log::log_boot(&mut store, &initial_time);
+        // The reset cause goes into the boot line: after a freeze and
+        // recovery, it tells whether the restart was a human reset
+        // (power-on) or the chip's own doing (brownout, watchdog).
+        let reset_reason = esp_hal::system::reset_reason();
+        log::info!("boot: reset reason {:?}", reset_reason);
+        crate::event_log::log_boot(&mut store, &initial_time, reset_reason.map(|r| r as u32));
 
         let fs_usage = store.usage();
         let initial_usage = app_core::data::StorageUsage {
@@ -795,6 +800,26 @@ impl<B: Board> SystemManager<'static, B> {
             GpioWakeupSource, RtcSleepConfig, TimerWakeupSource,
         };
 
+        // Board-elected sleep watchdog, armed FIRST: the LP watchdog
+        // counts on the slow clock in the low-power domain, so it
+        // keeps running through light sleep AND through any hang on
+        // the way there - every step below (touch, probe, clock
+        // drop, `rtc.sleep()` itself) is rescued by a system reset
+        // after the timeout instead of needing a power cycle. That
+        // matters because a watchdog reset preserves LP SRAM (the
+        // sleep breadcrumb on boards that keep one), while pulling
+        // power wipes it. Healthy cycles wake within the heartbeat
+        // and disarm right after `rtc.sleep()` returns, far inside
+        // the timeout.
+        let sleep_wdt = self.board.sleep_watchdog_timeout();
+        if let Some(timeout) = sleep_wdt {
+            self.rtc
+                .rwdt
+                .set_timeout(esp_hal::rtc_cntl::RwdtStage::Stage0, timeout);
+            self.rtc.rwdt.enable();
+            self.rtc.rwdt.feed();
+        }
+
         // Drop the touch controller to its low-power state
         // synchronously before sleep entry, bus lock held. Doing it
         // here rather than in the touch task off SLEEP_WATCH closes
@@ -835,6 +860,35 @@ impl<B: Board> SystemManager<'static, B> {
         let mut config = RtcSleepConfig::default();
         self.board.tune_sleep_config(&mut config);
 
+        // Sleep-clock watch. On PMU chips the sleep path is about to
+        // re-calibrate RC_FAST_DIV and divide by it; read the same
+        // value here first. A 0 or a value well off the boot baseline
+        // is the C6 freeze signature (radio session -> calibration
+        // timeout -> divide-by-zero in rtc.sleep()). Logged to serial
+        // AND to the flash event log, because on the C6 the serial
+        // side is gone after the first sleep and the evidence has to
+        // survive the reset that follows a freeze. Writes only on an
+        // anomaly, so a healthy device costs one calibration per
+        // sleep entry and no flash traffic.
+        if let Some(cal) = self.board.sleep_clock_probe() {
+            use core::sync::atomic::Ordering;
+            let base = SLEEP_CAL_BASELINE.load(Ordering::Relaxed);
+            // >5 % off baseline counts; RC_FAST drifts with
+            // temperature by far less than that between two sleeps.
+            let anomalous = cal == 0 || (base != 0 && cal.abs_diff(base) > base / 20);
+            if anomalous {
+                log::warn!("sleep-cal: pre-sleep {} (boot baseline {})", cal, base);
+                let time = self.model.cached_data().time;
+                crate::event_log::log_diag(
+                    &mut *self.store.lock().await,
+                    &time,
+                    "sleepcal",
+                    Some(cal),
+                    Some(base),
+                );
+            }
+        }
+
         // Drop to baseline before sleep: at max clock the slow-clock
         // alarm programming in TimerWakeupSource can't latch before
         // the CPU gates off and timer wake never fires.
@@ -857,6 +911,9 @@ impl<B: Board> SystemManager<'static, B> {
         // returns the PRE-sleep latch and fakes a 0 ms sleep.
         let entered_us = self.rtc_now_us();
         self.rtc.sleep(&config, &[&gpio_wake, &timer_wake]);
+        if sleep_wdt.is_some() {
+            self.rtc.rwdt.disable();
+        }
         let slept_ms = (self.rtc_now_us() - entered_us) / 1000;
         self.sleep_cycles += 1;
 
@@ -1590,6 +1647,13 @@ pub trait Bringup {
 /// [`Bringup`] in the canonical order, assemble the manager, spawn
 /// the per-device tasks, and run the event loop forever. Identical
 /// across boards, so it lives exactly once.
+/// Boot-time value of [`Board::sleep_clock_probe`], 0 = not seeded
+/// (the board has no such value, or the boot probe itself read 0).
+/// Every later sleep entry compares against it; see
+/// `SystemManager::enter_light_sleep`.
+static SLEEP_CAL_BASELINE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 pub async fn run<T: Bringup>(
     mut bringup: T,
     spawner: embassy_executor::Spawner,
@@ -1680,6 +1744,13 @@ pub async fn run<T: Bringup>(
     // Board-specific: the speaker task, where the board has one. Owns
     // the I2S / DMA / speaker pins; lazy bring-up on the first tone.
     bringup.spawn_audio(spawner, i2c_bus);
+    // Seed the sleep-clock baseline before anything has touched the
+    // radio; every sleep entry compares its fresh calibration to this.
+    if let Some(cal) = manager.board.sleep_clock_probe() {
+        SLEEP_CAL_BASELINE.store(cal, core::sync::atomic::Ordering::Relaxed);
+        log::info!("sleep-cal: boot baseline {}", cal);
+    }
+
     // Shared: the WiFi session task (scan / NTP sync / file serve on
     // command). The radio is off between sessions, so spawning costs
     // nothing until a settings view asks for a session. It gets the
