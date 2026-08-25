@@ -252,30 +252,29 @@ impl Bringup for C6Bringup {
     }
 }
 
-/// C6 duplex clock fixups, passed to `run_session` as its `tune_i2s`
-/// hook (re-applied every session - esp-hal rewrites these fields in
+/// C6 duplex clock fixup, passed to `run_session` as its `tune_i2s`
+/// hook (re-applied every session - esp-hal rewrites this field in
 /// its configure path).
 ///
 /// The C6's I2S clocks its TX and RX units from two independent
-/// fractional PCR dividers (160 MHz / 39.0625) and esp-hal leaves
-/// them free-running, which breaks full duplex twice over: the RX
-/// unit samples DIN with its own divider's phase (a per-session
-/// lottery against the wire - bit-run garbage from the mic on bad
-/// rolls), and the MCLK pin gets bound to the RX divider while
-/// BCLK/WS come from the TX divider (incoherent clocks at the codecs
-/// - chopped/stuttering ES8311 playback). ESP-IDF's duplex driver
-/// fixes both with two register writes, replicated here from its C6
-/// `i2s_ll`: share the TX unit's BCK/WS with the RX unit
-/// (`i2s_ll_share_bck_ws` - despite the field's name, sig_loopback
-/// shares clocks, not data), and bind the MCLK pin to the TX divider
-/// (`i2s_ll_mclk_bind_to_tx_clk`).
+/// fractional PCR dividers (160 MHz / 39.0625); in full duplex the
+/// RX unit would sample DIN with its own divider's phase - a
+/// per-session lottery against the wire, bit-run garbage from the
+/// mic on bad rolls. ESP-IDF's duplex driver shares the TX unit's
+/// BCK/WS with the RX unit (`i2s_ll_share_bck_ws` - despite the
+/// field's name, sig_loopback shares clocks, not data); replicated
+/// here. esp-hal's `signal_loopback` config sets this field too but
+/// also flips `rx_slave_mod`, which is not the register state this
+/// board's audio was verified with - the direct poke stays.
+///
+/// The second half of the original fixup - binding the MCLK pin to
+/// the TX divider instead of the free-running RX divider - now lives
+/// in the patched esp-hal fork's `set_tx_clock`/`set_rx_clock`
+/// (issue esp-rs/esp-hal#6072).
 fn tune_i2s() {
     unsafe { &*esp32c6::I2S0::ptr() }
         .tx_conf()
         .modify(|_, w| w.sig_loopback().set_bit());
-    unsafe { &*esp32c6::PCR::ptr() }
-        .i2s_rx_clkm_conf()
-        .modify(|_, w| w.i2s_mclk_sel().clear_bit());
 }
 
 /// ES7210 analog input gain. 30 dB is the esp-bsp / esp_codec_dev
@@ -385,7 +384,7 @@ async fn audio_task(
             AudioCommand::StopAlarm
             | AudioCommand::StopCapture
             | AudioCommand::StopTones
-            | AudioCommand::StopLoopback => {
+            | AudioCommand::StopClip => {
                 // No active session here - the inner loops own their
                 // own stop response. Defensive amp mute.
                 amp.disable();
@@ -394,7 +393,8 @@ async fn audio_task(
             AudioCommand::PlayAlarm => SessionMode::Play,
             AudioCommand::StartCapture => SessionMode::Capture,
             AudioCommand::PlayTones => SessionMode::Tones,
-            AudioCommand::StartLoopback => SessionMode::Loopback,
+            AudioCommand::RecordClip => SessionMode::RecordClip,
+            AudioCommand::PlayClip => SessionMode::PlayClip,
         };
         pending = run_session(
             mode,
@@ -465,7 +465,8 @@ async fn main(spawner: embassy_executor::Spawner) {
     // No PSRAM on this board: internal-SRAM heap (the framebuffer is
     // in the shared display HAL's static BSS, not the heap). 128 KB
     // to match the S3: the audio test suite holds 48 KB of live
-    // buffers (32 KB mic pop + 16 KB parrot recording), which OOM'd
+    // buffers (32 KB mic pop + 32 KB clip build; the stored clip is
+    // freed before a new build starts), which OOM'd
     // the previous 64 KB heap and starved renders during capture.
     // The C6 has 512 KB of HP SRAM; the linker will complain if this
     // ever collides with the static budget.

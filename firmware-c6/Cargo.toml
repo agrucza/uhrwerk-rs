@@ -86,9 +86,12 @@ app-core     = { path = "../app-core", features = ["serde"] }
 # from here, same pattern as `esp-hal`).
 esp-storage  = { version = "0.9.0", features = ["esp32c6"] }
 
-# Raw PAC for the `tune_i2s` duplex clock fixups in main.rs - two
-# register bits esp-hal doesn't expose. Version/features mirror
-# esp-hal's own dependency so Cargo dedupes a single copy.
+# Raw PAC for the `tune_i2s` duplex clock fixup in main.rs - the
+# sig_loopback bit, whose esp-hal config equivalent also flips
+# rx_slave_mod (not this board's verified register state). The MCLK
+# binding half moved into the patched esp-hal fork (#6072).
+# Version/features mirror esp-hal's own dependency so Cargo dedupes
+# a single copy.
 esp32c6 = { version = "0.23", features = ["critical-section"] }
 
 # --- Internal-SRAM heap allocator ---

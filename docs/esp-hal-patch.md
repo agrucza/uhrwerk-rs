@@ -3,7 +3,7 @@
 The workspace pins a soft fork of esp-hal via `[patch.crates-io]`:
 `https://github.com/agrucza/esp-hal`, branch `uhrwerk-rs` - esp-hal
 1.1.0-rc.0 (base commit `347003de`, the exact commit the crates.io
-release was built from) plus four changes, three files. The fork
+release was built from) plus five changes, four files. The fork
 keeps the version number, so every crate in the graph (esp-rtos,
 esp-radio, esp-storage, ...) resolves to this one copy. The delta is
 always visible as `git diff 347003de..uhrwerk-rs` in the fork.
@@ -14,7 +14,9 @@ with esp-radio/esp-rtos) into the `uhrwerk-rs` branch, followed by a
 `cargo update -p esp-hal` here and a re-flash-verify of all boards.
 
 This file is the investigation record: what the freeze was, how it
-was proven, and what the four changes do.
+was proven, and what the changes do. Changes 1-4 are the C6 sleep
+freeze; change 5 is the C6/H2 I2S duplex MCLK fix (our upstream
+issue esp-rs/esp-hal#6072, closed as not planned).
 
 ## Why
 
@@ -43,7 +45,7 @@ made it rarer) was the original suspect. The breadcrumb disproved it
 as the freeze mechanism - the fatal cycle never reaches the division
 - but changes 1 and 2 stay as hardening for the real timeout case.
 
-## The four changes
+## The five changes
 
 1. `src/rtc_cntl/sleep/esp32c6.rs`, `SleepTimeConfig::new`: the
    RC_FAST_DIV calibration is retried up to 3 times; if it keeps
@@ -122,7 +124,23 @@ as the freeze mechanism - the fatal cycle never reaches the division
    unbounded spins, and the PLL-enable path clocking its own regi2c
    from the PLL.
 
+5. `src/i2s/master.rs` (C6/H2 family): bind the I2S MCLK output to
+   the TX divider. `set_rx_clock` claimed the MCLK pin
+   unconditionally; TX and RX run independent fractional dividers,
+   so full duplex left MCLK incoherent with BCK/WS - external codecs
+   on a shared MCLK (ES8311 + ES7210) saw per-session corrupted
+   capture and stuttering playback. Now `set_tx_clock` binds MCLK to
+   the TX divider (ESP-IDF `i2s_ll_mclk_bind_to_tx_clk`) and
+   `set_rx_clock` claims it only while the TX clock is disabled -
+   order-independent, RX-only unaffected. This is our upstream issue
+   esp-rs/esp-hal#6072 (closed as not planned); firmware-c6's
+   `tune_i2s` previously poked the same PCR bit and now only sets
+   `sig_loopback` (the BCK/WS share, kept bin-side because esp-hal's
+   `signal_loopback` config also flips `rx_slave_mod`, which is not
+   the verified register state).
+
 Everything else in the fork is byte-identical to the registry crate.
-Retire the fork and the `[patch.crates-io]` block as soon as an
-upstream release carries an equivalent fix (the breadcrumb is
-diagnostic scaffolding and goes with it).
+Retire the fork and the `[patch.crates-io]` block as soon as
+upstream releases carry equivalents of BOTH the sleep fix and the
+I2S MCLK binding (the breadcrumb is diagnostic scaffolding and goes
+with the sleep fix).

@@ -822,7 +822,7 @@ dependencies = [
 [[package]]
 name = "esp-config"
 version = "0.7.0"
-source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#e4968362913ebac04ac2c08ab2b885b75d1f798f"
 dependencies = [
  "document-features",
  "esp-metadata-generated",
@@ -834,7 +834,7 @@ dependencies = [
 [[package]]
 name = "esp-hal"
 version = "1.1.0-rc.0"
-source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#e4968362913ebac04ac2c08ab2b885b75d1f798f"
 dependencies = [
  "bitfield",
  "bitflags 2.11.0",
@@ -890,7 +890,7 @@ dependencies = [
 [[package]]
 name = "esp-hal-procmacros"
 version = "0.22.0"
-source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#e4968362913ebac04ac2c08ab2b885b75d1f798f"
 dependencies = [
  "document-features",
  "object",
@@ -904,7 +904,7 @@ dependencies = [
 [[package]]
 name = "esp-metadata-generated"
 version = "0.4.0"
-source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#e4968362913ebac04ac2c08ab2b885b75d1f798f"
 
 [[package]]
 name = "esp-phy"
@@ -990,7 +990,7 @@ dependencies = [
 [[package]]
 name = "esp-riscv-rt"
 version = "0.14.0"
-source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#e4968362913ebac04ac2c08ab2b885b75d1f798f"
 dependencies = [
  "document-features",
  "riscv",
@@ -1000,7 +1000,7 @@ dependencies = [
 [[package]]
 name = "esp-rom-sys"
 version = "0.1.4"
-source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#e4968362913ebac04ac2c08ab2b885b75d1f798f"
 dependencies = [
  "cfg-if",
  "document-features",
@@ -1053,7 +1053,7 @@ dependencies = [
 [[package]]
 name = "esp-sync"
 version = "0.2.1"
-source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#e4968362913ebac04ac2c08ab2b885b75d1f798f"
 dependencies = [
  "cfg-if",
  "document-features",
@@ -2387,7 +2387,7 @@ dependencies = [
 [[package]]
 name = "xtensa-lx"
 version = "0.13.0"
-source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#e4968362913ebac04ac2c08ab2b885b75d1f798f"
 dependencies = [
  "critical-section",
 ]
@@ -2395,7 +2395,7 @@ dependencies = [
 [[package]]
 name = "xtensa-lx-rt"
 version = "0.22.0"
-source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#e4968362913ebac04ac2c08ab2b885b75d1f798f"
 dependencies = [
  "document-features",
  "xtensa-lx",
@@ -2405,7 +2405,7 @@ dependencies = [
 [[package]]
 name = "xtensa-lx-rt-proc-macros"
 version = "0.5.0"
-source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#febf92310b3cf689bc259c9618fec24828211057"
+source = "git+https://github.com/agrucza/esp-hal?branch=uhrwerk-rs#e4968362913ebac04ac2c08ab2b885b75d1f798f"
 dependencies = [
  "proc-macro2",
  "quote",
