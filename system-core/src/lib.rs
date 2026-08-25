@@ -32,6 +32,7 @@ pub mod audio;
 pub mod audio_hal;
 
 pub mod board;
+pub mod boot_console;
 pub mod bus;
 pub mod clock_math;
 pub mod display;

@@ -64,6 +64,7 @@ pub async fn haptics_task(i2c_bus: &'static SharedI2c) {
             }
         }
     }
+    system_core::bus::boot_report("HAPT", if online { "OK" } else { "FAILED" });
 
     // Held while the motor is on: the DRV2605 drives autonomously,
     // so if hardware light sleep freezes the executor between an

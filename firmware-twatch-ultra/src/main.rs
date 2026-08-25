@@ -249,6 +249,8 @@ impl Bringup for TwatchUltraBringup {
     async fn make_input(
         &mut self,
         i2c: &mut I2c<'static, Blocking>,
+        boot: &mut system_core::boot_console::BootConsole,
+        display: &mut Display<'static>,
     ) -> (TouchTaskState<'static>, BootButtonTaskState<'static>) {
         let mut touch_int = Input::new(
             self.touch_int.take().unwrap(),
@@ -265,7 +267,10 @@ impl Bringup for TwatchUltraBringup {
         // shared `TouchTaskState::init` (host-GPIO reset) doesn't
         // apply here: pulse the expander pin (vendor timing), probe
         // the chip, and hand the ready driver to the shared task.
+        // This pulse is also the expander's first real use, so its
+        // boot line lands here.
         let expander = Xl9555::new(ExpanderConfig::default());
+        boot.log(display, "EXP", "XL9555").await;
         let _ = expander.write_pin(i2c, board::EXP_TOUCH_RST, false);
         Timer::after(Duration::from_millis(20)).await;
         let _ = expander.write_pin(i2c, board::EXP_TOUCH_RST, true);
@@ -273,11 +278,18 @@ impl Bringup for TwatchUltraBringup {
 
         let mut cst = Cst9217::new();
         match cst.init(i2c, &mut Delay) {
-            Ok(info) => log::info!(
-                "Touch: CST{:04X}, fw 0x{:08X}, matrix {}x{}",
-                info.chip_id, info.fw_version, info.res_x, info.res_y,
-            ),
-            Err(()) => log::error!("Touch: CST92xx init failed"),
+            Ok(info) => {
+                log::info!(
+                    "Touch: CST{:04X}, fw 0x{:08X}, matrix {}x{}",
+                    info.chip_id, info.fw_version, info.res_x, info.res_y,
+                );
+                let line = alloc::format!("CST{:04X} OK", info.chip_id);
+                boot.log(display, "TOUCH", &line).await;
+            }
+            Err(()) => {
+                log::error!("Touch: CST92xx init failed");
+                boot.log(display, "TOUCH", "CST9217 FAIL").await;
+            }
         }
 
         let touch = TouchTaskState::with_driver(AnyTouch::Cst92xx(cst), touch_int);
@@ -325,6 +337,8 @@ impl Bringup for TwatchUltraBringup {
     async fn make_sensors(
         &mut self,
         i2c: &mut I2c<'static, Blocking>,
+        boot: &mut system_core::boot_console::BootConsole,
+        display: &mut Display<'static>,
     ) -> (RtcTaskState<'static>, ImuTaskState<'static>) {
         let mut rtc_int = Input::new(
             self.rtc_int.take().unwrap(),
@@ -332,6 +346,7 @@ impl Bringup for TwatchUltraBringup {
         );
         let _ = rtc_int.wakeup_enable(true, WakeEvent::LowLevel);
         let rtc_state = RtcTaskState::init(Some(rtc_int), i2c);
+        boot.log(display, "RTC", "PCF85063").await;
 
         // This board's IMU is the BHI260AP hub: its firmware upload
         // and sensor discovery run inside the shared IMU task via
@@ -472,6 +487,24 @@ impl Bringup for TwatchUltraBringup {
             gps: true,
             steps: true,
             ..app_core::data::Capabilities::default()
+        }
+    }
+
+    fn boot_hw(&self) -> system_core::boot_console::BootHw {
+        system_core::boot_console::BootHw {
+            platform: "LILYGO T-WATCH ULTRA",
+            pmu: "AXP2101",
+            tasks: &[
+                ("IMU", "BHI260AP"),
+                ("HAPT", "DRV2605"),
+                ("LORA", "SX1262"),
+                ("NFC", "ST25R3916"),
+            ],
+            parked: &[
+                ("GPS", "MIA-M10Q"),
+                ("SPK", "MAX98357A"),
+                ("MIC", "T3902"),
+            ],
         }
     }
 

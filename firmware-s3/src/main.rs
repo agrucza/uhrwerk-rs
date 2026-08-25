@@ -174,6 +174,8 @@ impl Bringup for S3Bringup {
     async fn make_input(
         &mut self,
         i2c: &mut I2c<'static, Blocking>,
+        boot: &mut system_core::boot_console::BootConsole,
+        display: &mut Display<'static>,
     ) -> (TouchTaskState<'static>, BootButtonTaskState<'static>) {
         let mut touch_int = Input::new(
             self.touch_int.take().unwrap(),
@@ -192,6 +194,7 @@ impl Bringup for S3Bringup {
             i2c,
         )
         .await;
+        boot.log(display, "TOUCH", "FT3168").await;
         (touch, BootButtonTaskState::new(boot_btn))
     }
 
@@ -224,6 +227,8 @@ impl Bringup for S3Bringup {
     async fn make_sensors(
         &mut self,
         i2c: &mut I2c<'static, Blocking>,
+        boot: &mut system_core::boot_console::BootConsole,
+        display: &mut Display<'static>,
     ) -> (RtcTaskState<'static>, ImuTaskState<'static>) {
         let mut rtc_int = Input::new(
             self.rtc_int.take().unwrap(),
@@ -231,14 +236,25 @@ impl Bringup for S3Bringup {
         );
         let _ = rtc_int.wakeup_enable(true, WakeEvent::LowLevel);
         let rtc_state = RtcTaskState::init(Some(rtc_int), i2c);
+        boot.log(display, "RTC", "PCF85063").await;
         // The chip choice is the board's: QMI8658 behind the AnyImu
         // seam. Bring-up (reset, bias, self-tests) runs inside the
-        // shared IMU task, staged over the shared bus.
+        // shared IMU task, staged over the shared bus - its boot
+        // line comes from the task's `boot_report`.
         let imu = ImuTaskState::new(
             drivers::imu::AnyImu::Qmi8658(drivers::imu::QmiImu::new()),
             Input::new(self.imu_int1.take().unwrap(), InputConfig::default().with_pull(Pull::Down)),
         );
         (rtc_state, imu)
+    }
+
+    fn boot_hw(&self) -> system_core::boot_console::BootHw {
+        system_core::boot_console::BootHw {
+            platform: "ESP32-S3-TOUCH-AMOLED-2.06",
+            pmu: "AXP2101",
+            tasks: &[("IMU", "QMI8658")],
+            parked: &[("SPK", "ES8311"), ("MIC", "ES7210")],
+        }
     }
 
     fn make_rtc_ctrl(&mut self) -> esp_hal::rtc_cntl::Rtc<'static> {

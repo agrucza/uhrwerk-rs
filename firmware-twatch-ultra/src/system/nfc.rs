@@ -51,6 +51,7 @@ pub async fn nfc_task(
     // holding this line low).
     cs.set_high();
     if !set_rail(i2c_bus, true).await {
+        bus::boot_report("NFC", "RAIL FAIL");
         cs.set_low();
         // Release the wake lock BEFORE parking the task forever -
         // holding it here would silently disable hardware light
@@ -77,8 +78,14 @@ pub async fn nfc_task(
     let drv = St25r3916::new();
 
     match probe(&drv, &mut spi).await {
-        Ok(()) => log::info!("NFC: canary complete"),
-        Err(e) => log::error!("NFC: probe failed: {:?}", e),
+        Ok(()) => {
+            log::info!("NFC: canary complete");
+            bus::boot_report("NFC", "OK");
+        }
+        Err(e) => {
+            log::error!("NFC: probe failed: {:?}", e);
+            bus::boot_report("NFC", "FAIL");
+        }
     }
 
     // Teardown regardless of outcome: chip to power-down mode,

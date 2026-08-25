@@ -61,9 +61,13 @@ pub async fn lora_task(
     Timer::after(Duration::from_millis(10)).await;
 
     match canary(&drv, &mut spi, &mut busy).await {
-        Ok(()) => log::info!("LoRa: canary ok - SX1262 re-parked in cold sleep"),
+        Ok(()) => {
+            log::info!("LoRa: canary ok - SX1262 re-parked in cold sleep");
+            bus::boot_report("LORA", "OK");
+        }
         Err(e) => {
             log::error!("LoRa: canary failed: {:?}", e);
+            bus::boot_report("LORA", "FAIL");
             // Best effort: never leave the radio awake and burning.
             let _ = drv.set_sleep(
                 &mut spi,

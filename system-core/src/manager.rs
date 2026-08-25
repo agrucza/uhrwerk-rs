@@ -295,6 +295,12 @@ const SD_RECOVER_INTERVAL: Duration = Duration::from_secs(5);
 /// whose CPU load blows the card's busy-poll deadlines.
 const SD_BOOT_GRACE_END: Instant = Instant::from_secs(10);
 
+/// How long the boot console waits for the task-side hardware
+/// reports (`bus::boot_report`) before giving up on the stragglers.
+/// Sized past the slowest legitimate reporter: the NFC canary sleeps
+/// 5 s before it even starts, the BHI260 upload runs ~4 s.
+const BOOT_REPORT_BUDGET: Duration = Duration::from_secs(8);
+
 // `NAV_STACK_DEPTH` and the `NavStack` type live in
 // `app_core::nav` so the stack's push/pop semantics are
 // host-testable.
@@ -1584,18 +1590,29 @@ pub trait Bringup {
     }
 
     /// Touch + BOOT-button task states; also arms their wake GPIOs.
+    /// `boot`/`display`: the boot console, live at this point - the
+    /// bin prints its touch line (with the real probe result where
+    /// the driver reports one) at the moment the controller actually
+    /// comes up.
     async fn make_input(
         &mut self,
         i2c: &mut I2c<'static, Blocking>,
+        boot: &mut crate::boot_console::BootConsole,
+        display: &mut Display<'static>,
     ) -> (TouchTaskState<'static>, BootButtonTaskState<'static>);
 
     /// Persistent storage (flash, plus SD where the board has a slot).
     fn make_store(&mut self) -> crate::storage::Store<'static>;
 
-    /// RTC + IMU task states.
+    /// RTC + IMU task states. `boot`/`display`: the bin prints its
+    /// RTC line when the chip is up. The IMU is NOT printed here -
+    /// its bring-up runs inside the shared IMU task after spawn and
+    /// reports via `bus::boot_report` (declared in `BootHw::tasks`).
     async fn make_sensors(
         &mut self,
         i2c: &mut I2c<'static, Blocking>,
+        boot: &mut crate::boot_console::BootConsole,
+        display: &mut Display<'static>,
     ) -> (RtcTaskState<'static>, ImuTaskState<'static>);
 
     /// The esp-hal RTC controller (used for hardware light sleep).
@@ -1625,6 +1642,12 @@ pub trait Bringup {
     fn capabilities(&self) -> app_core::data::Capabilities {
         app_core::data::Capabilities::default()
     }
+
+    /// The attached-hardware inventory for the boot console: platform
+    /// name plus per-subsystem chip designators. Purely declarative -
+    /// the shared boot sequence in [`run`] owns the ordering and
+    /// pacing of the lines.
+    fn boot_hw(&self) -> crate::boot_console::BootHw;
 
     /// Hand over the WIFI peripheral token. `run` spawns the shared
     /// WiFi session task with it (the task is board-agnostic; the
@@ -1693,13 +1716,70 @@ pub async fn run<T: Bringup>(
         if loaded { "loaded" } else { "default (re-saved)" },
     );
 
-    let display = bringup.make_display(&config).await;
+    let mut display = bringup.make_display(&config).await;
     let fb_canvas = bringup.take_fb_canvas();
     let lcd_te = bringup.make_lcd_te();
-    let (touch, boot_button) = bringup.make_input(&mut i2c).await;
-    let (rtc_state, imu) = bringup.make_sensors(&mut i2c).await;
+
+    // Boot console. The panel is initialized but dark and its GRAM
+    // is random (datasheet 7.5.23): blank it, wait out the SLPOUT
+    // booster ramp (SLPOUT ran inside make_display; waiting the full
+    // ramp here is the safe bound), and light it early so the rest
+    // of bring-up plays as a live terminal log instead of seconds of
+    // black glass. Every line is real telemetry - the steps that ran
+    // before the display existed print as backlog.
+    let mut boot = crate::boot_console::BootConsole::new();
+    boot.clear_panel(&mut display).await;
+    Timer::after(crate::display::SLPOUT_BOOST).await;
+    crate::display::panel_on(
+        &mut display,
+        app_core::ui::types::DisplayState::Active,
+        &config.display,
+    )
+    .await;
+    let hw = bringup.boot_hw();
+    boot.title(&mut display, "UHRWERK OS").await;
+    boot.comment(&mut display, "// NIGHTWATCH SHELL").await;
+    boot.bar(&mut display, "BOOTING...").await;
+    boot.wide(&mut display, hw.platform).await;
+    let reset = match esp_hal::system::reset_reason() {
+        Some(r) => alloc::format!("{:?}", r).to_uppercase(),
+        None => alloc::string::String::from("UNKNOWN"),
+    };
+    boot.log(&mut display, "RESET", &reset).await;
+    boot.log(&mut display, "CFG", if loaded { "LOADED" } else { "DEFAULT" })
+        .await;
+    let fs_usage = store.usage();
+    let fs_line = alloc::format!(
+        "{} FILES / {} KB",
+        fs_usage.files,
+        fs_usage.total_bytes / 1024,
+    );
+    boot.log(&mut display, "FS", &fs_line).await;
+    boot.log(&mut display, "PWR", hw.pmu).await;
+    let dsp_line = alloc::format!("CO5300 {}x{}", WIDTH, HEIGHT);
+    boot.log(&mut display, "DSP", &dsp_line).await;
+
+    // Sync bring-up, narrated by the bins themselves: each prints
+    // its line (touch with the real probe result, RTC) at the moment
+    // that hardware actually comes up.
+    let (touch, boot_button) =
+        bringup.make_input(&mut i2c, &mut boot, &mut display).await;
+    let (rtc_state, imu) =
+        bringup.make_sensors(&mut i2c, &mut boot, &mut display).await;
 
     let initial_time = rtc_state.snapshot(&mut i2c);
+    let time_line = app_core::ui::fmt::hms_parts(
+        initial_time.hour as u64,
+        initial_time.minute as u64,
+        initial_time.second as u64,
+    );
+    boot.log(&mut display, "TIME", &time_line).await;
+    // Hardware that deliberately does not init at boot - named so
+    // the inventory stays complete without faking an init.
+    for (label, chip) in hw.parked {
+        let text = alloc::format!("{} PARKED", chip);
+        boot.log(&mut display, label, &text).await;
+    }
     let initial_power = power_state.snapshot(&mut i2c);
     power_state.dump_status(&mut i2c);
 
@@ -1759,19 +1839,60 @@ pub async fn run<T: Bringup>(
     #[cfg(feature = "wifi")]
     spawner.spawn(crate::wifi::wifi_task(bringup.take_wifi(), manager.store).unwrap());
 
-    // Boot reveal: the panel is initialized but dark (init_display
-    // stops before DISPON - power-on GRAM is random per datasheet
-    // 7.5.23, which showed as a green flash when lit unpainted).
-    // Paint the boot frame, then light it - the same frame-before-
-    // first-light rule as the wake path.
+    // Boot-console epilogue: the tasks spawned above bring up the
+    // remaining hardware themselves (the IMU's staged upload, the
+    // radio canaries, haptics) and report via `bus::boot_report`.
+    // Print a "<chip> ..." line per declared task, then wait -
+    // bounded - for the reports, rewriting each line as its hardware
+    // actually comes up. The backstop keeps a dead chip from parking
+    // boot forever; a line that never reported is marked instead of
+    // left spinning. Events piling into EVENTS during the wait are
+    // fine: the channel holds a multi-second idle boot's worth, and
+    // the loop below drains it as soon as the clock is up.
+    for (label, chip) in hw.tasks {
+        let busy = alloc::format!("{} ...", chip);
+        boot.log_begin(&mut manager.display, label, &busy).await;
+    }
+    let deadline = Instant::now() + BOOT_REPORT_BUDGET;
+    let mut seen = [false; 16];
+    let mut pending = hw.tasks.len().min(seen.len());
+    while pending > 0 {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let Ok(line) = with_timeout(
+            deadline - now,
+            crate::bus::BOOT_STATUS.receive(),
+        )
+        .await
+        else {
+            break;
+        };
+        let Some(idx) = hw.tasks.iter().position(|(l, _)| *l == line.label)
+        else {
+            continue;
+        };
+        if idx < seen.len() && !seen[idx] {
+            seen[idx] = true;
+            pending -= 1;
+        }
+        let text = alloc::format!("{} {}", hw.tasks[idx].1, line.status);
+        boot.log_set(&mut manager.display, line.label, &text).await;
+    }
+    for (idx, (label, chip)) in hw.tasks.iter().enumerate() {
+        if idx < seen.len() && !seen[idx] {
+            let text = alloc::format!("{} NO REPORT", chip);
+            boot.log_set(&mut manager.display, label, &text).await;
+        }
+    }
+    // Close the log, hold the bar a beat, then cut to the first real
+    // frame (`force_full_redraw` is still set from construction; the
+    // panel has been lit since early bring-up).
+    boot.bar(&mut manager.display, "BOOT COMPLETE").await;
+    Timer::after(Duration::from_millis(400)).await;
     manager.render().await;
     manager.sync_canvas();
-    crate::display::panel_on(
-        &mut manager.display,
-        app_core::ui::types::DisplayState::Active,
-        &manager.model.config().display,
-    )
-    .await;
 
     loop {
         manager.tick().await;

@@ -49,6 +49,35 @@ pub const EVENT_CHANNEL_SIZE: usize = 32;
 pub static EVENTS: Channel<CriticalSectionRawMutex, SystemEvent, EVENT_CHANNEL_SIZE> =
     Channel::new();
 
+/// One boot-console line from a task that initializes its hardware
+/// AFTER spawn (the IMU's staged bring-up, the radio canaries,
+/// haptics). `label` must match a `BootHw::tasks` entry declared by
+/// the bin - the boot sequence's bounded wait matches on it and
+/// rewrites that line's status.
+pub struct BootLine {
+    pub label: &'static str,
+    pub status: heapless::String<16>,
+}
+
+/// Queue for [`BootLine`]s. Written once per reporting task via
+/// [`boot_report`]; drained by the boot sequence's bounded wait.
+/// Reports landing after the wait gave up just sit here unread -
+/// harmless, the channel is boot-scoped by convention.
+pub static BOOT_STATUS: Channel<CriticalSectionRawMutex, BootLine, 8> = Channel::new();
+
+/// Report a task's hardware bring-up outcome to the boot console.
+/// Non-blocking and infallible from the task's view: over-long
+/// statuses truncate, a full channel drops the line.
+pub fn boot_report(label: &'static str, status: &str) {
+    let mut s = heapless::String::<16>::new();
+    for c in status.chars() {
+        if s.push(c).is_err() {
+            break;
+        }
+    }
+    let _ = BOOT_STATUS.try_send(BootLine { label, status: s });
+}
+
 /// Maximum number of tasks that can subscribe to [`SLEEP_WATCH`] at
 /// once. Bump this when adding a new subscriber beyond the current
 /// three (IMU, touch, power). Each subscriber consumes one slot

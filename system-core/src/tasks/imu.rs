@@ -188,6 +188,10 @@ pub async fn imu_task(bus: &'static SharedI2c, mut state: ImuTaskState<'static>)
             }
         }
     };
+    // Tell the boot console the chip is up (or not) - this is the
+    // moment the staged upload actually finished, seconds after
+    // spawn on hub chips.
+    crate::bus::boot_report("IMU", if ready { "OK" } else { "FAILED" });
 
     // Boot self-tests, through the seam's staged path for every
     // chip.
