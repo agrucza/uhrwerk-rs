@@ -9,6 +9,14 @@ path  = "src/main.rs"
 test  = false
 bench = false
 
+[features]
+default = ["wifi"]
+# The WiFi session layer (system-core's wifi task + esp-radio init).
+# `--no-default-features` builds a radio-dead image: nothing ever
+# calls esp-radio's init, so the radio hardware stays unpowered.
+# That is the single-variable lever for standing-current soak A/Bs.
+wifi = ["system-core/wifi"]
+
 # Firmware crate for the ESP32-C6-Touch-AMOLED-2.06 board.
 #
 # Bring-up is incremental and mirrors the S3 init structure in `firmware/`:
@@ -75,7 +83,7 @@ drivers      = { path = "../drivers", default-features = false, features = [
     "display", "qmi8658", "pmu", "rtc", "touch", "es8311", "es7210", "sdcard",
 ] }
 firmware-hal = { path = "../firmware-hal" }
-system-core  = { path = "../system-core", features = ["wifi"] }
+system-core  = { path = "../system-core" }
 # Config-first boot: `make_display` receives the loaded settings
 # tree, so this bin names `app_core::config::Config` directly (its
 # siblings already declare app-core for `capabilities()`).

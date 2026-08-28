@@ -162,11 +162,38 @@ impl Es7210 {
         self.write(i2c, REG_RESET, 0x41)
     }
 
+    /// Power the ADC down to its datasheet power-down state
+    /// (datasheet "Power Down Mode": ~10 uA). REG4B/4C set every
+    /// per-channel block to its documented power-down bit (MICBIAS,
+    /// mic reference, PGA, ADC, state machines), bias levels zero,
+    /// and REG40 sets PDN_ANA. The digital core loses MCLK when the
+    /// session's I2S drops, so no clock gating is needed on top.
+    ///
+    /// The chip is external: SoC light sleep cannot gate it, and
+    /// left configured it holds mic bias + four ADC channels live
+    /// from the always-on rail indefinitely. Recovery is the full
+    /// three-step init - which is how every audio session already
+    /// starts.
+    pub fn power_down<I: I2c>(&self, i2c: &mut I) -> Result<(), I::Error> {
+        self.write(i2c, REG_MIC12_POWER, 0xFF)?; // bias/ref/PGA/ADC 1+2 down
+        self.write(i2c, REG_MIC34_POWER, 0xFF)?; // 3+4 down (defensive)
+        self.write(i2c, REG_MIC12_BIAS, 0x00)?;  // bias level off
+        self.write(i2c, REG_MIC34_BIAS, 0x00)?;
+        self.write(i2c, REG_ANALOG, 0x80)        // PDN_ANA = 1
+    }
+
     /// Set microphone gain for MIC1 and MIC2.
     pub fn set_gain<I: I2c>(&self, i2c: &mut I, gain: MicGain) -> Result<(), I::Error> {
         let val = 0x10 | (gain as u8); // bit4 = enable
         self.write(i2c, REG_MIC1_GAIN, val)?;
         self.write(i2c, REG_MIC2_GAIN, val)
+    }
+
+    /// Read a single register.
+    pub fn read_reg<I: I2c>(&self, i2c: &mut I, reg: u8) -> Result<u8, I::Error> {
+        let mut buf = [0u8; 1];
+        i2c.write_read(ADDR, &[reg], &mut buf)?;
+        Ok(buf[0])
     }
 
     fn write<I: I2c>(&self, i2c: &mut I, reg: u8, val: u8) -> Result<(), I::Error> {

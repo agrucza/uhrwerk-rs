@@ -13,6 +13,14 @@ bench = false
 # region geometry is a constant in `board.rs`, passed into the shared
 # `system_core::flash_fs` at construction - not a cfg feature.
 
+[features]
+default = ["wifi"]
+# The WiFi session layer (system-core's wifi task + esp-radio init).
+# `--no-default-features` builds a radio-dead image: nothing ever
+# calls esp-radio's init, so the radio hardware stays unpowered.
+# That is the single-variable lever for standing-current soak A/Bs.
+wifi = ["system-core/wifi"]
+
 [dependencies]
 # --- Espressif bootloader descriptor (required by espflash to verify the image) ---
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
@@ -76,7 +84,7 @@ embedded-hal-bus   = { version = "0.3.0" }
 app-core     = { path = "../app-core",     features = ["serde"] }
 drivers      = { path = "../drivers",      features = ["display", "qmi8658", "pmu", "rtc", "touch", "sdcard", "es8311", "es7210"] }
 firmware-hal = { path = "../firmware-hal", features = ["psram-fb"] }
-system-core  = { path = "../system-core", features = ["wifi"] }
+system-core  = { path = "../system-core" }
 
 embedded-graphics-core = { workspace = true }
 embedded-graphics      = "0.8.2"

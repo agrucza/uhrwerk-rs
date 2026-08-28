@@ -55,6 +55,7 @@ struct C6Bringup {
     lpwr: Option<p::LPWR<'static>>,
     // WiFi radio token, handed to the shared session task via
     // `take_wifi` (see system-core's wifi module).
+    #[cfg(feature = "wifi")]
     wifi: Option<p::WIFI<'static>>,
     // Audio - full-duplex (speaker TX + mic RX share one I2S).
     i2s0: Option<p::I2S0<'static>>,
@@ -228,6 +229,7 @@ impl Bringup for C6Bringup {
         esp_hal::rtc_cntl::Rtc::new(self.lpwr.take().unwrap())
     }
 
+    #[cfg(feature = "wifi")]
     fn take_wifi(&mut self) -> p::WIFI<'static> {
         self.wifi.take().unwrap()
     }
@@ -355,6 +357,65 @@ async fn codec_init(i2c_bus: &'static system_core::bus::SharedI2c) {
     }
 }
 
+/// Session-end counterpart to [`codec_init`], passed to `run_session`
+/// as its `teardown_hw` future: both codec chips into their datasheet
+/// power-down states. They hang on ALDO1, which is never turned off
+/// (the touch controller shares it) and survives warm reboots - so
+/// chip-level power-down is the only tool, and skipping it leaves DAC
+/// bias + mic bias + ADC channels drawing standing current through
+/// every light sleep until the battery dies (hardware-measured
+/// 2026-08-26 on the S3 sibling: one mic test armed it, an 11 h soak
+/// burned 80 %). MUST run while the session's clocks are still up -
+/// see the hook's call site in `run_session` for the ordering
+/// evidence. The next session's `codec_init` starts from full reset,
+/// so nothing is lost.
+///
+/// The readback line is the on-hardware verification that the writes
+/// latched: expected `ES8311[0D]=FA [12]=02 ES7210[4B]=FF [40]=80`.
+/// Visible on a plugged-in serial session (codec state is
+/// independent of sleep, so this needs no battery run to check).
+async fn codec_power_down(i2c_bus: &'static system_core::bus::SharedI2c) {
+    let es8311 = drivers::es8311::Es8311::new();
+    let es7210 = drivers::es7210::Es7210::new();
+    let mut i2c = i2c_bus.lock().await;
+    if es8311.power_down(&mut *i2c).is_err() {
+        log::warn!("Audio: ES8311 power-down failed");
+    }
+    if es7210.power_down(&mut *i2c).is_err() {
+        log::warn!("Audio: ES7210 power-down failed");
+    }
+    let rb = (
+        es8311.read_reg(&mut *i2c, 0x0D).unwrap_or(0),
+        es8311.read_reg(&mut *i2c, 0x12).unwrap_or(0),
+        es7210.read_reg(&mut *i2c, 0x4B).unwrap_or(0),
+        es7210.read_reg(&mut *i2c, 0x40).unwrap_or(0),
+    );
+    log::info!(
+        "Audio: codec pd readback ES8311[0D]={:02X} [12]={:02X} ES7210[4B]={:02X} [40]={:02X}",
+        rb.0, rb.1, rb.2, rb.3,
+    );
+}
+
+/// One-shot codec state line at boot, before any session has touched
+/// the chips. The codecs hang on ALDO1 and keep their registers
+/// across warm reboots, so after a soak night a reset with the
+/// monitor attached prints whether they actually stayed powered down
+/// (`ES8311[0D]=FA [12]=02 ES7210[4B]=FF [40]=80`); a battery that
+/// died overnight shows the chips' power-on defaults instead. Reads
+/// only - codec state is left untouched. 0xEE marks a failed read.
+async fn codec_boot_readback(i2c_bus: &'static system_core::bus::SharedI2c) {
+    let es8311 = drivers::es8311::Es8311::new();
+    let es7210 = drivers::es7210::Es7210::new();
+    let mut i2c = i2c_bus.lock().await;
+    log::info!(
+        "Audio: codec boot readback ES8311[0D]={:02X} [12]={:02X} ES7210[4B]={:02X} [40]={:02X}",
+        es8311.read_reg(&mut *i2c, 0x0D).unwrap_or(0xEE),
+        es8311.read_reg(&mut *i2c, 0x12).unwrap_or(0xEE),
+        es7210.read_reg(&mut *i2c, 0x4B).unwrap_or(0xEE),
+        es7210.read_reg(&mut *i2c, 0x40).unwrap_or(0xEE),
+    );
+}
+
 /// Audio dispatch loop. Owns the board-specific peripheral tokens and
 /// the cross-session state (amp, tone-phase counter),
 /// and reborrows the tokens into a fresh `run_session` for each
@@ -384,6 +445,7 @@ async fn audio_task(
 
     let mut amp = SpeakerAmp::new(pa);
     amp.disable();
+    codec_boot_readback(i2c_bus).await;
     let mut phase: u32 = 0;
     // A command consumed by a session's inner loop that the dispatcher
     // must still act on (e.g. a StartCapture that interrupted a
@@ -425,6 +487,7 @@ async fn audio_task(
             &mut phase,
             tune_i2s,
             codec_init(i2c_bus),
+            codec_power_down(i2c_bus),
         )
         .await;
     }
@@ -586,6 +649,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         imu_int1: Some(peripherals.GPIO16),
         flash: Some(peripherals.FLASH),
         lpwr: Some(peripherals.LPWR),
+        #[cfg(feature = "wifi")]
         wifi: Some(peripherals.WIFI),
         i2s0: Some(peripherals.I2S0),
         dma_ch1: Some(peripherals.DMA_CH1),

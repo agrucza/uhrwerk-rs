@@ -27,9 +27,12 @@ const REG_SYS0E:    u8 = 0x0E; // PGA / ADC modulator power
 const REG_SYS12:    u8 = 0x12; // DAC power
 const REG_SYS13:    u8 = 0x13; // HP driver select
 const REG_SYS14:    u8 = 0x14; // mic input / PGA gain
+const REG_ADC15:    u8 = 0x15; // ADC ramp rate / auto-mute
+const REG_ADC17:    u8 = 0x17; // ADC volume
 const REG_ADC1C:    u8 = 0x1C; // ADC EQ bypass / HPF
 const REG_DAC_VOL:  u8 = 0x32; // DAC volume
 const REG_DAC_EQ:   u8 = 0x37; // DAC EQ bypass / ramp rate
+const REG_GP45:     u8 = 0x45; // GP control
 
 pub struct Es8311;
 
@@ -120,6 +123,30 @@ impl Es8311 {
         self.write(i2c, REG_DAC_VOL, 0xBF)?;
 
         Ok(())
+    }
+
+    /// Power the codec down to its suspend state: DAC/ADC muted,
+    /// PGA + ADC modulator down (REG0E all PDN bits), DAC down
+    /// (REG12), mic input off, and REG0D = 0xFA - per the datasheet
+    /// bit map that is PDN_ANA, PDN_IBIASGEN, PDN_ADCBIASGEN,
+    /// PDN_ADCVREFGEN, PDN_DACVREFGEN set and the internal reference
+    /// disabled. Sequence is the Espressif reference driver's
+    /// `es8311_suspend`.
+    ///
+    /// The chip is external: SoC light sleep cannot gate it, and
+    /// left configured it holds its analog blocks biased from the
+    /// always-on rail indefinitely. Recovery is a full [`Self::init`]
+    /// cycle - which is how every audio session already starts.
+    pub fn power_down<I: I2c>(&self, i2c: &mut I) -> Result<(), I::Error> {
+        self.write(i2c, REG_DAC_VOL, 0x00)?; // mute DAC (-95.5 dB)
+        self.write(i2c, REG_ADC17, 0x00)?;   // mute ADC
+        self.write(i2c, REG_SYS0E, 0xFF)?;   // PGA + ADC modulator down
+        self.write(i2c, REG_SYS12, 0x02)?;   // DAC down
+        self.write(i2c, REG_SYS14, 0x00)?;   // mic input off
+        self.write(i2c, REG_SYS0D, 0xFA)?;   // analog + bias + refs down
+        self.write(i2c, REG_ADC15, 0x00)?;   // ADC ramp reset
+        self.write(i2c, REG_DAC_EQ, 0x08)?;  // DAC ramp default
+        self.write(i2c, REG_GP45, 0x01)      // GP low-power state
     }
 
     /// Set DAC output volume.

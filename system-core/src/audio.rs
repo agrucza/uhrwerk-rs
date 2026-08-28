@@ -1030,6 +1030,7 @@ pub async fn run_session<'d>(
     phase: &mut u32,
     tune_i2s: fn(),
     init_hw: impl core::future::Future<Output = ()>,
+    teardown_hw: impl core::future::Future<Output = ()>,
 ) -> Option<AudioCommand> {
     log::info!("Audio: session {:?}", mode);
     // The whole session holds the wake lock: hardware light sleep
@@ -1148,6 +1149,16 @@ pub async fn run_session<'d>(
             play_clip_until_done(&mut tx, &mut rx, amp, &mut buf).await
         }
     };
+
+    // The bin's hardware teardown hook, awaited at exactly this
+    // point for the same reason `init_hw` runs where it does: the
+    // clocks are STILL RUNNING (tx/rx are alive below). The vendor
+    // stack orders codec suspend before I2S stop; powering down
+    // after the transfer drop was tried 2026-08-26 and the boards
+    // measurably kept leaking, consistent with the codecs needing
+    // MCLK to act on the power-down writes (they demonstrably need
+    // it to act on configuration - see `init_hw` above).
+    teardown_hw.await;
 
     // tx and rx drop here. That cascades through the type stack: each
     // transfer's drop releases its I2sTx / I2sRx; those release the
