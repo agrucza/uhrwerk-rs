@@ -44,9 +44,18 @@ pub trait Board {
     /// Stop the haptic motor. Boards without one: no-op.
     fn buzz_stop(&mut self);
 
-    /// Power the board off. Either releases a soft-power latch or
-    /// hands off to a PMU that manages long-press shutdown itself.
-    fn shutdown(&mut self);
+    /// Power the board off, for firmware-initiated shutdowns (the
+    /// settings item, the low-battery cutoff) - releases a
+    /// soft-power latch or writes the PMU's soft power-off. Must
+    /// actually kill power: the manager stops writing flash before
+    /// calling this and does not expect to keep running. The PMU's
+    /// own long-press shutdown is separate and stays PMU-internal.
+    /// Called with the bus lock held - keep it to the power-off
+    /// transaction.
+    fn shutdown(
+        &mut self,
+        i2c: &mut esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>,
+    );
 
     /// Arm this board's hardware wake sources, synchronously, right
     /// before the manager enters light sleep. The manager owns *when*

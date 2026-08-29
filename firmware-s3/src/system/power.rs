@@ -124,10 +124,24 @@ impl<'d> Board for PowerControls<'d> {
         self.motor.set_low();
     }
 
-    /// Release the SYS_OUT latch - powers down the board.
-    fn shutdown(&mut self) {
-        log::info!("PWR: releasing SYS_OUT latch - powering off");
+    /// Release the SYS_OUT latch, then AXP2101 soft power-off
+    /// (REG 10h bit 0). The latch release alone was bench-measured
+    /// 2026-08-29 NOT to power the board down (UI kept running) -
+    /// the rails are AXP-driven on this board too (init enables
+    /// them all), so the PMU write is what actually cuts power,
+    /// same as the C6 and T-Watch. The latch release stays first:
+    /// it's this board's documented soft-power hold, and with the
+    /// AXP off it must not re-latch the rail on.
+    fn shutdown(
+        &mut self,
+        i2c: &mut esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>,
+    ) {
+        log::info!("PWR: SYS_OUT release + AXP2101 soft power-off");
         self.sys_out.set_high();
+        let pmu = Pmu::new(PmuConfig::default());
+        if pmu.soft_power_off(i2c).is_err() {
+            log::error!("PWR: AXP2101 soft power-off write failed");
+        }
     }
 
     /// Re-arm GPIO wake for touch_int(38), boot_btn(0), and

@@ -281,6 +281,11 @@ pub struct SystemManager<'d, B: Board> {
     /// (ticks fire per event; the expander read must not run at
     /// touch-drag rate).
     last_sd_detect_check: Option<Instant>,
+
+    /// Consecutive PMU readings below [`LOW_BATT_SHUTDOWN_MV`] while
+    /// on battery. Reaching [`LOW_BATT_CONFIRM_READS`] triggers the
+    /// clean shutdown in [`Self::check_low_battery`].
+    low_batt_reads: u8,
 }
 
 /// How often the tick loop will retry an SD probe when the mirror
@@ -300,6 +305,23 @@ const SD_BOOT_GRACE_END: Instant = Instant::from_secs(10);
 /// Sized past the slowest legitimate reporter: the NFC canary sleeps
 /// 5 s before it even starts, the BHI260 upload runs ~4 s.
 const BOOT_REPORT_BUDGET: Duration = Duration::from_secs(8);
+
+/// Battery voltage below which the system powers itself off instead
+/// of running into the cell's knee. The firmware otherwise keeps
+/// writing flash at collapsing voltage - interrupted writes at the
+/// floor are the prime suspect for the S3's ROM-level "invalid
+/// header" boot loop after a drained night (2026-08-28). 3400 mV
+/// rests a few percent above empty: the 08-27/29 soak logs show
+/// ~3.65 V to dead taking under 90 min, and both boards logging
+/// mid-write until ~3.2 V.
+const LOW_BATT_SHUTDOWN_MV: u16 = 3400;
+
+/// Consecutive sub-threshold readings required before the cutoff
+/// fires. A single reading can be load sag from a wake burst;
+/// readings arrive every 500 ms awake / 5 s asleep, so confirmation
+/// costs 1.5-15 s at a voltage where the battery still has tens of
+/// minutes left.
+const LOW_BATT_CONFIRM_READS: u8 = 3;
 
 // `NAV_STACK_DEPTH` and the `NavStack` type live in
 // `app_core::nav` so the stack's push/pop semantics are
@@ -446,6 +468,7 @@ impl<B: Board> SystemManager<'static, B> {
             last_storage_usage: initial_usage,
             last_sd_recover_attempt: None,
             last_sd_detect_check: None,
+            low_batt_reads: 0,
         };
 
         let bundle = TaskBundle {
@@ -586,7 +609,8 @@ impl<B: Board> SystemManager<'static, B> {
                 Effect::WifiStopServer => crate::bus::WIFI_STOP.signal(()),
                 Effect::Shutdown => {
                     log::info!("System: shutdown requested");
-                    self.board.shutdown();
+                    let mut i2c = self.i2c_bus.lock().await;
+                    self.board.shutdown(&mut i2c);
                 }
                 Effect::FactoryReset => {
                     log::info!("factory reset: wiping flash + SD mirror");
@@ -1007,6 +1031,69 @@ impl<B: Board> SystemManager<'static, B> {
         if was_sleeping && !self.model.sleeping() {
             log::info!("system: wake cause: {:?}", event);
         }
+
+        // Low-battery cutoff - every PMU snapshot passes through
+        // here, awake (500 ms cadence) and asleep (5 s), so this is
+        // the one place that sees the battery no matter the state.
+        if let SystemEvent::PowerUpdated { data } = &event {
+            self.check_low_battery(data).await;
+        }
+    }
+
+    /// Clean low-battery shutdown: [`LOW_BATT_CONFIRM_READS`]
+    /// consecutive readings under [`LOW_BATT_SHUTDOWN_MV`] while on
+    /// battery write one final `lowbatt` log line, show a notice if
+    /// the panel is lit, and hand the system to the PMU's power-off.
+    /// Powered off, the AXP still charges and the button still
+    /// boots, so a plug-in brings the watch straight back - what it
+    /// never does again is write flash into brownout.
+    ///
+    /// VBUS present resets the counter: charging raises the voltage
+    /// anyway, and powering off mid-charge would fight the user.
+    async fn check_low_battery(&mut self, power: &app_core::data::PowerData) {
+        let below = !power.vbus_good
+            && power.battery_present
+            && power
+                .battery_voltage_mv
+                .is_some_and(|mv| mv < LOW_BATT_SHUTDOWN_MV);
+        if !below {
+            self.low_batt_reads = 0;
+            return;
+        }
+        self.low_batt_reads = self.low_batt_reads.saturating_add(1);
+        // `!=`, not `<`: the counter keeps saturating upward on the
+        // readings after the cutoff fires, so the whole sequence
+        // (log line, notice, power-off) runs exactly once per
+        // below-threshold episode - a shutdown that fails must not
+        // loop the notice and hammer the log (observed on the C6
+        // bench test while its `shutdown()` was still a no-op).
+        if self.low_batt_reads != LOW_BATT_CONFIRM_READS {
+            return;
+        }
+
+        let mv = power.battery_voltage_mv.unwrap_or(0);
+        log::warn!("power: battery at {} mV - clean shutdown", mv);
+        {
+            let mut store = self.store.lock().await;
+            crate::event_log::log_diag(
+                &mut *store,
+                &self.model.cached_data().time,
+                "lowbatt",
+                Some(mv as u32),
+                None,
+            );
+        }
+        // Flash is done - nothing below writes the store again.
+
+        if !self.model.sleeping() {
+            let mut console = crate::boot_console::BootConsole::new();
+            console.clear_panel(&mut self.display).await;
+            console.title(&mut self.display, "BATTERY EMPTY").await;
+            console.comment(&mut self.display, "POWERING OFF").await;
+            Timer::after(Duration::from_millis(1500)).await;
+        }
+        let mut i2c = self.i2c_bus.lock().await;
+        self.board.shutdown(&mut i2c);
     }
 
     /// Run one iteration of the main event loop.

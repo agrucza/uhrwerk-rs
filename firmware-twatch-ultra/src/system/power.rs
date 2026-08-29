@@ -301,10 +301,20 @@ impl Board for TwatchUltraBoard {
         }
     }
 
-    /// No soft-power latch: the AXP2101 handles long-press (6 s)
-    /// shutdown internally. Nothing for firmware to do.
-    fn shutdown(&mut self) {
-        log::info!("PWR: shutdown is AXP2101-managed on this board (no-op)");
+    /// AXP2101 soft power-off (REG 10h bit 0) - kills every rail.
+    /// The PMU's long-press (6 s) shutdown is separate and stays
+    /// PMU-internal; this is the firmware-initiated path (settings
+    /// shutdown, low-battery cutoff), which was a no-op here until
+    /// the 2026-08-29 C6 bench test showed nothing powering off.
+    fn shutdown(
+        &mut self,
+        i2c: &mut esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>,
+    ) {
+        log::info!("PWR: AXP2101 soft power-off");
+        let pmu = Pmu::new(PmuConfig::default());
+        if pmu.soft_power_off(i2c).is_err() {
+            log::error!("PWR: AXP2101 soft power-off write failed");
+        }
     }
 
     /// Re-arm GPIO wake for BOOT (0), RTC INT (1), PMU IRQ (7) and
