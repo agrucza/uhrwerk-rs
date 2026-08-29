@@ -281,10 +281,6 @@ pub struct SystemManager<'d, B: Board> {
     /// (ticks fire per event; the expander read must not run at
     /// touch-drag rate).
     last_sd_detect_check: Option<Instant>,
-
-    // TEMPORARY - the sleep-drain probe accumulator, see the
-    // `SleepProbe` docs. Remove with the probe.
-    probe: SleepProbe,
 }
 
 /// How often the tick loop will retry an SD probe when the mirror
@@ -304,33 +300,6 @@ const SD_BOOT_GRACE_END: Instant = Instant::from_secs(10);
 /// Sized past the slowest legitimate reporter: the NFC canary sleeps
 /// 5 s before it even starts, the BHI260 upload runs ~4 s.
 const BOOT_REPORT_BUDGET: Duration = Duration::from_secs(8);
-
-// ---- TEMPORARY sleep-drain probe (2026-08-26) -------------------------------
-// Measures where per-heartbeat awake time goes on battery: S3/C6
-// showed ~1140/535 ms of awake time per 5 s cycle vs the T-Watch's
-// ~260 ms floor (ACTIVE on the battery screen = embassy time, which
-// pauses in light sleep, so awake-per-cycle = ACTIVE / SLEEPS).
-// Accumulates per-cycle phase timings; every [`PROBE_WINDOW`] cycles
-// one serial line + `pb*` event-log lines are written (flash
-// survives an unplugged run - the VBUS hold means the sleep loop
-// never runs while a host is attached). UI-wake cycles pollute the
-// drain bucket slightly; the measurement run is unattended, so they
-// are ~absent. REMOVE with the investigation.
-const PROBE_WINDOW: u32 = 60;
-
-#[derive(Default)]
-struct SleepProbe {
-    /// Embassy instant right after the previous `rtc.sleep()`
-    /// returned - the start of the awake gap the next cycle's
-    /// `total` measures.
-    last_sleep_exit: Option<Instant>,
-    /// Phase sums in us: [0] total awake gap, [1] pre-sleep hooks,
-    /// [2] pre-sleep settle, [3] rtc reads + wdt + cause, [4] the
-    /// `rtc.sleep()` call (awake part), [5] post-wake settle,
-    /// [6] woke log line, [7] post-wake drain, [8] summary tail.
-    sums_us: [u64; 9],
-    cycles: u32,
-}
 
 // `NAV_STACK_DEPTH` and the `NavStack` type live in
 // `app_core::nav` so the stack's push/pop semantics are
@@ -477,7 +446,6 @@ impl<B: Board> SystemManager<'static, B> {
             last_storage_usage: initial_usage,
             last_sd_recover_attempt: None,
             last_sd_detect_check: None,
-            probe: SleepProbe::default(),
         };
 
         let bundle = TaskBundle {
@@ -839,9 +807,6 @@ impl<B: Board> SystemManager<'static, B> {
             GpioWakeupSource, RtcSleepConfig, TimerWakeupSource,
         };
 
-        // TEMPORARY probe timestamp (phase boundaries; see SleepProbe).
-        let t0 = Instant::now();
-
         // Board-elected sleep watchdog, armed FIRST: the LP watchdog
         // counts on the slow clock in the low-power domain, so it
         // keeps running through light sleep AND through any hang on
@@ -935,8 +900,6 @@ impl<B: Board> SystemManager<'static, B> {
         // alarm programming in TimerWakeupSource can't latch before
         // the CPU gates off and timer wake never fires.
         self.board.set_cpu_freq(CpuFreq::Mhz80);
-        let t1 = Instant::now();
-        self.probe.sums_us[1] += (t1 - t0).as_micros();
 
         // Settle delay before sleep - lets the slow-clock alarm
         // writes latch into the RTC domain before the CPU gates
@@ -944,8 +907,6 @@ impl<B: Board> SystemManager<'static, B> {
         // example; shorter values have been observed to miss wake.
         let delay = Delay::new();
         delay.delay_millis(100);
-        let t2 = Instant::now();
-        self.probe.sums_us[2] += (t2 - t1).as_micros();
 
         // Diagnostic probe: how long the chip actually slept, off
         // the RTC-domain clock (which keeps counting through light
@@ -956,18 +917,7 @@ impl<B: Board> SystemManager<'static, B> {
         // `rtc_now_us`) - the plain read right after `rtc.sleep()`
         // returns the PRE-sleep latch and fakes a 0 ms sleep.
         let entered_us = self.rtc_now_us();
-        // TEMPORARY probe: t3 closes the awake gap that began at the
-        // previous cycle's sleep exit - the per-cycle total ACTIVE
-        // accrual everything else must add up to.
-        let t3 = Instant::now();
-        self.probe.sums_us[3] += (t3 - t2).as_micros();
-        if let Some(prev) = self.probe.last_sleep_exit {
-            self.probe.sums_us[0] += (t3 - prev).as_micros();
-        }
         self.rtc.sleep(&config, &[&gpio_wake, &timer_wake]);
-        let t4 = Instant::now();
-        self.probe.sums_us[4] += (t4 - t3).as_micros();
-        self.probe.last_sleep_exit = Some(t4);
         if sleep_wdt.is_some() {
             self.rtc.rwdt.disable();
         }
@@ -981,8 +931,6 @@ impl<B: Board> SystemManager<'static, B> {
         // chip-specific (and esp-hal's `wakeup_cause()` only works
         // for deep sleep; see the hook's doc).
         let wake_cause = self.board.wake_cause_raw();
-        let t5 = Instant::now();
-        self.probe.sums_us[3] += (t5 - t4).as_micros();
 
         // Post-wake settle delay. USB-Serial-JTAG in particular loses
         // the first ~tens of ms of output after light-sleep wake
@@ -992,8 +940,6 @@ impl<B: Board> SystemManager<'static, B> {
         // power but makes on-device debugging usable; drop or shrink
         // once we're confident this is shipping.
         delay.delay_millis(100);
-        let t6 = Instant::now();
-        self.probe.sums_us[5] += (t6 - t5).as_micros();
 
         // NOTE: printed this close to the wake, this line is often
         // eaten by the USB-Serial-JTAG resync blackout - the tick
@@ -1005,7 +951,6 @@ impl<B: Board> SystemManager<'static, B> {
             wake_cause,
             slept_ms,
         );
-        self.probe.sums_us[6] += t6.elapsed().as_micros();
         (wake_cause, slept_ms)
     }
 
@@ -1207,8 +1152,6 @@ impl<B: Board> SystemManager<'static, B> {
         }
         let (wake_cause, slept_ms) = self.enter_light_sleep().await;
         let gpio_wake = wake_cause & Self::WAKE_CAUSE_GPIO != 0;
-        // TEMPORARY probe: drain bucket starts here.
-        let td = Instant::now();
 
         // Kick the RTC task to check for an alarm / timer flag
         // latched while we slept. Boards with no RTC INT line (the
@@ -1245,10 +1188,6 @@ impl<B: Board> SystemManager<'static, B> {
         if gpio_wake && self.model.sleeping() {
             self.handle_event(SystemEvent::WakeInterrupt).await;
         }
-        // TEMPORARY probe: drain done, tail (diag delay + summary
-        // log) begins.
-        let tt = Instant::now();
-        self.probe.sums_us[7] += (tt - td).as_micros();
 
         // Late re-log of the wake diagnostics: by now any wake
         // transition has run and the USB host has resynced, so
@@ -1284,41 +1223,6 @@ impl<B: Board> SystemManager<'static, B> {
             self.pending_wake_summary =
                 Some((self.sleep_cycles, wake_cause, slept_ms));
         }
-
-        // TEMPORARY probe: close the cycle, flush the window.
-        self.probe.sums_us[8] += tt.elapsed().as_micros();
-        self.probe.cycles += 1;
-        if self.probe.cycles >= PROBE_WINDOW {
-            self.flush_probe().await;
-        }
-    }
-
-    /// TEMPORARY probe flush: one serial line + `pb*` event-log
-    /// lines per window (flash survives the unplugged run), then
-    /// reset. Values are whole-window ms sums; divide by `n` for
-    /// per-cycle averages. `tot` is the full awake gap between
-    /// consecutive `rtc.sleep()` calls - the buckets plus untracked
-    /// loop overhead must add up to it. Remove with the probe.
-    async fn flush_probe(&mut self) {
-        let ms: [u32; 9] =
-            core::array::from_fn(|i| (self.probe.sums_us[i] / 1000) as u32);
-        let n = self.probe.cycles;
-        log::info!(
-            "probe: n={} tot={} hooks={} settle1={} io={} slpcall={} \
-             settle2={} wokelog={} drain={} tail={} (ms/window)",
-            n, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7], ms[8],
-        );
-        let time = self.model.cached_data().time;
-        {
-            let mut store = self.store.lock().await;
-            crate::event_log::log_diag(&mut *store, &time, "pbtot", Some(ms[0]), Some(n));
-            crate::event_log::log_diag(&mut *store, &time, "pbhks", Some(ms[1]), Some(ms[2]));
-            crate::event_log::log_diag(&mut *store, &time, "pbios", Some(ms[3]), Some(ms[4]));
-            crate::event_log::log_diag(&mut *store, &time, "pbs2w", Some(ms[5]), Some(ms[6]));
-            crate::event_log::log_diag(&mut *store, &time, "pbdrt", Some(ms[7]), Some(ms[8]));
-        }
-        self.probe.sums_us = [0; 9];
-        self.probe.cycles = 0;
     }
 
     /// One awake pass: wait for events with an idle-tick heartbeat
