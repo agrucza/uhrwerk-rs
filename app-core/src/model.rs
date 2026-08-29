@@ -344,14 +344,19 @@ impl Model {
         // which just wakes).
         if self.sleeping && events::is_wake_source(event) {
             self.wake(now, &mut out);
-            // WoM and the manager's synthesized GPIO wake carry no
-            // payload for a screen - they only wake. Nothing human
-            // is confirmed behind them either, so the wake stays
+            // WoM, the manager's synthesized GPIO wake, and USB
+            // power appearing carry no payload for a screen - they
+            // only wake. Nothing human is confirmed behind them
+            // either (a dock glance included), so the wake stays
             // provisional: without user activity inside the grace
-            // window, `tick` re-enters sleep.
+            // window, `tick` re-enters sleep. On the charger that
+            // costs only the display - VBUS already holds hardware
+            // sleep off.
             if matches!(
                 event,
-                SystemEvent::WakeOnMotion | SystemEvent::WakeInterrupt
+                SystemEvent::WakeOnMotion
+                    | SystemEvent::WakeInterrupt
+                    | SystemEvent::VbusInserted
             ) {
                 self.motion_wake_grace = Some(now + MOTION_WAKE_GRACE);
                 return out;

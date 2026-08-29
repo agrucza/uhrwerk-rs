@@ -1250,6 +1250,13 @@ impl<B: Board> SystemManager<'static, B> {
         // cleared exactly once, whichever path reaches it first.
         RTC_COMMAND.signal(RtcCommand::Poll);
 
+        // Same treatment for the power task - its poll timer is
+        // also embassy-timed and frozen across light sleep. One
+        // PMU poll per heartbeat keeps battery readings and VBUS
+        // detection on wall time; the low-battery cutoff and the
+        // plug-in screen wake both ride those readings.
+        crate::bus::PMU_POLL.signal(());
+
         // CPU just woke. The wake-source ISR marked its owning
         // task ready but the task hasn't run yet, so `try_receive`
         // here would race ahead of it. Wait with a short timeout

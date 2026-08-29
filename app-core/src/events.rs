@@ -348,13 +348,15 @@ pub fn is_user_activity(event: &SystemEvent) -> bool {
 
 /// Returns `true` if the event is a non-user wake source:
 /// something that should bring the device out of sleep even
-/// though no one touched it. Covers IMU wake-on-motion and RTC
-/// alarm / countdown-timer expiries.
+/// though no one touched it. Covers IMU wake-on-motion, RTC
+/// alarm / countdown-timer expiries, and USB power appearing
+/// (docking is deliberate - light the screen to acknowledge it).
 pub fn is_wake_source(event: &SystemEvent) -> bool {
     matches!(
         event,
         SystemEvent::WakeOnMotion
             | SystemEvent::WakeInterrupt
+            | SystemEvent::VbusInserted
             | SystemEvent::AlarmFired { .. }
             | SystemEvent::TimerExpired { .. }
             // A wrong-token request only: the served and timed-out

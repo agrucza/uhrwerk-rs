@@ -62,7 +62,7 @@
 use app_core::events::SystemEvent;
 use crate::bus::{EVENTS, SLEEP_WATCH, SharedI2c, SleepState};
 use drivers::pmu::{InterruptSource, Pmu};
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select3, Either3};
 use embassy_time::{Duration, Timer};
 use embedded_hal::i2c::I2c as I2cTrait;
 
@@ -93,11 +93,18 @@ pub async fn power_task(bus: &'static SharedI2c, mut state: PowerTaskState) {
     let mut vbus_hold: Option<crate::bus::WakeHold> = None;
 
     loop {
-        match select(
+        // Third arm: the manager's per-heartbeat kick. This task's
+        // own timer runs on embassy time, which freezes across
+        // hardware light sleep - while sleeping, the timer arm
+        // fires only once in minutes of wall time, so the kick is
+        // what actually paces the sleeping polls (see
+        // `bus::PMU_POLL`).
+        match select3(
             Timer::after(Duration::from_millis(interval_ms)),
             sleep_rx.changed(),
+            crate::bus::PMU_POLL.wait(),
         ).await {
-            Either::Second(new_state) => {
+            Either3::Second(new_state) => {
                 interval_ms = match new_state {
                     SleepState::Sleeping => SLEEP_POLL_INTERVAL_MS,
                     SleepState::Awake => POLL_INTERVAL_MS,
@@ -105,7 +112,7 @@ pub async fn power_task(bus: &'static SharedI2c, mut state: PowerTaskState) {
                 log::info!("Power: poll interval -> {} ms", interval_ms);
                 continue;
             }
-            Either::First(_) => {}
+            Either3::First(_) | Either3::Third(()) => {}
         }
 
         let (fresh, events) = {

@@ -164,6 +164,17 @@ pub static GPS_COMMAND: Signal<CriticalSectionRawMutex, GpsCommand> = Signal::ne
 /// Single-consumer: only the WiFi task should call `wait()` on this.
 pub static WIFI_COMMAND: Signal<CriticalSectionRawMutex, WifiCommand> = Signal::new();
 
+/// Manager-to-power-task poll kick, signalled once per sleep
+/// heartbeat. The power task's own cadence is embassy-timed, and
+/// embassy time freezes across hardware light sleep - without this
+/// its "5 s sleeping poll" only accrues during the ~230 ms awake
+/// sliver of each cycle and stretches to minutes of wall time
+/// (VBUS plug-in went unnoticed for minutes, measured 2026-08-29).
+/// Same heartbeat-kick pattern as `RtcCommand::Poll`.
+///
+/// Single-consumer: only the power task should call `wait()` on this.
+pub static PMU_POLL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 /// Out-of-band stop for a running file-serving session.
 ///
 /// The scan and sync sessions finish on their own, so they are driven
