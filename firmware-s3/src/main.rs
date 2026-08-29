@@ -366,8 +366,9 @@ async fn codec_init(i2c_bus: &'static system_core::bus::SharedI2c) {
 }
 
 /// Session-end counterpart to [`codec_init`], passed to `run_session`
-/// as its `teardown_hw` future: both codec chips into their datasheet
-/// power-down states. They hang on ALDO1, which is never turned off
+/// as its `teardown_hw` future: both codec chips into analog
+/// power-down with reset held (see the drivers' `power_down` docs).
+/// They hang on ALDO1, which is never turned off
 /// (the touch controller shares it) and survives warm reboots - so
 /// chip-level power-down is the only tool, and skipping it leaves DAC
 /// bias + mic bias + ADC channels drawing standing current through
@@ -378,7 +379,9 @@ async fn codec_init(i2c_bus: &'static system_core::bus::SharedI2c) {
 /// session's `codec_init` starts from full reset, so nothing is lost.
 ///
 /// The readback line is the on-hardware verification that the writes
-/// latched: expected `ES8311[0D]=FA [12]=02 ES7210[4B]=FF [40]=80`.
+/// latched: `ES8311[00]=1F` and `ES7210[00]=FF` prove the final
+/// reset-assert took (the load-bearing step); the other registers
+/// report whether the held reset also clears the register file.
 /// Visible on a plugged-in serial session (codec state is
 /// independent of sleep, so this needs no battery run to check).
 async fn codec_power_down(i2c_bus: &'static system_core::bus::SharedI2c) {
@@ -392,32 +395,37 @@ async fn codec_power_down(i2c_bus: &'static system_core::bus::SharedI2c) {
         log::warn!("Audio: ES7210 power-down failed");
     }
     let rb = (
+        es8311.read_reg(&mut *i2c, 0x00).unwrap_or(0),
         es8311.read_reg(&mut *i2c, 0x0D).unwrap_or(0),
         es8311.read_reg(&mut *i2c, 0x12).unwrap_or(0),
+        es7210.read_reg(&mut *i2c, 0x00).unwrap_or(0),
         es7210.read_reg(&mut *i2c, 0x4B).unwrap_or(0),
         es7210.read_reg(&mut *i2c, 0x40).unwrap_or(0),
     );
     log::info!(
-        "Audio: codec pd readback ES8311[0D]={:02X} [12]={:02X} ES7210[4B]={:02X} [40]={:02X}",
-        rb.0, rb.1, rb.2, rb.3,
+        "Audio: codec pd readback ES8311[00]={:02X} [0D]={:02X} [12]={:02X} ES7210[00]={:02X} [4B]={:02X} [40]={:02X}",
+        rb.0, rb.1, rb.2, rb.3, rb.4, rb.5,
     );
 }
 
 /// One-shot codec state line at boot, before any session has touched
 /// the chips. The codecs hang on ALDO1 and keep their registers
 /// across warm reboots, so after a soak night a reset with the
-/// monitor attached prints whether they actually stayed powered down
-/// (`ES8311[0D]=FA [12]=02 ES7210[4B]=FF [40]=80`); a battery that
-/// died overnight shows the chips' power-on defaults instead. Reads
-/// only - codec state is left untouched. 0xEE marks a failed read.
+/// monitor attached prints whether they actually stayed in the
+/// held-reset teardown state (`ES8311[00]=1F`, `ES7210[00]=FF`); a
+/// battery that died overnight shows the chips' power-on defaults
+/// instead. Reads only - codec state is left untouched. 0xEE marks
+/// a failed read.
 async fn codec_boot_readback(i2c_bus: &'static system_core::bus::SharedI2c) {
     let es8311 = drivers::es8311::Es8311::new();
     let es7210 = drivers::es7210::Es7210::new();
     let mut i2c = i2c_bus.lock().await;
     log::info!(
-        "Audio: codec boot readback ES8311[0D]={:02X} [12]={:02X} ES7210[4B]={:02X} [40]={:02X}",
+        "Audio: codec boot readback ES8311[00]={:02X} [0D]={:02X} [12]={:02X} ES7210[00]={:02X} [4B]={:02X} [40]={:02X}",
+        es8311.read_reg(&mut *i2c, 0x00).unwrap_or(0xEE),
         es8311.read_reg(&mut *i2c, 0x0D).unwrap_or(0xEE),
         es8311.read_reg(&mut *i2c, 0x12).unwrap_or(0xEE),
+        es7210.read_reg(&mut *i2c, 0x00).unwrap_or(0xEE),
         es7210.read_reg(&mut *i2c, 0x4B).unwrap_or(0xEE),
         es7210.read_reg(&mut *i2c, 0x40).unwrap_or(0xEE),
     );

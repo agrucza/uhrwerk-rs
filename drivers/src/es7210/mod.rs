@@ -162,24 +162,24 @@ impl Es7210 {
         self.write(i2c, REG_RESET, 0x41)
     }
 
-    /// Power the ADC down to its datasheet power-down state
-    /// (datasheet "Power Down Mode": ~10 uA). REG4B/4C set every
-    /// per-channel block to its documented power-down bit (MICBIAS,
-    /// mic reference, PGA, ADC, state machines), bias levels zero,
-    /// and REG40 sets PDN_ANA. The digital core loses MCLK when the
-    /// session's I2S drops, so no clock gating is needed on top.
+    /// Power the ADC down at session end: analog power-down writes
+    /// (REG4B/4C per-channel blocks off, bias levels zero, REG40
+    /// PDN_ANA), then full reset asserted - REG00 = 0xFF, the same
+    /// value [`Self::init`] step 1 writes, held instead of released.
     ///
-    /// The chip is external: SoC light sleep cannot gate it, and
-    /// left configured it holds mic bias + four ADC channels live
-    /// from the always-on rail indefinitely. Recovery is the full
-    /// three-step init - which is how every audio session already
-    /// starts.
+    /// The final REG00 write is load-bearing: the analog-only
+    /// sequence leaves the chip at its enabled run state (REG00=0x41
+    /// from finalize, DLL powered, clock doubler armed),
+    /// soak-measured 2026-08-27/28 as part of ~3x the whole watch's
+    /// sleep drain. Recovery is the normal three-step init, which
+    /// begins by writing this same reset value.
     pub fn power_down<I: I2c>(&self, i2c: &mut I) -> Result<(), I::Error> {
         self.write(i2c, REG_MIC12_POWER, 0xFF)?; // bias/ref/PGA/ADC 1+2 down
         self.write(i2c, REG_MIC34_POWER, 0xFF)?; // 3+4 down (defensive)
         self.write(i2c, REG_MIC12_BIAS, 0x00)?;  // bias level off
         self.write(i2c, REG_MIC34_BIAS, 0x00)?;
-        self.write(i2c, REG_ANALOG, 0x80)        // PDN_ANA = 1
+        self.write(i2c, REG_ANALOG, 0x80)?;      // PDN_ANA = 1
+        self.write(i2c, REG_RESET, 0xFF)         // full reset, held
     }
 
     /// Set microphone gain for MIC1 and MIC2.

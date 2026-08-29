@@ -125,18 +125,18 @@ impl Es8311 {
         Ok(())
     }
 
-    /// Power the codec down to its suspend state: DAC/ADC muted,
-    /// PGA + ADC modulator down (REG0E all PDN bits), DAC down
-    /// (REG12), mic input off, and REG0D = 0xFA - per the datasheet
-    /// bit map that is PDN_ANA, PDN_IBIASGEN, PDN_ADCBIASGEN,
-    /// PDN_ADCVREFGEN, PDN_DACVREFGEN set and the internal reference
-    /// disabled. Sequence is the Espressif reference driver's
-    /// `es8311_suspend`.
+    /// Power the codec down at session end: the Espressif
+    /// `es8311_suspend` analog power-down writes, then reset mode -
+    /// REG00 with every reset bit set and CSM_ON cleared, which is
+    /// mainline Linux's entire suspend path for this chip
+    /// (es8311.c `es8311_suspend` -> `es8311_reset(true)`).
     ///
-    /// The chip is external: SoC light sleep cannot gate it, and
-    /// left configured it holds its analog blocks biased from the
-    /// always-on rail indefinitely. Recovery is a full [`Self::init`]
-    /// cycle - which is how every audio session already starts.
+    /// The final REG00 write is load-bearing: the analog-only
+    /// sequence leaves the chip state machine and clock manager
+    /// (REG00=0x80, REG01=0x3F from init) running from the always-on
+    /// rail, soak-measured 2026-08-27/28 at ~3x the whole watch's
+    /// sleep drain. Reset-asserted is also how every session's
+    /// [`Self::init`] starts, so recovery is the normal init cycle.
     pub fn power_down<I: I2c>(&self, i2c: &mut I) -> Result<(), I::Error> {
         self.write(i2c, REG_DAC_VOL, 0x00)?; // mute DAC (-95.5 dB)
         self.write(i2c, REG_ADC17, 0x00)?;   // mute ADC
@@ -146,7 +146,8 @@ impl Es8311 {
         self.write(i2c, REG_SYS0D, 0xFA)?;   // analog + bias + refs down
         self.write(i2c, REG_ADC15, 0x00)?;   // ADC ramp reset
         self.write(i2c, REG_DAC_EQ, 0x08)?;  // DAC ramp default
-        self.write(i2c, REG_GP45, 0x01)      // GP low-power state
+        self.write(i2c, REG_GP45, 0x01)?;    // GP low-power state
+        self.write(i2c, REG_RESET, 0x1F)     // reset mode: RST all, CSM off
     }
 
     /// Set DAC output volume.
