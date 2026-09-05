@@ -21,4 +21,5 @@ pub mod events;
 pub mod log;
 pub mod model;
 pub mod nav;
+pub mod nfc;
 pub mod ui;

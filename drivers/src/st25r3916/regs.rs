@@ -195,6 +195,27 @@ pub mod io_conf1 {
     pub const LF_CLK_OFF: u8 = 1 << 0;
 }
 
+/// ISO14443A and NFC 106 kb/s settings register bits (Table 27).
+pub mod iso14443a_nfc {
+    /// No parity bit generated during Tx (reader modes only).
+    pub const NO_TX_PAR: u8 = 1 << 7;
+    /// Received bit stream goes to the FIFO with the parity bit; no
+    /// parity or CRC detection (reader modes, 106 kbit/s only).
+    pub const NO_RX_PAR: u8 = 1 << 6;
+    /// NFCIP-1 transport frame: add SB/LEN on Tx, skip SB on Rx.
+    pub const NFC_F0: u8 = 1 << 5;
+    /// p_len<3:0> - modulation pulse width in 13.56 MHz periods
+    /// (Table 28).
+    pub const P_LEN_MASK: u8 = 0b0001_1110;
+    /// 1: ISO14443A bit-oriented anticollision frame. MUST be set for
+    /// the reception of an anticollision reply in reader mode (the
+    /// receiver then skips the CRC check - the frame has none) and
+    /// MUST be 0 for every other frame and mode. REQA/WUPA get their
+    /// CRC-less receive automatically from their direct commands;
+    /// only anticollision needs this bit (Table 36, note 1).
+    pub const ANTCL: u8 = 1 << 0;
+}
+
 /// Main interrupt register bits (Table 62); the same layout is used
 /// for its mask register.
 pub mod irq_main {

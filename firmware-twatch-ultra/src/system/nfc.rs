@@ -28,13 +28,15 @@
 //! traffic can interleave freely.
 
 use app_core::events::SystemEvent;
+use app_core::nfc::CardInfo;
 use drivers::pmu::{Config as PmuConfig, Pmu};
 use drivers::st25r3916::{regs, Error, St25r3916};
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Delay, Duration, Instant, Timer};
 use esp_hal::gpio::Output;
 use esp_hal::spi::master::Config as SpiConfig;
 use esp_hal::spi::Mode as SpiMode;
 use esp_hal::time::Rate;
+use nfc::reader::Reader;
 use system_core::bus::{self, SharedI2c, EVENTS};
 use system_core::spi_bus::{SharedSpiBus, SharedSpiDevice};
 
@@ -112,20 +114,20 @@ pub async fn nfc_task(
     // Step-1 RF proof, only on a chip that answered its identity.
     if identified {
         match rf_probe(&drv, &mut spi).await {
-            Ok(atqa) => {
-                match atqa {
-                    Some(a) => log::info!(
-                        "NFC: card detected, ATQA {:02X} {:02X}",
-                        a[0], a[1],
+            Ok(card) => {
+                match &card {
+                    Some(c) => log::info!(
+                        "NFC: identified {} UID {:02X?} ATQA {:02X} {:02X} SAK {:02X}",
+                        c.kind.label(), &c.uid[..], c.atqa[0], c.atqa[1], c.sak,
                     ),
                     None => log::info!(
-                        "NFC: no card seen in the {} s poll window",
+                        "NFC: no card identified in the {} s poll window",
                         CARD_POLL_SECS,
                     ),
                 }
                 // Both outcomes go to the event log - the evidence
                 // must survive a USB drop.
-                EVENTS.send(SystemEvent::NfcProbe { atqa }).await;
+                EVENTS.send(SystemEvent::NfcProbe { card }).await;
             }
             Err(e) => log::error!("NFC: RF probe failed: {:?}", e),
         }
@@ -200,15 +202,18 @@ async fn probe(
     }
 }
 
-/// Step-1 RF proof: the bring-up-proven sequence (commit 517abfa).
-/// Ready mode (oscillator, proven by osc_ok), Adjust Regulators, then
-/// the ISO14443A reader field and a REQA poll. Returns the ATQA of
-/// the first card that answers, or `None` if the window closes
-/// empty. The caller tears the field down afterwards.
+/// RF probe: the bring-up-proven sequence (commit 517abfa) - Ready
+/// mode (oscillator, proven by osc_ok), Adjust Regulators, then the
+/// ISO14443A reader field and a REQA poll (step 1) - and, once a card
+/// answers, the anticollision cascade + SELECT through the protocol
+/// reader (step 2). Returns the identity of the first card that
+/// completes SELECT, or `None` if the window closes empty or a card
+/// answered but could not be selected. The caller tears the field
+/// down afterwards.
 async fn rf_probe(
     drv: &St25r3916,
     spi: &mut SharedSpiDevice,
-) -> Result<Option<[u8; 2]>, Error<SpiErr>> {
+) -> Result<Option<CardInfo>, Error<SpiErr>> {
     // 3. Ready mode: oscillator + regulators on, proven by osc_ok.
     drv.update_reg(spi, regs::reg_a::OP_CONTROL, 0, regs::op_control::EN)?;
     let mut osc = false;
@@ -253,7 +258,7 @@ async fn rf_probe(
         CARD_POLL_SECS,
     );
     let deadline = Instant::now() + Duration::from_secs(CARD_POLL_SECS);
-    let mut found: Option<[u8; 2]> = None;
+    let mut found: Option<CardInfo> = None;
     'poll: while Instant::now() < deadline {
         drv.direct_command(spi, regs::cmd::TRANSMIT_REQA)?;
         // ATQA arrives within ~100 us of the REQA end; poll the
@@ -266,7 +271,20 @@ async fn rf_probe(
                 let n = (st.bytes as usize).min(2);
                 let mut atqa = [0u8; 2];
                 drv.fifo_read(spi, &mut atqa[..n])?;
-                found = Some(atqa);
+                log::info!(
+                    "NFC: card answered REQA, ATQA {:02X} {:02X} - identifying",
+                    atqa[0], atqa[1],
+                );
+                // Step 2: on the lit field, run WUPA + the anticollision
+                // cascade + SELECT through the protocol reader. It
+                // borrows the device seat for the exchange and hands
+                // it back for teardown.
+                let mut delay = Delay;
+                let mut reader = Reader::new(&mut *spi, &mut delay);
+                match reader.identify(atqa).await {
+                    Ok(card) => found = Some(card),
+                    Err(e) => log::warn!("NFC: identify failed after ATQA: {:?}", e),
+                }
                 break 'poll;
             }
         }

@@ -86,5 +86,7 @@ esp32s3 = { version = "0.35", features = ["critical-section"] }
 # through system-core/firmware-hal.
 app-core     = { path = "../app-core", features = ["serde"] }
 drivers      = { path = "../drivers", features = ["display", "pmu", "xl9555", "cst9217", "drv2605", "imu", "bhi260", "ublox", "sx1262", "st25r3916"] }
+# NFC protocol layer (ISO14443-A activation) over the ST25R3916 seat.
+nfc          = { path = "../nfc" }
 firmware-hal = { path = "../firmware-hal", features = ["psram-fb"] }
 system-core  = { path = "../system-core", features = ["wifi"] }

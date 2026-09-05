@@ -1,0 +1,27 @@
+[package]
+name    = "nfc"
+version = "0.1.0"
+edition = "2021"
+
+# no_std on the target; `std` turns on host tests (the ISO14443-A
+# decode vectors run on the build machine, no hardware needed).
+[features]
+default = []
+std     = []
+
+[dependencies]
+# The chip command layer this crate drives. Only the chip verbs; all
+# protocol logic (anticollision, and later Crypto1 / MIFARE) lives
+# here.
+drivers = { path = "../drivers", default-features = false, features = ["st25r3916"] }
+# Card value types (CardInfo, CardKind, ...) shared with the UI.
+# app-core does not depend on this crate, so no cycle.
+app-core = { path = "../app-core", default-features = false }
+
+embedded-hal       = { workspace = true }
+embedded-hal-async = { workspace = true }
+log                = { workspace = true }
+heapless           = "0.9.2"
+
+[dev-dependencies]
+embedded-hal-mock = { version = "0.11", features = ["eh1"] }

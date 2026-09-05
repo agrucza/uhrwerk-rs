@@ -198,9 +198,11 @@ pub enum SystemEvent {
     /// probe finishing while the display sleeps must not turn the
     /// screen on.
     NfcProbe {
-        /// `Some(atqa)` when a card answered (2 bytes, wire order);
-        /// `None` when the poll window closed with no card in range.
-        atqa: Option<[u8; 2]>,
+        /// `Some(card)` when a card answered REQA and completed
+        /// anticollision + SELECT (its identity: UID, ATQA, SAK, kind);
+        /// `None` when the poll window closed with nothing in range or
+        /// a card answered but could not be selected.
+        card: Option<crate::nfc::CardInfo>,
     },
 
     // -- WiFi --
@@ -434,17 +436,26 @@ pub fn classify_for_log(event: &SystemEvent) -> Option<LoggedEvent> {
         // the anchor has no timestamp anywhere.
         SystemEvent::ChargerPhaseChanged { phase: ChargerPhase::Done } =>
             LoggedEvent { tag: "charged", detail: None, detail2: None },
-        // An NFC field probe is a deliberate test, so BOTH outcomes are
-        // the evidence (the point is that the result survives a USB
-        // drop). `nfc_card` carries the ATQA packed little-endian
-        // (byte0 | byte1 << 8, so ATQA 04 00 logs as 4); `nfc_nocard`
-        // marks a poll window that closed with nothing in range.
-        SystemEvent::NfcProbe { atqa: Some(a) } => LoggedEvent {
+        // An NFC probe is a deliberate test, so BOTH outcomes are the
+        // evidence (the point is that the result survives a USB drop).
+        // `nfc_card` carries the first four UID bytes packed
+        // little-endian (uid0 | uid1<<8 | uid2<<16 | uid3<<24) as the
+        // identity, and the SAK as the second detail - the SAK names
+        // the card family, so the log line alone says what it was.
+        // Longer UIDs keep their tail on serial only. `nfc_nocard`
+        // marks a window that closed with nothing selectable.
+        SystemEvent::NfcProbe { card: Some(c) } => LoggedEvent {
             tag: "nfc_card",
-            detail: Some(a[0] as u32 | ((a[1] as u32) << 8)),
-            detail2: None,
+            detail: Some(
+                c.uid
+                    .iter()
+                    .take(4)
+                    .enumerate()
+                    .fold(0u32, |acc, (i, b)| acc | ((*b as u32) << (8 * i))),
+            ),
+            detail2: Some(c.sak as u32),
         },
-        SystemEvent::NfcProbe { atqa: None } =>
+        SystemEvent::NfcProbe { card: None } =>
             LoggedEvent { tag: "nfc_nocard", detail: None, detail2: None },
         _ => return None,
     })
@@ -456,13 +467,20 @@ mod tests {
 
     #[test]
     fn nfc_probe_logs_both_outcomes_and_is_passive() {
-        // ATQA 04 00 packs little-endian to 4; a closed window logs
-        // its own tag with no detail - both outcomes are evidence.
-        let hit = SystemEvent::NfcProbe { atqa: Some([0x04, 0x00]) };
-        let miss = SystemEvent::NfcProbe { atqa: None };
+        use crate::nfc::{CardInfo, CardKind, Uid};
+        // A 4-byte UID DE AD BE EF packs little-endian to 0xEFBEADDE;
+        // the SAK (0x08 = Classic 1K) rides as the second detail. A
+        // closed window logs its own tag with no detail - both
+        // outcomes are evidence.
+        let mut uid: Uid = Uid::new();
+        uid.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+        let hit = SystemEvent::NfcProbe {
+            card: Some(CardInfo { uid, atqa: [0x04, 0x00], sak: 0x08, kind: CardKind::MifareClassic1K }),
+        };
+        let miss = SystemEvent::NfcProbe { card: None };
         assert_eq!(
             classify_for_log(&hit),
-            Some(LoggedEvent { tag: "nfc_card", detail: Some(4), detail2: None }),
+            Some(LoggedEvent { tag: "nfc_card", detail: Some(0xEFBE_ADDE), detail2: Some(0x08) }),
         );
         assert_eq!(
             classify_for_log(&miss),
