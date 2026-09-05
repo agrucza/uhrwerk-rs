@@ -372,6 +372,14 @@ pub enum AnyImu {
     Bhi260(bhi260_imu::Bhi260Imu),
 }
 
+// The dispatcher is only meaningful when a chip variant exists. In a
+// seam-only build - a crate that speaks just `ImuData` and enables
+// `imu` without a chip, e.g. app-core's host tests - `AnyImu` has no
+// variants, so every `match self` here would be an empty match on a
+// reference, which the compiler rejects (references are always
+// inhabited). Gate the whole dispatcher on a chip being selected;
+// seam-only consumers use `ImuData`, never `AnyImu`.
+#[cfg(any(feature = "qmi8658", feature = "bhi260"))]
 impl AnyImu {
     /// The chip's marketing name, for UI display. Known statically
     /// from the variant - valid before bring-up completes.
