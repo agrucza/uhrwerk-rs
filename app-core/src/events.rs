@@ -190,6 +190,19 @@ pub enum SystemEvent {
         fix: crate::data::GpsFix,
     },
 
+    // -- NFC --
+    /// Result of one NFC field probe from the board's reader task:
+    /// whether an ISO14443A card answered REQA, and with what ATQA.
+    /// Emitted once per probe. Same activity/wake rules as
+    /// `GpsSyncUpdated`: neither user activity nor a wake source - a
+    /// probe finishing while the display sleeps must not turn the
+    /// screen on.
+    NfcProbe {
+        /// `Some(atqa)` when a card answered (2 bytes, wire order);
+        /// `None` when the poll window closed with no card in range.
+        atqa: Option<[u8; 2]>,
+    },
+
     // -- WiFi --
     /// Progress of the current WiFi session (scan or sync), emitted
     /// by the WiFi task. Cached in `cached_data.wifi` for the
@@ -421,6 +434,18 @@ pub fn classify_for_log(event: &SystemEvent) -> Option<LoggedEvent> {
         // the anchor has no timestamp anywhere.
         SystemEvent::ChargerPhaseChanged { phase: ChargerPhase::Done } =>
             LoggedEvent { tag: "charged", detail: None, detail2: None },
+        // An NFC field probe is a deliberate test, so BOTH outcomes are
+        // the evidence (the point is that the result survives a USB
+        // drop). `nfc_card` carries the ATQA packed little-endian
+        // (byte0 | byte1 << 8, so ATQA 04 00 logs as 4); `nfc_nocard`
+        // marks a poll window that closed with nothing in range.
+        SystemEvent::NfcProbe { atqa: Some(a) } => LoggedEvent {
+            tag: "nfc_card",
+            detail: Some(a[0] as u32 | ((a[1] as u32) << 8)),
+            detail2: None,
+        },
+        SystemEvent::NfcProbe { atqa: None } =>
+            LoggedEvent { tag: "nfc_nocard", detail: None, detail2: None },
         _ => return None,
     })
 }
@@ -428,6 +453,26 @@ pub fn classify_for_log(event: &SystemEvent) -> Option<LoggedEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nfc_probe_logs_both_outcomes_and_is_passive() {
+        // ATQA 04 00 packs little-endian to 4; a closed window logs
+        // its own tag with no detail - both outcomes are evidence.
+        let hit = SystemEvent::NfcProbe { atqa: Some([0x04, 0x00]) };
+        let miss = SystemEvent::NfcProbe { atqa: None };
+        assert_eq!(
+            classify_for_log(&hit),
+            Some(LoggedEvent { tag: "nfc_card", detail: Some(4), detail2: None }),
+        );
+        assert_eq!(
+            classify_for_log(&miss),
+            Some(LoggedEvent { tag: "nfc_nocard", detail: None, detail2: None }),
+        );
+        // A probe finishing while the display sleeps must not wake
+        // it, and it is not something the user did.
+        assert!(!is_user_activity(&hit));
+        assert!(!is_wake_source(&hit));
+    }
 
     #[test]
     fn touch_press_counts_as_user_activity() {
