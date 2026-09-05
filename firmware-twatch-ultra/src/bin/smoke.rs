@@ -117,6 +117,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
         peripherals.DMA_CH0,
         Output::new(peripherals.GPIO37, Level::High, OutputConfig::default()),
         fb,
+        0xFF, // full brightness - this is a bare panel bring-up test
     )
     .await;
 
