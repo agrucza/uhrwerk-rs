@@ -71,6 +71,10 @@ pub enum Effect {
     /// Short pulse: motor on, blocking-delay `duration_ms`, motor
     /// off. Used for the BOOT-press "going to sleep" haptic.
     MotorPulse { duration_ms: u32 },
+    /// Two short pulses with a gap - a distinct "success" double tap.
+    /// Used as the NFC scan-complete confirmation. Gated on
+    /// `haptics_enabled` like the other motor effects.
+    MotorDoublePulse,
 
     /// Forward a command to the RTC task via `RTC_COMMAND`.
     RtcCommand(RtcCommand),
@@ -577,6 +581,11 @@ impl Model {
                 // and leaves the previous card in place).
                 self.cached_data.last_nfc = Some(card.clone());
                 self.needs_redraw = true;
+                // Scan-complete confirmation: a distinct double tap
+                // (manager gates it on haptics_enabled). Only fires
+                // when a card was actually identified, so it is never
+                // spurious.
+                let _ = out.push(Effect::MotorDoublePulse);
             }
             SystemEvent::WifiStatusUpdated { state } => {
                 if self.cached_data.wifi != *state {

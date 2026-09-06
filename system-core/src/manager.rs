@@ -574,6 +574,22 @@ impl<B: Board> SystemManager<'static, B> {
                         self.board.buzz_stop();
                     }
                 }
+                Effect::MotorDoublePulse => {
+                    // Two ~80 ms pulses split by an ~80 ms gap - a
+                    // distinct double tap for "scan complete". Blocks
+                    // the effect loop ~240 ms, the same shape as the
+                    // WiFi-sync MotorPulse.
+                    if self.model.config().alerts.haptics_enabled {
+                        for i in 0..2 {
+                            if i > 0 {
+                                Timer::after(Duration::from_millis(80)).await;
+                            }
+                            self.board.buzz();
+                            Timer::after(Duration::from_millis(80)).await;
+                            self.board.buzz_stop();
+                        }
+                    }
+                }
                 Effect::RtcCommand(cmd) => RTC_COMMAND.signal(cmd),
                 Effect::ImuCommand(cmd) => IMU_COMMAND.signal(cmd),
                 Effect::AudioCommand(cmd) => {
