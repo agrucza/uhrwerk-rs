@@ -1,4 +1,4 @@
-//! NFC boot canary + step-1 RF proof - ST25R3916 behind the shared
+//! NFC boot canary + boot-time RF probe - ST25R3916 behind the shared
 //! SPI bus.
 //!
 //! Boot canary: raise CS (the park holds it LOW against the
@@ -8,14 +8,14 @@
 //! console. Screams in the log if a hardware fault or driver
 //! regression ever kills the reader.
 //!
-//! Step-1 RF proof (TEMPORARY, replaced by a command-driven session
-//! in a later step): on a known-good chip, run the bring-up-proven
-//! ritual - oscillator (osc_ok), Adjust Regulators, ISO14443A reader
-//! field - and poll REQA for a short window after boot. Hold a card
-//! to the watch back in that window; the ATQA is logged and the
-//! outcome is emitted as `SystemEvent::NfcProbe` so it lands in the
-//! event log and survives a USB drop. This re-proves the RF path in
-//! the current memory layout before any protocol logic returns.
+//! RF probe (TEMPORARY, replaced by a command-driven session in a
+//! later step): on a known-good chip, run the bring-up-proven ritual
+//! - oscillator (osc_ok), Adjust Regulators, ISO14443A reader field -
+//! and poll REQA for a short window after boot. Every card presented
+//! is identified through the protocol reader, logged, emitted as
+//! `SystemEvent::NfcProbe` (so it lands in the event log and survives
+//! a USB drop), then HALTed so it stays quiet while it lies on the
+//! back; lifting it and presenting it again is a new presentation.
 //!
 //! Ritual facts (DS12484 rev 8, section 4.1): the overheat
 //! protection frame must be the first contact after every power-up
@@ -28,7 +28,7 @@
 //! traffic can interleave freely.
 
 use app_core::events::SystemEvent;
-use app_core::nfc::CardInfo;
+use app_core::nfc::{CardIdentity, CardKind};
 use drivers::pmu::{Config as PmuConfig, Pmu};
 use drivers::st25r3916::{regs, Error, St25r3916};
 use embassy_time::{Delay, Duration, Instant, Timer};
@@ -42,10 +42,12 @@ use system_core::spi_bus::{SharedSpiBus, SharedSpiDevice};
 
 type SpiErr = esp_hal::spi::Error;
 
-/// Step-1 RF proof window: how long the field stays up hunting for a
-/// card after the identity check, and the REQA cadence. Long enough
-/// to bring a card to the watch back after power-on; the 500 ms
-/// cadence is the one proven at bring-up.
+/// Boot probe window (DEV, temporary until the command-driven
+/// session): how long the field stays up after the identity check,
+/// detecting every card presentation, and the REQA cadence. The
+/// 500 ms cadence is the one proven at bring-up. The task holds a
+/// wake lock for the window, so hardware light sleep is off while the
+/// scanner is active.
 const CARD_POLL_SECS: u64 = 15;
 const CARD_POLL_GAP_MS: u64 = 500;
 
@@ -111,24 +113,12 @@ pub async fn nfc_task(
         }
     };
 
-    // Step-1 RF proof, only on a chip that answered its identity.
+    // RF probe, only on a chip that answered its identity. The wake
+    // lock taken above spans the whole window, so hardware light
+    // sleep stays off while the scanner is active.
     if identified {
         match rf_probe(&drv, &mut spi).await {
-            Ok(card) => {
-                match &card {
-                    Some(c) => log::info!(
-                        "NFC: identified {} UID {:02X?} ATQA {:02X} {:02X} SAK {:02X}",
-                        c.kind.label(), &c.uid[..], c.atqa[0], c.atqa[1], c.sak,
-                    ),
-                    None => log::info!(
-                        "NFC: no card identified in the {} s poll window",
-                        CARD_POLL_SECS,
-                    ),
-                }
-                // Both outcomes go to the event log - the evidence
-                // must survive a USB drop.
-                EVENTS.send(SystemEvent::NfcProbe { card }).await;
-            }
+            Ok(n) => log::info!("NFC: probe window closed, {} presentation(s)", n),
             Err(e) => log::error!("NFC: RF probe failed: {:?}", e),
         }
     }
@@ -204,16 +194,18 @@ async fn probe(
 
 /// RF probe: the bring-up-proven sequence (commit 517abfa) - Ready
 /// mode (oscillator, proven by osc_ok), Adjust Regulators, then the
-/// ISO14443A reader field and a REQA poll (step 1) - and, once a card
-/// answers, the anticollision cascade + SELECT through the protocol
-/// reader (step 2). Returns the identity of the first card that
-/// completes SELECT, or `None` if the window closes empty or a card
-/// answered but could not be selected. The caller tears the field
-/// down afterwards.
+/// ISO14443A reader field and a REQA poll - and, for every card that
+/// answers within the window, the anticollision cascade + SELECT
+/// through the protocol reader. Every presentation is logged and
+/// emitted as `SystemEvent::NfcProbe`, then the card is HALTed so it
+/// stays quiet while it lies on the back; lifting it and presenting
+/// it again is a new presentation. An empty window emits one
+/// `nfc_nocard`. Returns the number of presentations. The caller
+/// tears the field down afterwards.
 async fn rf_probe(
     drv: &St25r3916,
     spi: &mut SharedSpiDevice,
-) -> Result<Option<CardInfo>, Error<SpiErr>> {
+) -> Result<u32, Error<SpiErr>> {
     // 3. Ready mode: oscillator + regulators on, proven by osc_ok.
     drv.update_reg(spi, regs::reg_a::OP_CONTROL, 0, regs::op_control::EN)?;
     let mut osc = false;
@@ -226,7 +218,7 @@ async fn rf_probe(
     }
     if !osc {
         log::warn!("NFC: 27.12 MHz oscillator never stabilized - RF probe skipped");
-        return Ok(None);
+        return Ok(0);
     }
     log::info!("NFC: oscillator running");
 
@@ -254,12 +246,12 @@ async fn rf_probe(
     // ISO14443-3 guard time before the first command.
     Timer::after(Duration::from_millis(6)).await;
     log::info!(
-        "NFC: field on - present an ISO14443A card within {} s",
+        "NFC: field on - present cards for {} s",
         CARD_POLL_SECS,
     );
     let deadline = Instant::now() + Duration::from_secs(CARD_POLL_SECS);
-    let mut found: Option<CardInfo> = None;
-    'poll: while Instant::now() < deadline {
+    let mut presentations: u32 = 0;
+    while Instant::now() < deadline {
         drv.direct_command(spi, regs::cmd::TRANSMIT_REQA)?;
         // ATQA arrives within ~100 us of the REQA end; poll the
         // (self-clearing) interrupt registers briefly.
@@ -271,26 +263,114 @@ async fn rf_probe(
                 let n = (st.bytes as usize).min(2);
                 let mut atqa = [0u8; 2];
                 drv.fifo_read(spi, &mut atqa[..n])?;
-                log::info!(
-                    "NFC: card answered REQA, ATQA {:02X} {:02X} - identifying",
-                    atqa[0], atqa[1],
-                );
-                // Step 2: on the lit field, run WUPA + the anticollision
-                // cascade + SELECT through the protocol reader. It
-                // borrows the device seat for the exchange and hands
-                // it back for teardown.
+                // On the lit field, run the anticollision cascade +
+                // SELECT through the protocol reader. It borrows the
+                // device seat for the exchange and hands it back.
                 let mut delay = Delay;
                 let mut reader = Reader::new(&mut *spi, &mut delay);
                 match reader.identify(atqa).await {
-                    Ok(card) => found = Some(card),
-                    Err(e) => log::warn!("NFC: identify failed after ATQA: {:?}", e),
+                    Ok(card) => {
+                        // Set once a card ends in a Crypto1 session and
+                        // is halted with the ENCRYPTED HALT below; then
+                        // the plain HLTA at the end is skipped (an authed
+                        // card only understands encrypted frames).
+                        let mut crypto_halted = false;
+                        match &card {
+                            CardIdentity::Iso14443a(a) => log::info!(
+                                "NFC: identified {} UID {:02X?} ATQA {:02X} {:02X} SAK {:02X}",
+                                a.kind.label(), &a.uid[..], a.atqa[0], a.atqa[1], a.sak,
+                            ),
+                            other => log::info!(
+                                "NFC: identified {} id {:02X?}",
+                                other.label(), other.id_bytes(),
+                            ),
+                        }
+                        // Step 3a: on a Type 2 tag - still ACTIVE
+                        // straight after SELECT - read pages 0..=3 and
+                        // check the UID they carry against the one
+                        // anticollision assembled. Proves the 16-byte
+                        // block read + CRC-tail path with no
+                        // cryptography in the way.
+                        if let CardIdentity::Iso14443a(a) = &card {
+                            if a.kind == CardKind::MifareUltralight {
+                                match reader.read_type2(0).await {
+                                    Ok(pages) => {
+                                        let check = match nfc::type2::uid_from_pages0_3(&pages) {
+                                            Some(u) if u.as_slice() == &a.uid[..] => "UID matches",
+                                            Some(_) => "UID MISMATCH",
+                                            None => "BCC FAIL",
+                                        };
+                                        log::info!(
+                                            "NFC: type2 pages 0-3 {:02X?} - {}",
+                                            pages, check,
+                                        );
+                                    }
+                                    Err(e) => log::warn!("NFC: type2 read failed: {:?}", e),
+                                }
+                            }
+                            // Step 3b-ii: MIFARE Classic - authenticate
+                            // sector 0 with the factory default key A and
+                            // read block 0 (the manufacturer block: its
+                            // first 4 bytes are the UID, so it
+                            // self-verifies like the type 2 read).
+                            if a.kind.is_mifare_classic() {
+                                let uid32 = nfc::mifare::uid_for_auth(&a.uid);
+                                let key = [0xFFu8; 6];
+                                match reader.mifare_auth(key, true, 0, uid32).await {
+                                    Ok(mut cipher) => {
+                                        match reader.mifare_read_block(&mut cipher, 0).await {
+                                            Ok(blk) => {
+                                                let uid_ok = blk[..4] == a.uid[..4.min(a.uid.len())];
+                                                log::info!(
+                                                    "NFC: classic block 0 {:02X?} - {}",
+                                                    blk, if uid_ok { "UID matches" } else { "read ok" },
+                                                );
+                                            }
+                                            Err(e) => log::warn!("NFC: classic block 0 read failed: {:?}", e),
+                                        }
+                                        // Encrypted HALT: quiet the authed card
+                                        // so, left on the back, it stops
+                                        // re-authing every cadence.
+                                        if let Err(e) = reader.mifare_halt(&mut cipher).await {
+                                            log::warn!("NFC: mifare halt failed: {:?}", e);
+                                        }
+                                        crypto_halted = true;
+                                    }
+                                    Err(e) => log::warn!("NFC: classic auth (key A default) failed: {:?}", e),
+                                }
+                            }
+                        }
+                        presentations += 1;
+                        // Every presentation goes to the event log -
+                        // the evidence must survive a USB drop.
+                        EVENTS.send(SystemEvent::NfcProbe { card: Some(card) }).await;
+                        // HALT the card so it stays quiet while it lies
+                        // on the back; lifting it resets it to IDLE and
+                        // the next presentation is detected afresh. No
+                        // dedup needed - and none wanted. A card halted
+                        // inside a Crypto1 session (above) is skipped:
+                        // it would NAK a plain HLTA.
+                        if !crypto_halted {
+                            if let Err(e) = reader.halt().await {
+                                log::warn!("NFC: halt failed: {:?}", e);
+                            }
+                        }
+                    }
+                    Err(e) => log::warn!(
+                        "NFC: card answered REQA (ATQA {:02X} {:02X}) but identify failed: {:?}",
+                        atqa[0], atqa[1], e,
+                    ),
                 }
-                break 'poll;
+                break;
             }
         }
         Timer::after(Duration::from_millis(CARD_POLL_GAP_MS)).await;
     }
-    Ok(found)
+    if presentations == 0 {
+        log::info!("NFC: no card identified in the {} s window", CARD_POLL_SECS);
+        EVENTS.send(SystemEvent::NfcProbe { card: None }).await;
+    }
+    Ok(presentations)
 }
 
 /// Poll the (read-clears) interrupt registers until a timer/NFC bit

@@ -19,7 +19,10 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod crypto1;
 pub mod iso14443a;
+pub mod mifare;
 pub mod reader;
+pub mod type2;
 
 pub use app_core::nfc as types;

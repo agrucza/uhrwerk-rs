@@ -198,11 +198,12 @@ pub enum SystemEvent {
     /// probe finishing while the display sleeps must not turn the
     /// screen on.
     NfcProbe {
-        /// `Some(card)` when a card answered REQA and completed
-        /// anticollision + SELECT (its identity: UID, ATQA, SAK, kind);
-        /// `None` when the poll window closed with nothing in range or
-        /// a card answered but could not be selected.
-        card: Option<crate::nfc::CardInfo>,
+        /// `Some(identity)` when a card answered its technology's
+        /// activation and completed selection - tagged by technology
+        /// with that technology's identity fields; `None` when the poll
+        /// window closed with nothing in range or a card answered but
+        /// could not be selected.
+        card: Option<crate::nfc::CardIdentity>,
     },
 
     // -- WiFi --
@@ -397,6 +398,17 @@ pub struct LoggedEvent {
     pub detail2: Option<u32>,
 }
 
+/// Pack up to four bytes little-endian into a `u32` for an event-log
+/// detail field (byte0 | byte1<<8 | byte2<<16 | byte3<<24). Shorter
+/// slices pack what they have; longer ones pack the first four.
+fn le_u32(bytes: &[u8]) -> u32 {
+    bytes
+        .iter()
+        .take(4)
+        .enumerate()
+        .fold(0u32, |acc, (i, b)| acc | ((*b as u32) << (8 * i)))
+}
+
 /// Classify a [`SystemEvent`] for the SD-card event log, or return
 /// `None` if the event is too chatty or too low-signal to record.
 ///
@@ -438,22 +450,29 @@ pub fn classify_for_log(event: &SystemEvent) -> Option<LoggedEvent> {
             LoggedEvent { tag: "charged", detail: None, detail2: None },
         // An NFC probe is a deliberate test, so BOTH outcomes are the
         // evidence (the point is that the result survives a USB drop).
-        // `nfc_card` carries the first four UID bytes packed
-        // little-endian (uid0 | uid1<<8 | uid2<<16 | uid3<<24) as the
-        // identity, and the SAK as the second detail - the SAK names
-        // the card family, so the log line alone says what it was.
-        // Longer UIDs keep their tail on serial only. `nfc_nocard`
-        // marks a window that closed with nothing selectable.
-        SystemEvent::NfcProbe { card: Some(c) } => LoggedEvent {
-            tag: "nfc_card",
-            detail: Some(
-                c.uid
-                    .iter()
-                    .take(4)
-                    .enumerate()
-                    .fold(0u32, |acc, (i, b)| acc | ((*b as u32) << (8 * i))),
-            ),
-            detail2: Some(c.sak as u32),
+        // One tag per technology, so the line alone says what answered.
+        // The identity packs into the two details, little-endian:
+        //   nfc_a  <uid[0..4]>  <sak>        Type A - the SAK names the
+        //                                     family; a 7/10-byte UID
+        //                                     keeps its tail on serial
+        //   nfc_b  <pupi>       -            Type B - PUPI is exactly 4 B
+        //   nfc_f  <idm[0..4]>  <idm[4..8]>  FeliCa - full 8-byte IDm
+        //   nfc_v  <uid[0..4]>  <uid[4..8]>  NFC-V  - full 8-byte UID
+        // `nfc_nocard` marks a window that closed with nothing
+        // selectable.
+        SystemEvent::NfcProbe { card: Some(crate::nfc::CardIdentity::Iso14443a(a)) } =>
+            LoggedEvent { tag: "nfc_a", detail: Some(le_u32(&a.uid)), detail2: Some(a.sak as u32) },
+        SystemEvent::NfcProbe { card: Some(crate::nfc::CardIdentity::Iso14443b(b)) } =>
+            LoggedEvent { tag: "nfc_b", detail: Some(le_u32(&b.pupi)), detail2: None },
+        SystemEvent::NfcProbe { card: Some(crate::nfc::CardIdentity::Felica(f)) } => LoggedEvent {
+            tag: "nfc_f",
+            detail: Some(le_u32(&f.idm[..4])),
+            detail2: Some(le_u32(&f.idm[4..])),
+        },
+        SystemEvent::NfcProbe { card: Some(crate::nfc::CardIdentity::Iso15693(v)) } => LoggedEvent {
+            tag: "nfc_v",
+            detail: Some(le_u32(&v.uid[..4])),
+            detail2: Some(le_u32(&v.uid[4..])),
         },
         SystemEvent::NfcProbe { card: None } =>
             LoggedEvent { tag: "nfc_nocard", detail: None, detail2: None },
@@ -466,30 +485,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nfc_probe_logs_both_outcomes_and_is_passive() {
-        use crate::nfc::{CardInfo, CardKind, Uid};
-        // A 4-byte UID DE AD BE EF packs little-endian to 0xEFBEADDE;
-        // the SAK (0x08 = Classic 1K) rides as the second detail. A
-        // closed window logs its own tag with no detail - both
-        // outcomes are evidence.
+    fn nfc_probe_logs_per_technology_and_is_passive() {
+        use crate::nfc::{CardIdentity, CardKind, FelicaInfo, TypeAInfo, Uid};
+        // Type A: UID DE AD BE EF packs little-endian to 0xEFBEADDE;
+        // the SAK (0x08 = Classic 1K) rides as the second detail.
         let mut uid: Uid = Uid::new();
         uid.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
-        let hit = SystemEvent::NfcProbe {
-            card: Some(CardInfo { uid, atqa: [0x04, 0x00], sak: 0x08, kind: CardKind::MifareClassic1K }),
+        let a = SystemEvent::NfcProbe {
+            card: Some(CardIdentity::Iso14443a(TypeAInfo {
+                uid,
+                atqa: [0x04, 0x00],
+                sak: 0x08,
+                kind: CardKind::MifareClassic1K,
+            })),
         };
-        let miss = SystemEvent::NfcProbe { card: None };
         assert_eq!(
-            classify_for_log(&hit),
-            Some(LoggedEvent { tag: "nfc_card", detail: Some(0xEFBE_ADDE), detail2: Some(0x08) }),
+            classify_for_log(&a),
+            Some(LoggedEvent { tag: "nfc_a", detail: Some(0xEFBE_ADDE), detail2: Some(0x08) }),
         );
+        // FeliCa: the full 8-byte IDm survives across both details.
+        let f = SystemEvent::NfcProbe {
+            card: Some(CardIdentity::Felica(FelicaInfo {
+                idm: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+                pmm: [0; 8],
+            })),
+        };
+        assert_eq!(
+            classify_for_log(&f),
+            Some(LoggedEvent { tag: "nfc_f", detail: Some(0x0403_0201), detail2: Some(0x0807_0605) }),
+        );
+        // A closed window logs its own tag with no detail - both
+        // outcomes are evidence.
+        let miss = SystemEvent::NfcProbe { card: None };
         assert_eq!(
             classify_for_log(&miss),
             Some(LoggedEvent { tag: "nfc_nocard", detail: None, detail2: None }),
         );
         // A probe finishing while the display sleeps must not wake
         // it, and it is not something the user did.
-        assert!(!is_user_activity(&hit));
-        assert!(!is_wake_source(&hit));
+        assert!(!is_user_activity(&a));
+        assert!(!is_wake_source(&a));
     }
 
     #[test]

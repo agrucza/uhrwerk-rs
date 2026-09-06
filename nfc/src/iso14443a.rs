@@ -17,6 +17,12 @@ pub const SEL_CL1: u8 = 0x93;
 pub const SEL_CL2: u8 = 0x95;
 pub const SEL_CL3: u8 = 0x97;
 
+/// HLTA: put a selected card into the HALT state (ISO14443-3 6.3.3).
+/// A halted card ignores REQA and answers only WUPA - or field loss,
+/// which resets it to IDLE. The PICC must not reply; silence is the
+/// success case.
+pub const HLTA: [u8; 2] = [0x50, 0x00];
+
 /// The SELECT code for a cascade level (1..=3).
 pub fn sel_for_level(level: u8) -> Option<u8> {
     match level {
@@ -97,6 +103,85 @@ pub fn classify(atqa: [u8; 2], sak: u8) -> CardKind {
     }
 }
 
+// -- ISO14443-3 framing helpers ----------------------------------------------
+
+/// ISO14443-A CRC_A (ISO/IEC 14443-3 Annex B): CRC-16 with polynomial
+/// 0x8408 (0x1021 reflected), initial value 0x6363, no final XOR,
+/// appended low byte first. Needed in software for MIFARE Classic's
+/// encrypted commands, where the chip's automatic CRC would be
+/// computed over ciphertext.
+pub fn crc_a(data: &[u8]) -> [u8; 2] {
+    let mut crc: u16 = 0x6363;
+    for &b in data {
+        let mut ch = b ^ (crc as u8);
+        ch ^= ch << 4;
+        crc = (crc >> 8) ^ ((ch as u16) << 8) ^ ((ch as u16) << 3) ^ ((ch as u16) >> 4);
+    }
+    [crc as u8, (crc >> 8) as u8]
+}
+
+/// ISO14443-A uses ODD parity: the parity bit is 1 when the byte has
+/// an even number of set bits.
+pub fn oddparity8(b: u8) -> u8 {
+    ((b.count_ones() & 1) ^ 1) as u8
+}
+
+#[inline]
+fn put_bit(buf: &mut [u8], pos: usize, bit: u8) {
+    let mask = 1u8 << (pos % 8);
+    if bit & 1 != 0 {
+        buf[pos / 8] |= mask;
+    } else {
+        buf[pos / 8] &= !mask;
+    }
+}
+
+#[inline]
+fn get_bit(buf: &[u8], pos: usize) -> u8 {
+    (buf[pos / 8] >> (pos % 8)) & 1
+}
+
+/// Pack bytes with one parity bit after each into the raw bit stream
+/// the chip transmits when parity generation is off (`no_tx_par`):
+/// LSB first, 9 bits per byte, contiguous. Returns the bit count;
+/// load `bits / 8` full FIFO bytes and declare `bits % 8` extra bits.
+/// `out` must hold at least `ceil(9 * data.len() / 8)` bytes.
+pub fn pack_parity_stream(data: &[u8], parity: &[u8], out: &mut [u8]) -> usize {
+    let mut pos = 0usize;
+    for (i, &d) in data.iter().enumerate() {
+        for j in 0..8 {
+            put_bit(out, pos, (d >> j) & 1);
+            pos += 1;
+        }
+        put_bit(out, pos, parity[i]);
+        pos += 1;
+    }
+    pos
+}
+
+/// Unpack a raw received bit stream (`no_rx_par`: 9 bits per byte,
+/// LSB first) into data bytes and parity bits. `bits` is the stream
+/// length - 8 per full FIFO byte plus the incomplete last byte's bits
+/// as the FIFO status reports them. Returns the byte count; trailing
+/// bits that do not complete a 9-bit symbol are ignored.
+pub fn unpack_parity_stream(
+    stream: &[u8],
+    bits: usize,
+    data: &mut [u8],
+    parity: &mut [u8],
+) -> usize {
+    let n = (bits / 9).min(data.len()).min(parity.len());
+    for i in 0..n {
+        let mut b = 0u8;
+        for j in 0..8 {
+            b |= get_bit(stream, 9 * i + j) << j;
+        }
+        data[i] = b;
+        parity[i] = get_bit(stream, 9 * i + 8);
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +241,44 @@ mod tests {
         assert!(!sak_says_cascade(0x08));
         assert!(sak_is_iso4(0x20));
         assert!(!sak_is_iso4(0x08));
+    }
+
+    #[test]
+    fn crc_a_known_answer_hlta() {
+        // The HLTA frame on the wire is 50 00 57 CD - the canonical
+        // CRC_A vector.
+        assert_eq!(crc_a(&HLTA), [0x57, 0xCD]);
+    }
+
+    #[test]
+    fn odd_parity_values() {
+        assert_eq!(oddparity8(0x00), 1);
+        assert_eq!(oddparity8(0x01), 0);
+        assert_eq!(oddparity8(0x03), 1);
+        assert_eq!(oddparity8(0xFF), 1);
+    }
+
+    #[test]
+    fn parity_stream_layout_and_round_trip() {
+        // One byte 0x01 with parity 1: bits 1,0,0,0,0,0,0,0,1 packed
+        // LSB first -> [0x01, 0x01], 9 bits.
+        let mut out = [0u8; 2];
+        assert_eq!(pack_parity_stream(&[0x01], &[1], &mut out), 9);
+        assert_eq!(out, [0x01, 0x01]);
+        // Round trip over an 8-byte frame (the {nr, ar} size): 72 bits
+        // = exactly 9 FIFO bytes, no partial byte.
+        let data = [0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78];
+        let par = [1, 0, 1, 1, 0, 0, 1, 0];
+        let mut stream = [0u8; 9];
+        let bits = pack_parity_stream(&data, &par, &mut stream);
+        assert_eq!(bits, 72);
+        let (mut d, mut p) = ([0u8; 8], [0u8; 8]);
+        assert_eq!(unpack_parity_stream(&stream, bits, &mut d, &mut p), 8);
+        assert_eq!(d, data);
+        assert_eq!(p, par);
+        // A 4-byte answer is 36 bits: 4 full FIFO bytes + 4 bits.
+        let mut s4 = [0u8; 5];
+        assert_eq!(pack_parity_stream(&data[..4], &par[..4], &mut s4), 36);
+        assert_eq!((36 / 8, 36 % 8), (4, 4));
     }
 }

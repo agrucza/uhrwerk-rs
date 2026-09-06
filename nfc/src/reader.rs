@@ -18,13 +18,14 @@
 //! bytes - on the error path too - so a failed cascade says exactly
 //! which exchange failed and what the chip actually delivered.
 
-use app_core::nfc::{CardInfo, NfcScanError, Uid};
+use app_core::nfc::{CardIdentity, NfcScanError, TypeAInfo, Uid};
 use drivers::st25r3916::{regs, St25r3916};
 use embedded_hal::spi::SpiDevice;
 use embedded_hal_async::delay::DelayNs;
 use heapless::Vec;
 
-use crate::iso14443a;
+use crate::crypto1::Crypto1;
+use crate::{iso14443a, mifare, type2};
 
 /// Per-transceive response wait: poll the RX interrupt this many
 /// times, this far apart. A card answers within ~100 us of the
@@ -57,7 +58,7 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
     /// no reply and drops the card back to IDLE (hardware-observed:
     /// TX_END fired, RX never came). WUPA is for waking a HALTed card,
     /// which is a different flow.
-    pub async fn identify(&mut self, atqa: [u8; 2]) -> Result<CardInfo, NfcScanError> {
+    pub async fn identify(&mut self, atqa: [u8; 2]) -> Result<CardIdentity, NfcScanError> {
 
         let mut uid: Uid = Vec::new();
         let mut sak = 0u8;
@@ -121,7 +122,67 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
             }
         }
 
-        Ok(CardInfo { uid, atqa, sak, kind: iso14443a::classify(atqa, sak) })
+        Ok(CardIdentity::Iso14443a(TypeAInfo {
+            uid,
+            atqa,
+            sak,
+            kind: iso14443a::classify(atqa, sak),
+        }))
+    }
+
+    /// Type 2 Tag READ (MIFARE Ultralight / NTAG): 16 bytes = 4 pages
+    /// from `page`. The card must be ACTIVE - call straight after
+    /// [`identify`](Self::identify), before the next REQA drops it back
+    /// to IDLE. The chip checks the reply CRC and leaves the two CRC
+    /// bytes in the FIFO after the data (as seen on SELECT: SAK + 2),
+    /// so the FIFO holds 18 and the data is the first 16.
+    pub async fn read_type2(
+        &mut self,
+        page: u8,
+    ) -> Result<[u8; type2::READ_LEN], NfcScanError> {
+        let mut rx = [0u8; type2::READ_LEN + 2];
+        let n = self
+            .transceive("t2read", &[type2::READ, page], true, &mut rx)
+            .await?;
+        if n < type2::READ_LEN {
+            log::warn!("nfc-dbg: t2read page {} short reply n={}", page, n);
+            return Err(NfcScanError::Hardware);
+        }
+        let mut out = [0u8; type2::READ_LEN];
+        out.copy_from_slice(&rx[..type2::READ_LEN]);
+        Ok(out)
+    }
+
+    /// HLTA: put the selected card into HALT so it stops answering
+    /// REQA while it stays in the field. It only wakes to WUPA - or to
+    /// field loss, which resets it to IDLE - so lifting the card and
+    /// presenting it again is seen as a fresh presentation, while a
+    /// card left on the back stays quiet. The PICC must NOT reply:
+    /// silence is success; any reply means it did not halt.
+    pub async fn halt(&mut self) -> Result<(), NfcScanError> {
+        self.drv
+            .direct_command(self.spi, regs::cmd::CLEAR_FIFO)
+            .map_err(hw)?;
+        self.drv.fifo_load(self.spi, &iso14443a::HLTA).map_err(hw)?;
+        self.drv
+            .set_num_tx_bytes(self.spi, iso14443a::HLTA.len() as u16, 0)
+            .map_err(hw)?;
+        self.drv
+            .direct_command(self.spi, regs::cmd::TRANSMIT_WITH_CRC)
+            .map_err(hw)?;
+        // The frame is out in well under a millisecond; a card that
+        // did not halt would NAK within ~100 us of its end.
+        self.delay.delay_ms(3).await;
+        let irqs = self.drv.read_interrupts(self.spi).map_err(hw)?;
+        if irqs.main & regs::irq_main::RX_END != 0 {
+            log::warn!(
+                "nfc-dbg: hlta answered (main={:#04x}) - card not halted",
+                irqs.main,
+            );
+            return Err(NfcScanError::SelectFailed);
+        }
+        log::info!("nfc-dbg: hlta ok (main={:#04x})", irqs.main);
+        Ok(())
     }
 
     /// Send `tx` and collect the reply into `rx`, returning the byte
@@ -181,6 +242,249 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
         }
         log::warn!("nfc-dbg: {} no RX_END tx={:02X?} crc={}", what, tx, with_crc);
         Err(NfcScanError::NoCard)
+    }
+
+    // -- MIFARE Classic Crypto1 (encrypted-parity framing) ------------------
+    //
+    // HARDWARE-ONLY, NEVER RUN before this step: MIFARE Classic
+    // encrypts each byte's parity bit, so the chip's automatic parity
+    // is switched off (no_tx_par / no_rx_par) and the parity is framed
+    // in software; the nonces carry no CRC and the read's CRC is
+    // encrypted, so RX CRC checking is off (no_crc_rx) and the CRC is
+    // verified after decryption. The pure cipher/framing this drives
+    // is host-tested (crypto1/mifare/iso14443a); only the wire timing
+    // is unproven.
+
+    /// Set/clear manual-parity mode (no_tx_par + no_rx_par, Table 27).
+    fn set_manual_parity(&mut self, on: bool) -> Result<(), NfcScanError> {
+        let bits = regs::iso14443a_nfc::NO_TX_PAR | regs::iso14443a_nfc::NO_RX_PAR;
+        let (clear, set) = if on { (0, bits) } else { (bits, 0) };
+        self.drv
+            .update_reg(self.spi, regs::reg_a::ISO14443A_NFC, clear, set)
+            .map_err(hw)?;
+        Ok(())
+    }
+
+    /// Set/clear receive-without-CRC (no_crc_rx, Table 36).
+    fn set_rx_no_crc(&mut self, on: bool) -> Result<(), NfcScanError> {
+        let (clear, set) = if on { (0, regs::aux::NO_CRC_RX) } else { (regs::aux::NO_CRC_RX, 0) };
+        self.drv.update_reg(self.spi, regs::reg_a::AUX, clear, set).map_err(hw)?;
+        Ok(())
+    }
+
+    /// Raw transceive for the encrypted frames: transmit `tx_bits`
+    /// from `tx` (packed 9-bit symbols) with no chip CRC and no chip
+    /// parity, and collect the raw reply bit stream into `rx`,
+    /// returning the received bit count. The caller runs the Crypto1
+    /// framing on both sides.
+    async fn transceive_raw(
+        &mut self,
+        what: &'static str,
+        tx: &[u8],
+        tx_bits: usize,
+        rx: &mut [u8],
+    ) -> Result<usize, NfcScanError> {
+        let tx_bytes = tx_bits / 8;
+        let extra = (tx_bits % 8) as u8;
+        let load = tx_bytes + if extra != 0 { 1 } else { 0 };
+        self.drv.direct_command(self.spi, regs::cmd::CLEAR_FIFO).map_err(hw)?;
+        self.drv.fifo_load(self.spi, &tx[..load]).map_err(hw)?;
+        self.drv
+            .set_num_tx_bytes(self.spi, tx_bytes as u16, extra)
+            .map_err(hw)?;
+        self.drv
+            .direct_command(self.spi, regs::cmd::TRANSMIT_WITHOUT_CRC)
+            .map_err(hw)?;
+        for _ in 0..RX_POLL_TRIES {
+            self.delay.delay_ms(RX_POLL_GAP_MS).await;
+            let irqs = self.drv.read_interrupts(self.spi).map_err(hw)?;
+            let err = irqs.error_wup
+                & (regs::irq_error_wup::CRC_ERROR
+                    | regs::irq_error_wup::PARITY_ERROR
+                    | regs::irq_error_wup::HARD_FRAMING_ERROR
+                    | regs::irq_error_wup::SOFT_FRAMING_ERROR);
+            if irqs.main & regs::irq_main::RX_END != 0 || err != 0 {
+                let st = self.drv.fifo_status(self.spi).map_err(hw)?;
+                let nbytes = (st.bytes as usize).min(rx.len());
+                self.drv.fifo_read(self.spi, &mut rx[..nbytes]).map_err(hw)?;
+                let bits = if st.last_byte_bits == 0 {
+                    nbytes * 8
+                } else {
+                    nbytes.saturating_sub(1) * 8 + st.last_byte_bits as usize
+                };
+                log::info!(
+                    "nfc-dbg: {} raw main={:#04x} err={:#04x} fifo={} lb={} -> {} bits {:02X?}",
+                    what, irqs.main, irqs.error_wup, st.bytes, st.last_byte_bits, bits, &rx[..nbytes],
+                );
+                if irqs.main & regs::irq_main::RX_END == 0 {
+                    return Err(NfcScanError::Hardware);
+                }
+                return Ok(bits);
+            }
+        }
+        log::warn!("nfc-dbg: {} raw no RX_END", what);
+        Err(NfcScanError::NoCard)
+    }
+
+    /// Authenticate one sector (Crypto1 three-pass) with a 6-byte key.
+    /// On success returns the synchronized cipher for the encrypted
+    /// read that follows. Normal parity + RX CRC are restored on every
+    /// exit path, so a failure does not poison the next identify.
+    pub async fn mifare_auth(
+        &mut self,
+        key6: [u8; 6],
+        is_key_a: bool,
+        block: u8,
+        uid32: u32,
+    ) -> Result<Crypto1, NfcScanError> {
+        // Pass 1: AUTH command, in clear with normal parity but a
+        // SOFTWARE CRC transmitted via Transmit-Without-CRC. The chip's
+        // Transmit-With-CRC command re-enables the RX CRC check
+        // (overriding no_crc_rx), which then rejects the CRC-less tag
+        // nonce; Transmit-Without-CRC leaves no_crc_rx in effect, so
+        // the 4-byte nonce is received clean.
+        self.set_rx_no_crc(true)?;
+        let cmd = if is_key_a { mifare::AUTH_KEY_A } else { mifare::AUTH_KEY_B };
+        let mut auth = [cmd, block, 0, 0];
+        let acrc = iso14443a::crc_a(&auth[..2]);
+        auth[2] = acrc[0];
+        auth[3] = acrc[1];
+        let mut nt_buf = [0u8; 4];
+        let nt = match self.transceive("auth1", &auth, false, &mut nt_buf).await {
+            Ok(n) if n >= 4 => u32::from_be_bytes(nt_buf),
+            other => {
+                log::warn!("nfc-dbg: auth1 (nonce) failed: {:?}", other);
+                let _ = self.set_rx_no_crc(false);
+                return Err(NfcScanError::SelectFailed);
+            }
+        };
+        log::info!("nfc-dbg: auth nt={:08X}", nt);
+
+        // Pass 2: encrypted {nr, ar} with encrypted parity, no CRC,
+        // manual parity; the reply is the 4-byte encrypted aT.
+        let frame = mifare::auth_frame(mifare::key_to_u64(&key6), uid32, nt, 0);
+        self.set_manual_parity(true)?;
+        let mut tx = [0u8; 9];
+        let tx_bits = iso14443a::pack_parity_stream(&frame.bytes, &frame.parity, &mut tx);
+        let mut rxs = [0u8; 8];
+        let result = self.transceive_raw("auth2", &tx, tx_bits, &mut rxs).await;
+        // Restore chip framing before interpreting the reply.
+        let _ = self.set_manual_parity(false);
+        let _ = self.set_rx_no_crc(false);
+        let rx_bits = result?;
+
+        let (mut at_b, mut at_p) = ([0u8; 4], [0u8; 4]);
+        let n = iso14443a::unpack_parity_stream(&rxs, rx_bits, &mut at_b, &mut at_p);
+        if n < 4 {
+            log::warn!("nfc-dbg: auth2 short aT n={} ({} bits)", n, rx_bits);
+            return Err(NfcScanError::SelectFailed);
+        }
+        let mut cipher = frame.cipher;
+        let mut at_plain = [0u8; 4];
+        if let Err(i) = mifare::decrypt_with_parity(&mut cipher, &at_b, &at_p, &mut at_plain) {
+            log::warn!("nfc-dbg: aT parity mismatch at byte {} (enc {:02X?})", i, at_b);
+            return Err(NfcScanError::SelectFailed);
+        }
+        let at = u32::from_be_bytes(at_plain);
+        if at != frame.at_expected {
+            log::warn!("nfc-dbg: aT {:08X} != expected {:08X}", at, frame.at_expected);
+            return Err(NfcScanError::SelectFailed);
+        }
+        log::info!("nfc-dbg: auth OK aT={:08X}", at);
+        Ok(cipher)
+    }
+
+    /// Read one 16-byte block over an authenticated Crypto1 session.
+    /// Command + CRC, and the 16 data bytes + their CRC, are encrypted
+    /// with software parity; the recovered CRC is checked against the
+    /// data. Advances `cipher` past the exchange.
+    pub async fn mifare_read_block(
+        &mut self,
+        cipher: &mut Crypto1,
+        block: u8,
+    ) -> Result<[u8; 16], NfcScanError> {
+        let mut cmd = [mifare::READ_BLOCK, block, 0, 0];
+        let crc = iso14443a::crc_a(&cmd[..2]);
+        cmd[2] = crc[0];
+        cmd[3] = crc[1];
+        let (mut enc, mut par) = ([0u8; 4], [0u8; 4]);
+        mifare::encrypt_with_parity(cipher, &cmd, false, &mut enc, &mut par);
+        let mut tx = [0u8; 5];
+        let tx_bits = iso14443a::pack_parity_stream(&enc, &par, &mut tx);
+
+        self.set_manual_parity(true)?;
+        self.set_rx_no_crc(true)?;
+        let mut rxs = [0u8; 24]; // 18 bytes * 9 bits = 162 bits = 21 FIFO bytes
+        let result = self.transceive_raw("read", &tx, tx_bits, &mut rxs).await;
+        let _ = self.set_manual_parity(false);
+        let _ = self.set_rx_no_crc(false);
+        let rx_bits = result?;
+
+        let (mut edata, mut epar) = ([0u8; 18], [0u8; 18]);
+        let n = iso14443a::unpack_parity_stream(&rxs, rx_bits, &mut edata, &mut epar);
+        if n < 18 {
+            log::warn!("nfc-dbg: read short reply n={} ({} bits)", n, rx_bits);
+            return Err(NfcScanError::Hardware);
+        }
+        let mut plain = [0u8; 18];
+        if let Err(i) = mifare::decrypt_with_parity(cipher, &edata[..18], &epar[..18], &mut plain) {
+            log::warn!("nfc-dbg: read parity mismatch at byte {}", i);
+            return Err(NfcScanError::Hardware);
+        }
+        let crc = iso14443a::crc_a(&plain[..16]);
+        if crc != [plain[16], plain[17]] {
+            log::warn!("nfc-dbg: read CRC {:02X?} != data CRC {:02X?}", crc, &plain[16..18]);
+            return Err(NfcScanError::Hardware);
+        }
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&plain[..16]);
+        Ok(out)
+    }
+
+    /// Halt an authenticated card: the HALT command (50 00 + CRC)
+    /// encrypted with software parity through the live `cipher`. A
+    /// card in a Crypto1 session only understands encrypted frames, so
+    /// the plain [`halt`](Self::halt) gets a NAK; this one is
+    /// understood and the card falls silent (success = no reply).
+    pub async fn mifare_halt(&mut self, cipher: &mut Crypto1) -> Result<(), NfcScanError> {
+        let mut cmd = [0x50u8, 0x00, 0, 0];
+        let crc = iso14443a::crc_a(&cmd[..2]);
+        cmd[2] = crc[0];
+        cmd[3] = crc[1];
+        let (mut enc, mut par) = ([0u8; 4], [0u8; 4]);
+        mifare::encrypt_with_parity(cipher, &cmd, false, &mut enc, &mut par);
+        let mut tx = [0u8; 5];
+        let tx_bits = iso14443a::pack_parity_stream(&enc, &par, &mut tx);
+        let tx_bytes = tx_bits / 8;
+        let extra = (tx_bits % 8) as u8;
+        let load = tx_bytes + if extra != 0 { 1 } else { 0 };
+
+        self.set_manual_parity(true)?;
+        self.set_rx_no_crc(true)?;
+        let r = async {
+            self.drv.direct_command(self.spi, regs::cmd::CLEAR_FIFO).map_err(hw)?;
+            self.drv.fifo_load(self.spi, &tx[..load]).map_err(hw)?;
+            self.drv
+                .set_num_tx_bytes(self.spi, tx_bytes as u16, extra)
+                .map_err(hw)?;
+            self.drv
+                .direct_command(self.spi, regs::cmd::TRANSMIT_WITHOUT_CRC)
+                .map_err(hw)?;
+            // A halted card is silent; a card that did not halt NAKs
+            // within ~100 us of the frame end.
+            self.delay.delay_ms(3).await;
+            self.drv.read_interrupts(self.spi).map_err(hw)
+        }
+        .await;
+        let _ = self.set_manual_parity(false);
+        let _ = self.set_rx_no_crc(false);
+        let irqs = r?;
+        if irqs.main & regs::irq_main::RX_END != 0 {
+            log::warn!("nfc-dbg: mifare-hlta answered (main={:#04x})", irqs.main);
+            return Err(NfcScanError::SelectFailed);
+        }
+        log::info!("nfc-dbg: mifare-hlta ok (main={:#04x})", irqs.main);
+        Ok(())
     }
 }
 

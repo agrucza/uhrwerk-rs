@@ -216,6 +216,24 @@ pub mod iso14443a_nfc {
     pub const ANTCL: u8 = 1 << 0;
 }
 
+/// Auxiliary definition register bits (Table 36, reg 0x0A).
+pub mod aux {
+    /// 1: receive WITHOUT CRC check (the chip hands the CRC bytes to
+    /// the FIFO and does not verify them). MIFARE Classic's encrypted
+    /// frames carry an encrypted CRC the chip cannot check, and the
+    /// auth nonces carry none, so this is set for a Crypto1 session
+    /// and the CRC is verified in software after decryption.
+    pub const NO_CRC_RX: u8 = 1 << 7;
+    pub const NFC_ID1: u8 = 1 << 5;
+    pub const NFC_ID0: u8 = 1 << 4;
+    /// 90-degree phase clock for PM demodulation (leave 0).
+    pub const MFAZ_CL90: u8 = 1 << 3;
+    /// Disable the correlator receiver (leave 0 for ISO-A).
+    pub const DIS_CORR: u8 = 1 << 2;
+    pub const NFC_N1: u8 = 1 << 1;
+    pub const NFC_N0: u8 = 1 << 0;
+}
+
 /// Main interrupt register bits (Table 62); the same layout is used
 /// for its mask register.
 pub mod irq_main {
