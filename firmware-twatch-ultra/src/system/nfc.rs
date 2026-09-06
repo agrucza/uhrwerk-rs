@@ -359,11 +359,17 @@ async fn rf_probe(
 
                                 // Byte offset of the next block in the image;
                                 // locked sectors are zero-filled so block N
-                                // always lands at byte N*16. Interior mutability
-                                // (the async callback is FnMut -> Future and
-                                // can't borrow &mut across calls).
+                                // always lands at byte N*16. `dump_failed`
+                                // latches on the first SD write error so a
+                                // flaky card yields a clearly-incomplete file,
+                                // not a silently truncated one. Interior
+                                // mutability: the async callback is
+                                // FnMut -> Future and can't borrow &mut across
+                                // calls.
                                 let next = core::cell::Cell::new(0u16);
                                 let next_ref = &next;
+                                let dump_failed = core::cell::Cell::new(false);
+                                let dump_failed_ref = &dump_failed;
                                 let on_block = move |b: nfc::reader::SweepBlock| async move {
                                     log::info!(
                                         "NFC: sweep S{:02} B{:03}{} key{} {:02X?} | {:02X?}",
@@ -374,7 +380,10 @@ async fn rf_probe(
                                         b.key,
                                         b.data,
                                     );
-                                    if !sd_dump {
+                                    // Skip SD once there is no card, or once a
+                                    // prior write failed - serial logging above
+                                    // still runs either way.
+                                    if !sd_dump || dump_failed_ref.get() {
                                         return;
                                     }
                                     // One lock, only synchronous SD writes
@@ -384,22 +393,45 @@ async fn rf_probe(
                                     if let Some(sd) = g.sd_mut() {
                                         let target = b.block as u16;
                                         let mut n = next_ref.get();
+                                        let mut ok = true;
                                         while n < target {
-                                            let _ = sd.append_line(path, &[0u8; 16]);
+                                            if sd.append_line(path, &[0u8; 16]).is_err() {
+                                                ok = false;
+                                                break;
+                                            }
                                             n += 1;
                                         }
-                                        let _ = sd.append_line(path, &b.data);
-                                        next_ref.set(target + 1);
+                                        if ok {
+                                            ok = sd.append_line(path, &b.data).is_ok();
+                                        }
+                                        if ok {
+                                            next_ref.set(target + 1);
+                                        } else {
+                                            log::warn!(
+                                                "NFC: dump write to {} failed at block {} - stopping, file incomplete",
+                                                path, target,
+                                            );
+                                            dump_failed_ref.set(true);
+                                        }
                                     }
                                 };
                                 match reader.sweep_classic(a.kind, uid32, on_block).await {
-                                    Ok(s) => log::info!(
-                                        "NFC: sweep done - {}/{} sectors unlocked, {} blocks read{}",
-                                        s.sectors_unlocked,
-                                        s.sectors_total,
-                                        s.blocks_read,
-                                        if sd_dump { " (saved to SD)" } else { "" },
-                                    ),
+                                    Ok(s) => {
+                                        let sd_status = if !sd_dump {
+                                            ""
+                                        } else if dump_failed.get() {
+                                            " (SD dump INCOMPLETE - write error)"
+                                        } else {
+                                            " (saved to SD)"
+                                        };
+                                        log::info!(
+                                            "NFC: sweep done - {}/{} sectors unlocked, {} blocks read{}",
+                                            s.sectors_unlocked,
+                                            s.sectors_total,
+                                            s.blocks_read,
+                                            sd_status,
+                                        );
+                                    }
                                     Err(e) => log::warn!("NFC: sweep failed: {:?}", e),
                                 }
                                 // The sweep leaves the card HALTED (encrypted
