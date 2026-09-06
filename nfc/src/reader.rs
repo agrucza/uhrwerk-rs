@@ -584,12 +584,16 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
     /// reads - then encrypted-HALTs to end the session. A sector no
     /// default key opens is logged and skipped. On return the card is
     /// HALTED.
-    pub async fn sweep_classic<F: FnMut(SweepBlock)>(
+    pub async fn sweep_classic<F, Fut>(
         &mut self,
         kind: CardKind,
         uid32: u32,
         mut on_block: F,
-    ) -> Result<SweepStats, NfcScanError> {
+    ) -> Result<SweepStats, NfcScanError>
+    where
+        F: FnMut(SweepBlock) -> Fut,
+        Fut: core::future::Future<Output = ()>,
+    {
         let sectors = mifare::sector_count(kind);
         let mut stats = SweepStats { sectors_total: sectors, ..Default::default() };
 
@@ -640,7 +644,8 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
                                     key,
                                     key_is_a,
                                     data,
-                                });
+                                })
+                                .await;
                             }
                             Err(e) => log::warn!(
                                 "nfc-dbg: sweep sector {} block {} read failed: {:?}",

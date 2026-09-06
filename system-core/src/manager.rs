@@ -1720,10 +1720,19 @@ pub trait Bringup {
     /// the generic orchestrator. It drives the alarm / timer alert tone
     /// in response to `AUDIO_COMMAND`, bringing the codec up lazily on
     /// the first tone. Default: no-op for boards without a speaker.
+    ///
+    /// Also handed the shared `store`: this is the manager's spawn
+    /// point for every bin-local task, and a board with an SD-backed
+    /// subsystem (the T-Watch NFC dump writer) needs the same
+    /// `&'static SharedStore` the manager holds. `SharedStore` is not
+    /// `Sync`, so it cannot be reached through a global; it rides in as
+    /// a spawn argument. Boards that spawn no store-using task ignore
+    /// it.
     fn spawn_audio(
         &mut self,
         _spawner: embassy_executor::Spawner,
         _i2c_bus: &'static crate::bus::SharedI2c,
+        _store: &'static crate::bus::SharedStore,
     ) {
     }
 
@@ -1918,7 +1927,7 @@ pub async fn run<T: Bringup>(
     spawner.spawn(power_task(i2c_bus, bundle.power).unwrap());
     // Board-specific: the speaker task, where the board has one. Owns
     // the I2S / DMA / speaker pins; lazy bring-up on the first tone.
-    bringup.spawn_audio(spawner, i2c_bus);
+    bringup.spawn_audio(spawner, i2c_bus, manager.store);
     // Seed the sleep-clock baseline before anything has touched the
     // radio; every sleep entry compares its fresh calibration to this.
     if let Some(cal) = manager.board.sleep_clock_probe() {

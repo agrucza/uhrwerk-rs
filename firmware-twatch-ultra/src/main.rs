@@ -414,6 +414,7 @@ impl Bringup for TwatchUltraBringup {
         &mut self,
         spawner: embassy_executor::Spawner,
         i2c_bus: &'static system_core::bus::SharedI2c,
+        store: &'static system_core::bus::SharedStore,
     ) {
         spawner.spawn(crate::system::haptics::haptics_task(i2c_bus).unwrap());
         spawner.spawn(
@@ -455,6 +456,7 @@ impl Bringup for TwatchUltraBringup {
                 i2c_bus,
                 self.spi_bus.expect("spi_bus built in make_store"),
                 self.nfc_cs_out.take().unwrap(),
+                store,
             )
             .unwrap(),
         );

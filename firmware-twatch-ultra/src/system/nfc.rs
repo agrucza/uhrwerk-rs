@@ -56,6 +56,10 @@ pub async fn nfc_task(
     i2c_bus: &'static SharedI2c,
     spi_bus: &'static SharedSpiBus,
     mut cs: Output<'static>,
+    // Shared flash+SD store, handed in at spawn (SharedStore is not
+    // Sync, so it cannot be reached through a global). The Classic
+    // dump streams to its SD side.
+    store: &'static bus::SharedStore,
 ) {
     // Let the boot storm pass; the LoRa probe owns the early log.
     Timer::after(Duration::from_secs(5)).await;
@@ -117,7 +121,7 @@ pub async fn nfc_task(
     // lock taken above spans the whole window, so hardware light
     // sleep stays off while the scanner is active.
     if identified {
-        match rf_probe(&drv, &mut spi).await {
+        match rf_probe(&drv, &mut spi, store).await {
             Ok(n) => log::info!("NFC: probe window closed, {} presentation(s)", n),
             Err(e) => log::error!("NFC: RF probe failed: {:?}", e),
         }
@@ -205,6 +209,7 @@ async fn probe(
 async fn rf_probe(
     drv: &St25r3916,
     spi: &mut SharedSpiDevice,
+    store: &'static bus::SharedStore,
 ) -> Result<u32, Error<SpiErr>> {
     // 3. Ready mode: oscillator + regulators on, proven by osc_ok.
     drv.update_reg(spi, regs::reg_a::OP_CONTROL, 0, regs::op_control::EN)?;
@@ -308,17 +313,58 @@ async fn rf_probe(
                                     Err(e) => log::warn!("NFC: type2 read failed: {:?}", e),
                                 }
                             }
-                            // Step 4a: MIFARE Classic - STREAMING sweep of
+                            // Step 4a/4b: MIFARE Classic - STREAMING sweep of
                             // the whole card. Every sector is opened with a
                             // default key (A then B), all its blocks read
                             // under that one auth, and each 16-byte block
-                            // handed to the callback below the instant it is
-                            // read - logged straight to serial, nothing
-                            // accumulated. On return the card is HALTED, so
-                            // the plain HLTA at the end is skipped.
+                            // handed to the callback the instant it is read:
+                            // logged to serial and, when an SD card is
+                            // present, appended to a raw dump image. Nothing
+                            // is accumulated in RAM. On return the card is
+                            // HALTED, so the plain HLTA at the end is skipped.
                             if a.kind.is_mifare_classic() {
                                 let uid32 = nfc::mifare::uid_for_auth(&a.uid);
-                                let on_block = |b: nfc::reader::SweepBlock| {
+                                // Dump path /nfc/<first-4-UID-bytes>.NFC, FAT
+                                // 8.3-safe (8 hex + 3-char ext). Built into a
+                                // fixed ASCII buffer - no heapless in this bin.
+                                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                                let mut pbuf = *b"/nfc/00000000.NFC";
+                                for k in 0..4 {
+                                    let byte = a.uid.get(k).copied().unwrap_or(0);
+                                    pbuf[5 + k * 2] = HEX[(byte >> 4) as usize];
+                                    pbuf[6 + k * 2] = HEX[(byte & 0x0F) as usize];
+                                }
+                                let path = core::str::from_utf8(&pbuf).unwrap_or("/nfc/dump.NFC");
+
+                                // Truncate/create the dump up front (also makes
+                                // the /nfc dir). SD-only, never mirrored to
+                                // flash. If SD is offline the sweep still runs,
+                                // serial-only - identify already succeeded.
+                                let sd_dump = {
+                                    let mut g = store.lock().await;
+                                    if g.sd_online() {
+                                        match g.sd_mut().map(|sd| sd.write_file(path, &[])) {
+                                            Some(Ok(())) => true,
+                                            Some(Err(e)) => {
+                                                log::warn!("NFC: dump create {} failed: {:?}", path, e);
+                                                false
+                                            }
+                                            None => false,
+                                        }
+                                    } else {
+                                        log::info!("NFC: no SD card - dumping to serial only");
+                                        false
+                                    }
+                                };
+
+                                // Byte offset of the next block in the image;
+                                // locked sectors are zero-filled so block N
+                                // always lands at byte N*16. Interior mutability
+                                // (the async callback is FnMut -> Future and
+                                // can't borrow &mut across calls).
+                                let next = core::cell::Cell::new(0u16);
+                                let next_ref = &next;
+                                let on_block = move |b: nfc::reader::SweepBlock| async move {
                                     log::info!(
                                         "NFC: sweep S{:02} B{:03}{} key{} {:02X?} | {:02X?}",
                                         b.sector,
@@ -328,11 +374,31 @@ async fn rf_probe(
                                         b.key,
                                         b.data,
                                     );
+                                    if !sd_dump {
+                                        return;
+                                    }
+                                    // One lock, only synchronous SD writes
+                                    // inside it, then release - the store lock
+                                    // must never be held across an await.
+                                    let mut g = store.lock().await;
+                                    if let Some(sd) = g.sd_mut() {
+                                        let target = b.block as u16;
+                                        let mut n = next_ref.get();
+                                        while n < target {
+                                            let _ = sd.append_line(path, &[0u8; 16]);
+                                            n += 1;
+                                        }
+                                        let _ = sd.append_line(path, &b.data);
+                                        next_ref.set(target + 1);
+                                    }
                                 };
                                 match reader.sweep_classic(a.kind, uid32, on_block).await {
                                     Ok(s) => log::info!(
-                                        "NFC: sweep done - {}/{} sectors unlocked, {} blocks read",
-                                        s.sectors_unlocked, s.sectors_total, s.blocks_read,
+                                        "NFC: sweep done - {}/{} sectors unlocked, {} blocks read{}",
+                                        s.sectors_unlocked,
+                                        s.sectors_total,
+                                        s.blocks_read,
+                                        if sd_dump { " (saved to SD)" } else { "" },
                                     ),
                                     Err(e) => log::warn!("NFC: sweep failed: {:?}", e),
                                 }

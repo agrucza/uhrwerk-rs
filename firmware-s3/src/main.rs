@@ -271,6 +271,8 @@ impl Bringup for S3Bringup {
         &mut self,
         spawner: embassy_executor::Spawner,
         i2c_bus: &'static system_core::bus::SharedI2c,
+        // Unused on this board: no SD-backed bin task needs the store.
+        _store: &'static system_core::bus::SharedStore,
     ) {
         // Circular DMA buffers. RX is 32 KB (~512 ms at 16 kHz/16-bit
         // stereo) - sized to ride main-loop stalls without overrunning
