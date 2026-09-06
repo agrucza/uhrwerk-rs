@@ -302,6 +302,54 @@ impl St25r3916 {
         self.write_reg(spi, reg_a::IRQ_MASK_MAIN, &masks)
     }
 
+    /// Enter wake-up (tag-detection) mode. Field, Tx/Rx and the
+    /// oscillator stay off; the chip's 32 kHz timer periodically
+    /// measures the antenna amplitude, keeps an auto-averaged
+    /// reference that tracks slow drift, and raises the amplitude
+    /// wake-up IRQ when a measurement deviates past `delta` - a card
+    /// entering the field. Only that IRQ is routed to the pin. Draws
+    /// microamps (I_WU ~3 uA).
+    ///
+    /// `delta` is the `am_d<3:0>` detection threshold (0..=15): too
+    /// high never trips on a card, too low false-trips on drift.
+    /// HARDWARE-ONLY, never run before: the exact delta needs tuning
+    /// on the board's antenna.
+    ///
+    /// On a trip the caller reads the interrupts (which drops the
+    /// level-held IRQ line) and powers the field up for a real poll,
+    /// then calls this again to re-arm.
+    pub fn enter_wakeup_mode<S: SpiDevice<u8>>(
+        &self,
+        spi: &mut S,
+        delta: u8,
+    ) -> Result<(), Error<S::Error>> {
+        // Everything off; the wake-up timer runs regardless.
+        self.write_reg(spi, reg_a::OP_CONTROL, &[0])?;
+        // Amplitude measurement with an auto-averaged reference.
+        self.write_reg(
+            spi,
+            reg_a::AMPLITUDE_MEASURE_CONF,
+            &[regs::amplitude_measure_conf::delta(delta)
+                | regs::amplitude_measure_conf::weight(2)
+                | regs::amplitude_measure_conf::AM_AE],
+        )?;
+        // Run only the amplitude measurement, 100 ms base, shortest
+        // multiplier (responsive), IRQ on a threshold cross only.
+        self.write_reg(
+            spi,
+            reg_a::WUP_TIMER_CONTROL,
+            &[regs::wup_timer_control::WAM],
+        )?;
+        // Route only the amplitude wake-up IRQ to the pin; mask all
+        // others (1 = masked).
+        self.set_irq_masks(spi, [0xFF, 0xFF, !regs::irq_error_wup::WUP_AMPLITUDE, 0xFF])?;
+        // Clear any latched IRQ so the pin starts low.
+        let _ = self.read_interrupts(spi)?;
+        // Enter wake-up mode (wu = 1, en = 0).
+        self.write_reg(spi, reg_a::OP_CONTROL, &[regs::op_control::WU])?;
+        Ok(())
+    }
+
     /// Read (and clear) all four interrupt status registers in one
     /// auto-incremented burst. Reading drops the IRQ line once every
     /// set bit has been read (section 4.3.1).

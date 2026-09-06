@@ -270,6 +270,51 @@ pub mod irq_error_wup {
     pub const WUP_CAPACITANCE: u8 = 1 << 0;
 }
 
+/// Wake-up timer control register bits (Table 103, reg 0x32). Selects
+/// which measurements the 32 kHz wake-up timer runs and how often.
+pub mod wup_timer_control {
+    /// Timeout range: 0 = 100 ms base, 1 = 10 ms base.
+    pub const WUR: u8 = 1 << 7;
+    /// Timeout multiplier `wut<2:0>` (bits 6:4, Table 104).
+    pub const WUT_MASK: u8 = 0b0111_0000;
+    /// Raise the IRQ on every timeout (not just a threshold cross).
+    pub const WTO: u8 = 1 << 3;
+    /// Enable the amplitude measurement.
+    pub const WAM: u8 = 1 << 2;
+    /// Enable the phase measurement.
+    pub const WPH: u8 = 1 << 1;
+    /// Enable the capacitive measurement.
+    pub const WCAP: u8 = 1 << 0;
+    /// Pack the timeout multiplier into `wut<2:0>`.
+    pub const fn wut(n: u8) -> u8 {
+        (n << 4) & WUT_MASK
+    }
+}
+
+/// Amplitude measurement configuration (Table 105, reg 0x33); the
+/// phase config register 0x37 has the same layout.
+pub mod amplitude_measure_conf {
+    /// Detection delta `am_d<3:0>` (bits 7:4): how far a measurement
+    /// must move from the reference to trip the wake-up IRQ.
+    pub const AM_D_MASK: u8 = 0b1111_0000;
+    /// Include the tripping measurement in the running average.
+    pub const AM_AAM: u8 = 1 << 3;
+    /// Auto-averaging weight `am_aew<1:0>` (bits 2:1): 00=4, 01=8,
+    /// 10=16, 11=32 samples.
+    pub const AM_AEW_MASK: u8 = 0b0000_0110;
+    /// Enable the auto-averaged reference (it tracks slow antenna
+    /// drift; without it the reference is the fixed 0x34/0x38 value).
+    pub const AM_AE: u8 = 1 << 0;
+    /// Pack the detection delta into `am_d<3:0>`.
+    pub const fn delta(n: u8) -> u8 {
+        (n << 4) & AM_D_MASK
+    }
+    /// Pack the auto-averaging weight into `am_aew<1:0>`.
+    pub const fn weight(n: u8) -> u8 {
+        (n << 1) & AM_AEW_MASK
+    }
+}
+
 /// FIFO status register 2 bits (Table 67; bits 7:6 are the byte
 /// count MSBs).
 pub mod fifo_status2 {

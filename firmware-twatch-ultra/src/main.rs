@@ -63,6 +63,7 @@ struct TwatchUltraBringup {
     // Shared-SPI chip selects held deselected (see TwatchUltraBoard).
     lora_cs: Option<p::GPIO36<'static>>,
     nfc_cs: Option<p::GPIO4<'static>>,
+    nfc_irq: Option<p::GPIO5<'static>>,
     // SX1262 reset/busy - reborrowed once at boot for the cold-sleep
     // park, then consumed by the LoRa task at spawn.
     lora_rst: Option<p::GPIO47<'static>>,
@@ -457,6 +458,12 @@ impl Bringup for TwatchUltraBringup {
                 self.spi_bus.expect("spi_bus built in make_store"),
                 self.nfc_cs_out.take().unwrap(),
                 store,
+                // GPIO5 NFC IRQ, active-high; pull-down so it reads
+                // low while the chip is unpowered at boot.
+                Input::new(
+                    self.nfc_irq.take().unwrap(),
+                    InputConfig::default().with_pull(Pull::Down),
+                ),
             )
             .unwrap(),
         );
@@ -798,6 +805,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         pmu_irq: Some(peripherals.GPIO7),
         lora_cs: Some(peripherals.GPIO36),
         nfc_cs: Some(peripherals.GPIO4),
+        nfc_irq: Some(peripherals.GPIO5),
         lora_rst: Some(peripherals.GPIO47),
         lora_busy: Some(peripherals.GPIO48),
         spi2: Some(peripherals.SPI2),
