@@ -18,7 +18,7 @@
 //! bytes - on the error path too - so a failed cascade says exactly
 //! which exchange failed and what the chip actually delivered.
 
-use app_core::nfc::{CardIdentity, NfcScanError, TypeAInfo, Uid};
+use app_core::nfc::{CardIdentity, CardKind, NfcScanError, TypeAInfo, Uid};
 use drivers::st25r3916::{regs, St25r3916};
 use embedded_hal::spi::SpiDevice;
 use embedded_hal_async::delay::DelayNs;
@@ -41,6 +41,40 @@ pub struct Reader<'a, S: SpiDevice, D: DelayNs> {
     delay: &'a mut D,
 }
 
+/// One 16-byte block delivered by [`Reader::sweep_classic`], with
+/// where it sits and the key that unlocked its sector. Handed to the
+/// sweep callback and dropped - the sweep keeps no history, so the
+/// RAM footprint is one of these, whatever the card's size. `data` is
+/// a copy (16 bytes), not a borrow, so the callback has no lifetime to
+/// juggle.
+#[derive(Debug, Clone, Copy)]
+pub struct SweepBlock {
+    /// Sector this block belongs to.
+    pub sector: u8,
+    /// Absolute block index (0-based across the whole card).
+    pub block: u8,
+    /// True for the sector trailer (its last block: access bits +
+    /// keys; key bytes usually read back as zero).
+    pub is_trailer: bool,
+    /// The 6-byte key that authenticated this block's sector.
+    pub key: [u8; 6],
+    /// Whether `key` is key A (`true`) or key B (`false`).
+    pub key_is_a: bool,
+    /// The 16 plaintext bytes.
+    pub data: [u8; 16],
+}
+
+/// Tally returned by [`Reader::sweep_classic`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SweepStats {
+    /// Sectors on this card family.
+    pub sectors_total: u8,
+    /// Sectors opened by a default key (A or B).
+    pub sectors_unlocked: u8,
+    /// Blocks successfully read and delivered to the callback.
+    pub blocks_read: u16,
+}
+
 impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
     pub fn new(spi: &'a mut S, delay: &'a mut D) -> Self {
         Reader { drv: St25r3916::new(), spi, delay }
@@ -59,7 +93,21 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
     /// TX_END fired, RX never came). WUPA is for waking a HALTed card,
     /// which is a different flow.
     pub async fn identify(&mut self, atqa: [u8; 2]) -> Result<CardIdentity, NfcScanError> {
+        let (uid, sak) = self.activate().await?;
+        Ok(CardIdentity::Iso14443a(TypeAInfo {
+            uid,
+            atqa,
+            sak,
+            kind: iso14443a::classify(atqa, sak),
+        }))
+    }
 
+    /// Run the anticollision cascade + SELECT on a card already in the
+    /// READY state - the caller's REQA, or [`wake`](Self::wake), just
+    /// answered - and return its assembled UID and final SAK. This is
+    /// the body [`identify`](Self::identify) wraps with classification;
+    /// the sweep's re-activation reuses it directly.
+    async fn activate(&mut self) -> Result<(Uid, u8), NfcScanError> {
         let mut uid: Uid = Vec::new();
         let mut sak = 0u8;
         for level in 1..=3u8 {
@@ -101,7 +149,7 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
                 log::warn!("nfc-dbg: anticol L{} BCC mismatch {:02X?}", level, ac);
                 return Err(NfcScanError::SelectFailed);
             }
-            log::info!("nfc-dbg: anticol L{} ok {:02X?}", level, ac);
+            log::debug!("nfc-dbg: anticol L{} ok {:02X?}", level, ac);
 
             // SELECT: [SEL, NVB=0x70, uid0..3, bcc] with CRC. Reply
             // is the 1-byte SAK (+CRC, stripped by the chip).
@@ -116,18 +164,12 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
                 return Err(NfcScanError::SelectFailed);
             }
             sak = sak_buf[0];
-            log::info!("nfc-dbg: select L{} ok SAK {:02X}", level, sak);
+            log::debug!("nfc-dbg: select L{} ok SAK {:02X}", level, sak);
             if !iso14443a::sak_says_cascade(sak) {
                 break;
             }
         }
-
-        Ok(CardIdentity::Iso14443a(TypeAInfo {
-            uid,
-            atqa,
-            sak,
-            kind: iso14443a::classify(atqa, sak),
-        }))
+        Ok((uid, sak))
     }
 
     /// Type 2 Tag READ (MIFARE Ultralight / NTAG): 16 bytes = 4 pages
@@ -181,7 +223,7 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
             );
             return Err(NfcScanError::SelectFailed);
         }
-        log::info!("nfc-dbg: hlta ok (main={:#04x})", irqs.main);
+        log::debug!("nfc-dbg: hlta ok (main={:#04x})", irqs.main);
         Ok(())
     }
 
@@ -233,7 +275,7 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
                 let st = self.drv.fifo_status(self.spi).map_err(hw)?;
                 let n = (st.bytes as usize).min(rx.len());
                 self.drv.fifo_read(self.spi, &mut rx[..n]).map_err(hw)?;
-                log::info!(
+                log::debug!(
                     "nfc-dbg: {} rx tx={:02X?} crc={} main={:#04x} err={:#04x} fifo={} rx={:02X?}",
                     what, tx, with_crc, irqs.main, irqs.error_wup, st.bytes, &rx[..n],
                 );
@@ -312,7 +354,7 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
                 } else {
                     nbytes.saturating_sub(1) * 8 + st.last_byte_bits as usize
                 };
-                log::info!(
+                log::debug!(
                     "nfc-dbg: {} raw main={:#04x} err={:#04x} fifo={} lb={} -> {} bits {:02X?}",
                     what, irqs.main, irqs.error_wup, st.bytes, st.last_byte_bits, bits, &rx[..nbytes],
                 );
@@ -358,7 +400,7 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
                 return Err(NfcScanError::SelectFailed);
             }
         };
-        log::info!("nfc-dbg: auth nt={:08X}", nt);
+        log::debug!("nfc-dbg: auth nt={:08X}", nt);
 
         // Pass 2: encrypted {nr, ar} with encrypted parity, no CRC,
         // manual parity; the reply is the 4-byte encrypted aT.
@@ -390,7 +432,7 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
             log::warn!("nfc-dbg: aT {:08X} != expected {:08X}", at, frame.at_expected);
             return Err(NfcScanError::SelectFailed);
         }
-        log::info!("nfc-dbg: auth OK aT={:08X}", at);
+        log::debug!("nfc-dbg: auth OK aT={:08X}", at);
         Ok(cipher)
     }
 
@@ -483,8 +525,139 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
             log::warn!("nfc-dbg: mifare-hlta answered (main={:#04x})", irqs.main);
             return Err(NfcScanError::SelectFailed);
         }
-        log::info!("nfc-dbg: mifare-hlta ok (main={:#04x})", irqs.main);
+        log::debug!("nfc-dbg: mifare-hlta ok (main={:#04x})", irqs.main);
         Ok(())
+    }
+
+    // -- Streaming MIFARE Classic sweep (step 4a) ---------------------------
+
+    /// Bring a card that is not currently selected back into the READY
+    /// state. WUPA wakes a HALTed card (where an encrypted/plain HALT
+    /// or a failed auth leaves it while the field stays lit); a REQA
+    /// fallback covers a card that reset to IDLE instead. Returns the
+    /// ATQA. The field must already be up; the answer is CRC-less and
+    /// needs no FIFO preparation, exactly as the boot REQA poll proved.
+    pub async fn wake(&mut self) -> Result<[u8; 2], NfcScanError> {
+        for &cmd in &[regs::cmd::TRANSMIT_WUPA, regs::cmd::TRANSMIT_REQA] {
+            self.drv.direct_command(self.spi, cmd).map_err(hw)?;
+            for _ in 0..RX_POLL_TRIES {
+                self.delay.delay_ms(RX_POLL_GAP_MS).await;
+                let irqs = self.drv.read_interrupts(self.spi).map_err(hw)?;
+                if irqs.main & regs::irq_main::RX_END != 0 {
+                    let st = self.drv.fifo_status(self.spi).map_err(hw)?;
+                    let n = (st.bytes as usize).min(2);
+                    let mut atqa = [0u8; 2];
+                    self.drv.fifo_read(self.spi, &mut atqa[..n]).map_err(hw)?;
+                    return Ok(atqa);
+                }
+            }
+        }
+        Err(NfcScanError::NoCard)
+    }
+
+    /// Wake + re-run the anticollision cascade + SELECT, leaving a
+    /// previously-halted card ACTIVE and selected again. Each sector of
+    /// a sweep starts from this clean re-activation, so a fresh auth
+    /// nonce is exchanged and a failed key attempt cannot poison the
+    /// next one.
+    async fn reactivate(&mut self) -> Result<(), NfcScanError> {
+        self.wake().await?;
+        let _ = self.activate().await?;
+        Ok(())
+    }
+
+    /// Stream every readable block of a MIFARE Classic to `on_block`,
+    /// one block at a time, accumulating nothing: the sweep holds only
+    /// the current [`SweepBlock`] and its cipher, so the RAM footprint
+    /// is flat for a 1K or a 4K. This is the fix for the old in-RAM
+    /// whole-card dump that started the footprint disaster.
+    ///
+    /// Precondition: the card is SELECTED and ACTIVE (call straight
+    /// after [`identify`](Self::identify)). The card is put into HALT
+    /// on entry so every sector begins uniformly by waking it.
+    ///
+    /// For each sector it tries key A then key B, each against the
+    /// [`mifare::DEFAULT_KEYS`] dictionary, re-activating the card
+    /// before every attempt (a failed Crypto1 auth drops the card).
+    /// On the first key that authenticates, it reads all blocks of the
+    /// sector under that one auth - the cipher advancing across the
+    /// reads - then encrypted-HALTs to end the session. A sector no
+    /// default key opens is logged and skipped. On return the card is
+    /// HALTED.
+    pub async fn sweep_classic<F: FnMut(SweepBlock)>(
+        &mut self,
+        kind: CardKind,
+        uid32: u32,
+        mut on_block: F,
+    ) -> Result<SweepStats, NfcScanError> {
+        let sectors = mifare::sector_count(kind);
+        let mut stats = SweepStats { sectors_total: sectors, ..Default::default() };
+
+        // The card is ACTIVE on entry; drop it to HALT so the per-sector
+        // loop can wake it uniformly with WUPA.
+        self.halt().await?;
+
+        for sector in 0..sectors {
+            let first = mifare::sector_first_block(sector) as u8;
+            let nblk = mifare::blocks_in_sector(sector);
+
+            // Find a working key: key A dictionary, then key B. Every
+            // attempt re-activates first, because a failed auth leaves
+            // the card unselected.
+            let mut opened: Option<(Crypto1, [u8; 6], bool)> = None;
+            'keys: for &key_is_a in &[true, false] {
+                for &key in mifare::DEFAULT_KEYS {
+                    // A wake/re-select failure here means the card left
+                    // the field (the small coil decouples easily on a
+                    // long sweep). That is not a sweep failure - keep
+                    // whatever was already read and return it.
+                    if self.reactivate().await.is_err() {
+                        log::warn!(
+                            "nfc-dbg: sweep card lost at sector {} - partial dump, {} blocks read",
+                            sector, stats.blocks_read,
+                        );
+                        return Ok(stats);
+                    }
+                    if let Ok(cipher) = self.mifare_auth(key, key_is_a, first, uid32).await {
+                        opened = Some((cipher, key, key_is_a));
+                        break 'keys;
+                    }
+                }
+            }
+
+            match opened {
+                Some((mut cipher, key, key_is_a)) => {
+                    stats.sectors_unlocked += 1;
+                    for b in 0..nblk {
+                        let block = first + b;
+                        match self.mifare_read_block(&mut cipher, block).await {
+                            Ok(data) => {
+                                stats.blocks_read += 1;
+                                on_block(SweepBlock {
+                                    sector,
+                                    block,
+                                    is_trailer: b + 1 == nblk,
+                                    key,
+                                    key_is_a,
+                                    data,
+                                });
+                            }
+                            Err(e) => log::warn!(
+                                "nfc-dbg: sweep sector {} block {} read failed: {:?}",
+                                sector, block, e,
+                            ),
+                        }
+                    }
+                    // End the crypto session so the card is HALTED for
+                    // the next sector's WUPA.
+                    if let Err(e) = self.mifare_halt(&mut cipher).await {
+                        log::warn!("nfc-dbg: sweep sector {} halt failed: {:?}", sector, e);
+                    }
+                }
+                None => log::warn!("nfc-dbg: sweep sector {} locked (no default key)", sector),
+            }
+        }
+        Ok(stats)
     }
 }
 

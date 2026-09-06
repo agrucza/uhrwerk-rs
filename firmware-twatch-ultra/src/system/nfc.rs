@@ -308,36 +308,38 @@ async fn rf_probe(
                                     Err(e) => log::warn!("NFC: type2 read failed: {:?}", e),
                                 }
                             }
-                            // Step 3b-ii: MIFARE Classic - authenticate
-                            // sector 0 with the factory default key A and
-                            // read block 0 (the manufacturer block: its
-                            // first 4 bytes are the UID, so it
-                            // self-verifies like the type 2 read).
+                            // Step 4a: MIFARE Classic - STREAMING sweep of
+                            // the whole card. Every sector is opened with a
+                            // default key (A then B), all its blocks read
+                            // under that one auth, and each 16-byte block
+                            // handed to the callback below the instant it is
+                            // read - logged straight to serial, nothing
+                            // accumulated. On return the card is HALTED, so
+                            // the plain HLTA at the end is skipped.
                             if a.kind.is_mifare_classic() {
                                 let uid32 = nfc::mifare::uid_for_auth(&a.uid);
-                                let key = [0xFFu8; 6];
-                                match reader.mifare_auth(key, true, 0, uid32).await {
-                                    Ok(mut cipher) => {
-                                        match reader.mifare_read_block(&mut cipher, 0).await {
-                                            Ok(blk) => {
-                                                let uid_ok = blk[..4] == a.uid[..4.min(a.uid.len())];
-                                                log::info!(
-                                                    "NFC: classic block 0 {:02X?} - {}",
-                                                    blk, if uid_ok { "UID matches" } else { "read ok" },
-                                                );
-                                            }
-                                            Err(e) => log::warn!("NFC: classic block 0 read failed: {:?}", e),
-                                        }
-                                        // Encrypted HALT: quiet the authed card
-                                        // so, left on the back, it stops
-                                        // re-authing every cadence.
-                                        if let Err(e) = reader.mifare_halt(&mut cipher).await {
-                                            log::warn!("NFC: mifare halt failed: {:?}", e);
-                                        }
-                                        crypto_halted = true;
-                                    }
-                                    Err(e) => log::warn!("NFC: classic auth (key A default) failed: {:?}", e),
+                                let on_block = |b: nfc::reader::SweepBlock| {
+                                    log::info!(
+                                        "NFC: sweep S{:02} B{:03}{} key{} {:02X?} | {:02X?}",
+                                        b.sector,
+                                        b.block,
+                                        if b.is_trailer { "*" } else { " " },
+                                        if b.key_is_a { "A" } else { "B" },
+                                        b.key,
+                                        b.data,
+                                    );
+                                };
+                                match reader.sweep_classic(a.kind, uid32, on_block).await {
+                                    Ok(s) => log::info!(
+                                        "NFC: sweep done - {}/{} sectors unlocked, {} blocks read",
+                                        s.sectors_unlocked, s.sectors_total, s.blocks_read,
+                                    ),
+                                    Err(e) => log::warn!("NFC: sweep failed: {:?}", e),
                                 }
+                                // The sweep leaves the card HALTED (encrypted
+                                // halt of the last sector, or a failed auth) -
+                                // do not send it a plain HLTA on top.
+                                crypto_halted = true;
                             }
                         }
                         presentations += 1;
