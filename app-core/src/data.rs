@@ -33,6 +33,10 @@ pub struct Capabilities {
     /// build feature (a bin can't claim a radio it didn't wire), not
     /// by the bin. Gates the settings WIFI row.
     pub wifi: bool,
+    /// An NFC reader front end with a scan task (currently the
+    /// T-Watch Ultra's ST25R3916). Gates the app-drawer NFC tile and
+    /// the NFC screen.
+    pub nfc: bool,
 }
 
 // ============================================================================

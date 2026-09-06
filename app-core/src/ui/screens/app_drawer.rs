@@ -49,6 +49,8 @@ enum IconKind {
     Alarm,
     Settings,
     Heart,
+    /// Smartcard-chip glyph for the NFC tile.
+    Nfc,
     /// Placeholder glyph for unused slots: a small hollow square.
     Empty,
 }
@@ -67,6 +69,7 @@ fn draw_icon<D: BlendTarget>(
         IconKind::Alarm     => glyphs::bell(display, cx, cy, radius, color),
         IconKind::Settings  => glyphs::settings(display, cx, cy, radius, color),
         IconKind::Heart     => glyphs::heart(display, cx, cy, radius, color),
+        IconKind::Nfc       => glyphs::chip(display, cx, cy, radius, color),
         IconKind::Empty     => {
             let size = (radius * 2 / 3).max(6);
             let x = cx - size / 2;
@@ -102,10 +105,23 @@ const TILES: [TileDef; 9] = [
     TileDef { target: Some(ScreenId::Timer),     caption: "TIMER",    border: theme::MEDIA, icon: IconKind::Timer     },
     TileDef { target: Some(ScreenId::Alarm),     caption: "ALARM",    border: theme::ALERT, icon: IconKind::Alarm     },
     // Row 2
-    TileDef { target: None,                      caption: "",         border: theme::BORDER,  icon: IconKind::Empty     },
+    TileDef { target: Some(ScreenId::Nfc),       caption: "NFC",      border: theme::INFO,    icon: IconKind::Nfc       },
     TileDef { target: None,                      caption: "MSG",      border: theme::BORDER,  icon: IconKind::Empty     },
     TileDef { target: None,                      caption: "CAL",      border: theme::BORDER,  icon: IconKind::Empty     },
 ];
+
+/// The tile's launch target after capability gating. The NFC tile
+/// only launches on a board that carries the reader; elsewhere it
+/// falls back to a dimmed placeholder (like the other `None` slots)
+/// rather than opening a screen that can never show a card. This is
+/// the drawer's only capability gate; other board-specific features
+/// gate as settings rows, not drawer apps.
+fn effective_target(t: &TileDef, data: &SystemData) -> Option<ScreenId> {
+    match t.target {
+        Some(ScreenId::Nfc) if !data.capabilities.nfc => None,
+        other => other,
+    }
+}
 
 // -- Layout constants --------------------------------------------------------
 
@@ -159,7 +175,7 @@ impl Screen for AppDrawerScreen {
         data: &SystemData,
         ctx: &RenderCtx,
     ) {
-        let installed = TILES.iter().filter(|t| t.target.is_some()).count();
+        let installed = TILES.iter().filter(|t| effective_target(t, data).is_some()).count();
         let mut buf: String<16> = String::new();
         let _ = write!(buf, "{:02} INSTALLED", installed);
         draw_overlay_chrome(
@@ -200,7 +216,7 @@ impl Screen for AppDrawerScreen {
             // Placeholder tiles dim BOTH the icon and the caption -
             // a dim icon under a full-brightness caption read as
             // half-enabled.
-            let (icon_color, caption_color) = if t.target.is_some() {
+            let (icon_color, caption_color) = if effective_target(t, data).is_some() {
                 (t.border, theme::FG)
             } else {
                 (theme::FG_DIM, theme::FG_DIM)
@@ -236,7 +252,7 @@ impl Screen for AppDrawerScreen {
                     let row = i / 3;
                     let col = i % 3;
                     if !tile_rect(row, col, &data.safe_area).contains(pt) { continue; }
-                    if let Some(target) = t.target {
+                    if let Some(target) = effective_target(t, data) {
                         return Action::SwitchScreen(target);
                     }
                     return Action::None;

@@ -70,6 +70,10 @@ pub enum ScreenId {
     /// pre-overlay screen onto the nav stack so `Action::Back`
     /// returns to wherever the user came from.
     Notifications,
+    /// NFC card reader. Shows the last scanned card's technology,
+    /// family and UID. Launched from the app-drawer NFC tile, which
+    /// only appears on boards with the `nfc` capability.
+    Nfc,
 }
 
 // -- Actions -----------------------------------------------------------------
@@ -950,6 +954,12 @@ pub struct SystemData {
     /// otherwise tell whether `wifi` or `gps_sync` holds the fresher
     /// `Synced`. See [`crate::data::TimeSyncOutcome`].
     pub last_time_sync: Option<crate::data::TimeSyncOutcome>,
+
+    /// The last card an NFC scan identified, from
+    /// `SystemEvent::NfcProbe`; `None` until the first one lands this
+    /// boot (and always on boards without the NFC capability). Read
+    /// by the NFC screen. Not live - a fresh scan replaces it.
+    pub last_nfc: Option<crate::nfc::CardIdentity>,
 }
 
 // -- Screen trait -------------------------------------------------------------

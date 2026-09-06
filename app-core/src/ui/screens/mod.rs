@@ -1,6 +1,7 @@
 pub mod alarm;
 pub mod app_drawer;
 pub mod clock;
+pub mod nfc;
 pub mod notifications;
 pub mod quick_access;
 pub mod settings;
@@ -28,6 +29,9 @@ pub enum ActiveScreen {
     AppDrawer(app_drawer::AppDrawerScreen),
     /// Global ALERTS overlay. Reached via left-edge swipe-right.
     Notifications(notifications::NotificationsScreen),
+    /// NFC card reader (last scanned card). Launched from the app
+    /// drawer on boards with the `nfc` capability.
+    Nfc(nfc::NfcScreen),
 }
 
 impl ActiveScreen {
@@ -58,6 +62,7 @@ impl ActiveScreen {
             ScreenId::Notifications => {
                 Self::Notifications(notifications::NotificationsScreen::new())
             }
+            ScreenId::Nfc => Self::Nfc(nfc::NfcScreen::new()),
         }
     }
 
@@ -88,6 +93,7 @@ impl ActiveScreen {
             Self::QuickAccess(s) => s.render(display, data, ctx),
             Self::AppDrawer(s) => s.render(display, data, ctx),
             Self::Notifications(s) => s.render(display, data, ctx),
+            Self::Nfc(s) => s.render(display, data, ctx),
         }
     }
 
@@ -101,6 +107,7 @@ impl ActiveScreen {
             Self::QuickAccess(s) => s.on_event(event, data),
             Self::AppDrawer(s) => s.on_event(event, data),
             Self::Notifications(s) => s.on_event(event, data),
+            Self::Nfc(s) => s.on_event(event, data),
         }
     }
 
@@ -114,6 +121,7 @@ impl ActiveScreen {
             Self::QuickAccess(s) => s.on_mount(data),
             Self::AppDrawer(s) => s.on_mount(data),
             Self::Notifications(s) => s.on_mount(data),
+            Self::Nfc(s) => s.on_mount(data),
         }
     }
 
@@ -127,6 +135,7 @@ impl ActiveScreen {
             Self::QuickAccess(s) => s.on_unmount(),
             Self::AppDrawer(s) => s.on_unmount(),
             Self::Notifications(s) => s.on_unmount(),
+            Self::Nfc(s) => s.on_unmount(),
         }
     }
 
@@ -142,6 +151,7 @@ impl ActiveScreen {
             Self::QuickAccess(s) => s.dirty_rects(data),
             Self::AppDrawer(s) => s.dirty_rects(data),
             Self::Notifications(s) => s.dirty_rects(data),
+            Self::Nfc(s) => s.dirty_rects(data),
         }
     }
 
@@ -158,6 +168,7 @@ impl ActiveScreen {
             Self::QuickAccess(s) => s.clear_dirty(data),
             Self::AppDrawer(s) => s.clear_dirty(data),
             Self::Notifications(s) => s.clear_dirty(data),
+            Self::Nfc(s) => s.clear_dirty(data),
         }
     }
 
@@ -172,6 +183,7 @@ impl ActiveScreen {
             Self::QuickAccess(_) => ScreenId::QuickAccess,
             Self::AppDrawer(_) => ScreenId::AppDrawer,
             Self::Notifications(_) => ScreenId::Notifications,
+            Self::Nfc(_) => ScreenId::Nfc,
         }
     }
 

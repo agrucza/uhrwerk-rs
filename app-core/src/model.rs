@@ -570,6 +570,14 @@ impl Model {
                 // on the 1 Hz TimeUpdated tick, same as steps.
                 self.cached_data.gps_fix = Some(*fix);
             }
+            SystemEvent::NfcProbe { card: Some(card) } => {
+                // Store the last identified card so the NFC screen can
+                // show it. Redraw so the screen updates if it is up
+                // (a probe with no card falls through to the no-op arm
+                // and leaves the previous card in place).
+                self.cached_data.last_nfc = Some(card.clone());
+                self.needs_redraw = true;
+            }
             SystemEvent::WifiStatusUpdated { state } => {
                 if self.cached_data.wifi != *state {
                     // Tactile end-of-session milestone, like the GPS
@@ -1942,7 +1950,7 @@ mod tests {
     /// A model whose board carries the given radios.
     fn with_caps(wifi: bool, gps: bool) -> Model {
         let mut data = SystemData::default();
-        data.capabilities = crate::data::Capabilities { wifi, gps, steps: false };
+        data.capabilities = crate::data::Capabilities { wifi, gps, steps: false, nfc: false };
         Model::new(data, Config::default(), Instant::from_millis(0))
     }
 

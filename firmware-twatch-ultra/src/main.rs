@@ -488,6 +488,7 @@ impl Bringup for TwatchUltraBringup {
         app_core::data::Capabilities {
             gps: true,
             steps: true,
+            nfc: true,
             ..app_core::data::Capabilities::default()
         }
     }
