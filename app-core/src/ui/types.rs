@@ -955,11 +955,12 @@ pub struct SystemData {
     /// `Synced`. See [`crate::data::TimeSyncOutcome`].
     pub last_time_sync: Option<crate::data::TimeSyncOutcome>,
 
-    /// The last card an NFC scan identified, from
-    /// `SystemEvent::NfcProbe`; `None` until the first one lands this
-    /// boot (and always on boards without the NFC capability). Read
-    /// by the NFC screen. Not live - a fresh scan replaces it.
-    pub last_nfc: Option<crate::nfc::CardIdentity>,
+    /// Outcome of the last NFC scan, from `SystemEvent::NfcProbe`:
+    /// `Card` when identified, `Unrecognized` when a card was present
+    /// but couldn't be identified, `None` until the first scan (and
+    /// always on boards without NFC). Read by the NFC screen. Not
+    /// live - a fresh scan replaces it.
+    pub last_nfc: crate::nfc::NfcScan,
 }
 
 // -- Screen trait -------------------------------------------------------------

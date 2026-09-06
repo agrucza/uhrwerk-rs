@@ -301,6 +301,16 @@ impl Board for TwatchUltraBoard {
         }
     }
 
+    /// One-shot self-terminating click - see `buzz`. The haptics task
+    /// plays a ROM effect the DRV2605 ends on its own, so nothing can
+    /// leave the motor latched on.
+    fn buzz_click(&mut self) {
+        use crate::system::haptics::{HapticCommand, HAPTIC_COMMAND};
+        if HAPTIC_COMMAND.try_send(HapticCommand::Click).is_err() {
+            log::warn!("Haptics: command queue full - click dropped");
+        }
+    }
+
     /// AXP2101 soft power-off (REG 10h bit 0) - kills every rail.
     /// The PMU's long-press (6 s) shutdown is separate and stays
     /// PMU-internal; this is the firmware-initiated path (settings
@@ -317,16 +327,21 @@ impl Board for TwatchUltraBoard {
         }
     }
 
-    /// Re-arm GPIO wake for BOOT (0), RTC INT (1), PMU IRQ (7) and
-    /// touch INT (12). The embassy async GPIO drivers clear the
-    /// `wakeup_enable` bits set at init on every wait, so the board
-    /// sets them back immediately before `rtc.sleep()`. `int_type=4`
-    /// is LowLevel - all four lines are active-low - and the only
-    /// type esp-hal allows for wake-from-light-sleep.
+    /// Re-arm GPIO wake right before `rtc.sleep()`. The embassy async
+    /// GPIO drivers clear the `wakeup_enable` bits set at init on
+    /// every wait, so the board sets them back here.
     ///
-    /// Touch INT is the tap-to-wake path: the CST9217 keeps scanning
-    /// through system sleep (12 uA monitor mode, self-managed) and
-    /// asserts INT on the first touch.
+    /// Two groups by polarity (`Event` discriminants: LowLevel = 4,
+    /// HighLevel = 5):
+    /// - Active-LOW (`int_type = 4`): BOOT (0), RTC INT (1), PMU IRQ
+    ///   (7), touch INT (12). Touch INT is the tap-to-wake path - the
+    ///   CST9217 keeps scanning through sleep (12 uA monitor mode) and
+    ///   asserts INT on the first touch.
+    /// - Active-HIGH (`int_type = 5`): NFC IRQ (5). In wake-up mode
+    ///   the ST25R3916 drives it high when a card trips the amplitude
+    ///   threshold, so an NFC tap wakes the watch. High-level wake IS
+    ///   supported (esp-hal fork); the old "int_type 4 only" note was
+    ///   outdated.
     fn arm_wake_sources(&mut self) {
         for &gpio_num in &[
             crate::board::BTN_BOOT,
@@ -339,6 +354,12 @@ impl Board for TwatchUltraBoard {
                 w.int_type().bits(4)
             });
         }
+        GPIO::regs()
+            .pin(crate::board::NFC_IRQ as usize)
+            .modify(|_, w| unsafe {
+                w.wakeup_enable().set_bit();
+                w.int_type().bits(5)
+            });
     }
 
     /// S3 family: RTC_CNTL (`LPWR`) `slp_wakeup_cause`.

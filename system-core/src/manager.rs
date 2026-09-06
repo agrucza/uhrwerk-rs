@@ -567,6 +567,11 @@ impl<B: Board> SystemManager<'static, B> {
                     }
                 }
                 Effect::MotorOff => self.board.buzz_stop(),
+                Effect::MotorClick => {
+                    if self.model.config().alerts.haptics_enabled {
+                        self.board.buzz_click();
+                    }
+                }
                 Effect::MotorPulse { duration_ms } => {
                     if self.model.config().alerts.haptics_enabled {
                         self.board.buzz();

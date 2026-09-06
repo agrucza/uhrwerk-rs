@@ -74,17 +74,47 @@ impl Screen for NfcScreen {
         let safe = &data.safe_area;
         let content_top = app_content_top(safe);
 
-        let Some(card) = &data.last_nfc else {
-            // Empty state: no card identified this boot.
-            fonts::draw_centered(
-                display,
-                &fonts::headline(),
-                "PRESENT A CARD",
-                theme::SCREEN_W as i32 / 2,
-                content_top + (theme::SCREEN_H as i32 - content_top) / 2 - 20,
-                theme::FG_MUTED,
-            );
-            return;
+        // Three states: a recognized card renders the panel below; the
+        // other two are a single centered caption.
+        let card = match &data.last_nfc {
+            crate::nfc::NfcScan::Card(c) => c,
+            other => {
+                let cy = content_top + (theme::SCREEN_H as i32 - content_top) / 2 - 20;
+                let cx = theme::SCREEN_W as i32 / 2;
+                match other {
+                    crate::nfc::NfcScan::Unrecognized => {
+                        // A card was there but couldn't be read.
+                        fonts::draw_centered(
+                            display,
+                            &fonts::headline(),
+                            "CARD NOT RECOGNIZED",
+                            cx,
+                            cy,
+                            theme::WARN,
+                        );
+                        fonts::draw_centered(
+                            display,
+                            &fonts::caption(),
+                            "unsupported or unreadable",
+                            cx,
+                            cy + 40,
+                            theme::FG_MUTED,
+                        );
+                    }
+                    _ => {
+                        // No scan yet this boot.
+                        fonts::draw_centered(
+                            display,
+                            &fonts::headline(),
+                            "PRESENT A CARD",
+                            cx,
+                            cy,
+                            theme::FG_MUTED,
+                        );
+                    }
+                }
+                return;
+            }
         };
 
         // -- Card panel --------------------------------------------------

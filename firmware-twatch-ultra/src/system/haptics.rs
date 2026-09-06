@@ -9,16 +9,27 @@
 //! itself, exactly as it does for the GPIO motor board.
 
 use drivers::drv2605::{Config as DrvConfig, Drv2605, RTP_MAX};
+use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Timer};
-use system_core::bus::SharedI2c;
+use system_core::bus::{SharedI2c, SleepState, SLEEP_WATCH};
 
 #[derive(Clone, Copy)]
 pub enum HapticCommand {
     On,
     Off,
+    /// One-shot self-terminating ROM click (see [`CLICK_EFFECT`]). The
+    /// DRV2605 plays it autonomously and stops itself, so unlike the
+    /// On/Off pair it can never latch the motor on - the right shape
+    /// for a scan-confirm buzz that fires at a wake-from-sleep
+    /// boundary.
+    Click,
 }
+
+/// DRV2605 ROM library A effect for the click: 1 = "Strong Click -
+/// 100%". Short and crisp; the chip ends it on its own.
+const CLICK_EFFECT: u8 = 1;
 
 /// Depth 8 is burst headroom only: pattern pulses arrive every
 /// ~100+ ms and the task drains a command in ~1 ms of I2C.
@@ -74,27 +85,79 @@ pub async fn haptics_task(i2c_bus: &'static SharedI2c) {
     // The hold keeps the manager idling until Off has actually
     // reached the chip.
     let mut motor_hold: Option<system_core::bus::WakeHold> = None;
+    // React to sleep transitions too, not just buzz commands: the
+    // motor MUST be off before the system enters real light sleep, or
+    // a lost/failed Off leaves it vibrating straight through sleep
+    // (executor frozen, nothing to deliver the stop until the next
+    // wake).
+    let mut sleep_rx = SLEEP_WATCH.receiver().unwrap();
     loop {
-        let cmd = HAPTIC_COMMAND.receive().await;
-        if !online {
-            continue;
-        }
-        let mut i2c = i2c_bus.lock().await;
-        let res = match cmd {
-            HapticCommand::On => {
-                if motor_hold.is_none() {
-                    motor_hold = Some(system_core::bus::WakeHold::new());
+        match select(HAPTIC_COMMAND.receive(), sleep_rx.changed()).await {
+            Either::First(cmd) => {
+                if !online {
+                    continue;
                 }
-                drv.buzz_on(&mut *i2c, RTP_MAX)
+                match cmd {
+                    HapticCommand::On => {
+                        if motor_hold.is_none() {
+                            motor_hold = Some(system_core::bus::WakeHold::new());
+                        }
+                        let mut i2c = i2c_bus.lock().await;
+                        if drv.buzz_on(&mut *i2c, RTP_MAX).is_err() {
+                            log::warn!("Haptics: buzz_on I2C write failed");
+                        }
+                    }
+                    HapticCommand::Off => {
+                        // Retry the stop: a single failed Off (plausible
+                        // in the I2C storm right at a wake, when this
+                        // buzz fires) would otherwise strand the motor
+                        // driving continuously. The wake lock is held
+                        // across the retries so the system can't sleep
+                        // with the motor still on.
+                        if !stop_motor(&drv, i2c_bus).await {
+                            log::warn!("Haptics: buzz_off failed after retries");
+                        }
+                        motor_hold = None;
+                    }
+                    HapticCommand::Click => {
+                        // Self-terminating ROM effect: fire and forget.
+                        // No wake lock - the chip finishes the click on
+                        // its own even if the system sleeps right after,
+                        // and there is no Off to lose.
+                        let mut i2c = i2c_bus.lock().await;
+                        if drv.play_effect(&mut *i2c, CLICK_EFFECT).is_err() {
+                            log::warn!("Haptics: click I2C write failed");
+                        }
+                    }
+                }
             }
-            HapticCommand::Off => {
-                let res = drv.buzz_off(&mut *i2c);
-                motor_hold = None;
-                res
+            Either::Second(state) => {
+                // Safety net: force the motor off before real light
+                // sleep, regardless of what the command stream did.
+                if matches!(state, SleepState::Sleeping) {
+                    if online {
+                        let _ = stop_motor(&drv, i2c_bus).await;
+                    }
+                    motor_hold = None;
+                }
             }
-        };
-        if res.is_err() {
-            log::warn!("Haptics: DRV2605 I2C write failed");
         }
     }
+}
+
+/// Stop the motor, retrying the I2C writes - a lost Off leaves the
+/// DRV2605 in continuous RTP drive. Returns true once the stop lands.
+async fn stop_motor(drv: &Drv2605, i2c_bus: &'static SharedI2c) -> bool {
+    for attempt in 0..5 {
+        {
+            let mut i2c = i2c_bus.lock().await;
+            if drv.buzz_off(&mut *i2c).is_ok() {
+                return true;
+            }
+        }
+        if attempt < 4 {
+            Timer::after(Duration::from_millis(5)).await;
+        }
+    }
+    false
 }

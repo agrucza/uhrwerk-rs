@@ -224,6 +224,27 @@ impl CardIdentity {
 }
 
 // ============================================================================
+// NfcScan - the outcome of the last scan, for the UI.
+// ============================================================================
+
+/// What the last NFC scan produced, held in `SystemData` for the NFC
+/// screen. Distinguishes "nothing scanned yet" from "a card was there
+/// but could not be identified" (a technology the reader can't read, a
+/// failed read, or the wake-up sensor tripping on an unreadable card)
+/// so the screen shows a clear "not recognized" state instead of a
+/// bare wake.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum NfcScan {
+    /// No scan this boot.
+    #[default]
+    None,
+    /// A card was identified.
+    Card(CardIdentity),
+    /// A card was present but not identified (or an unreadable trip).
+    Unrecognized,
+}
+
+// ============================================================================
 // Errors
 // ============================================================================
 

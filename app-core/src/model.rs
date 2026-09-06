@@ -75,6 +75,12 @@ pub enum Effect {
     /// Used as the NFC scan-complete confirmation. Gated on
     /// `haptics_enabled` like the other motor effects.
     MotorDoublePulse,
+    /// One-shot self-terminating haptic click (a DRV2605 ROM effect on
+    /// boards that have one). Unlike `MotorPulse`, there is no timed
+    /// Off to lose, so it cannot latch the motor on - used for the NFC
+    /// identify confirmation, which fires at a wake-from-sleep
+    /// boundary. Gated on `haptics_enabled`.
+    MotorClick,
 
     /// Forward a command to the RTC task via `RTC_COMMAND`.
     RtcCommand(RtcCommand),
@@ -385,6 +391,34 @@ impl Model {
             }
         }
 
+        // 3c. NFC scan: a card was presented - a deliberate user
+        // action, whether or not it could be identified. Wake the
+        // device (a tap-from-sleep lights the display here) and jump to
+        // the NFC screen so the card, or a "not recognized" state, is
+        // shown. The outcome is already cached (step 1); the event is
+        // consumed so it never reaches a screen's on_event.
+        if let SystemEvent::NfcProbe { .. } = event {
+            self.last_activity = now;
+            self.motion_wake_grace = None;
+            if self.sleeping {
+                self.wake(now, &mut out);
+            }
+            if self.screen.id() != ScreenId::Nfc {
+                // Launch like an app: remember where we came from so
+                // Back returns there. Don't stack onto an overlay -
+                // replace it (matches the app-drawer launch path).
+                if !matches!(
+                    self.screen.id(),
+                    ScreenId::QuickAccess | ScreenId::AppDrawer | ScreenId::Notifications
+                ) {
+                    self.nav_stack.push(self.screen.id());
+                }
+                self.screen.switch_to(ScreenId::Nfc, &self.cached_data);
+            }
+            self.needs_redraw = true;
+            return out;
+        }
+
         // 3b. Wrist lowered: the wrist left the viewing pose - the
         // user is done looking. Sleep now instead of waiting out
         // the idle timer. Never mid-alert: an alarm keeps ringing
@@ -574,18 +608,25 @@ impl Model {
                 // on the 1 Hz TimeUpdated tick, same as steps.
                 self.cached_data.gps_fix = Some(*fix);
             }
-            SystemEvent::NfcProbe { card: Some(card) } => {
-                // Store the last identified card so the NFC screen can
-                // show it. Redraw so the screen updates if it is up
-                // (a probe with no card falls through to the no-op arm
-                // and leaves the previous card in place).
-                self.cached_data.last_nfc = Some(card.clone());
+            SystemEvent::NfcProbe { card } => {
+                // A card was identified, or one was present but not
+                // identified (an unreadable/unsupported tap). Either
+                // way it is a real presentation - store the outcome so
+                // the screen shows the card or a "not recognized"
+                // state.
+                self.cached_data.last_nfc = match card {
+                    Some(c) => crate::nfc::NfcScan::Card(c.clone()),
+                    None => crate::nfc::NfcScan::Unrecognized,
+                };
                 self.needs_redraw = true;
-                // Scan-complete confirmation: a distinct double tap
-                // (manager gates it on haptics_enabled). Only fires
-                // when a card was actually identified, so it is never
-                // spurious.
-                let _ = out.push(Effect::MotorDoublePulse);
+                // Scan confirmation: a one-shot self-terminating click
+                // (manager gates it on haptics_enabled). NOT a
+                // MotorPulse - the timed On/Off latched the motor on
+                // after a real-light-sleep wake. A ROM click has no
+                // separate Off to lose and the chip ends it itself, so
+                // it cannot latch. Same feedback whether or not the
+                // card was identified.
+                let _ = out.push(Effect::MotorClick);
             }
             SystemEvent::WifiStatusUpdated { state } => {
                 if self.cached_data.wifi != *state {

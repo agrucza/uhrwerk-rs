@@ -51,9 +51,11 @@ type SpiErr = esp_hal::spi::Error;
 const CARD_POLL_SECS: u64 = 2;
 const CARD_POLL_GAP_MS: u64 = 500;
 
-/// Wake-up amplitude detection delta (`am_d<3:0>`, 0..=15). Starting
-/// value - HARDWARE TUNING (Phase 4): raise it if idle antenna drift
-/// false-trips, lower it if presenting a card does not trip.
+/// Wake-up amplitude detection delta (`am_d<3:0>`, 0..=15). Lower =
+/// more sensitive. 4 reliably trips a MIFARE Classic and an NTAG216
+/// (the NTAG couples a little more weakly, so it needs a moment on the
+/// coil rather than a flick, but it does trip). Raise it if idle drift
+/// false-trips; lower toward 1 if a card genuinely won't trip.
 const WAKEUP_DELTA: u8 = 4;
 
 /// Settle delay before re-arming wake-up mode after handling a trip -
@@ -273,6 +275,11 @@ async fn rf_probe(
     );
     let deadline = Instant::now() + Duration::from_secs(CARD_POLL_SECS);
     let mut presentations: u32 = 0;
+    // Whether any card answered REQA (ATQA received), even if it then
+    // failed to identify. Gates the "unrecognized" report so a bare
+    // wake-up trip with no card answering (a false trip, or the card
+    // already lifted) stays silent instead of flashing "not recognized".
+    let mut saw_atqa = false;
     while Instant::now() < deadline {
         drv.direct_command(spi, regs::cmd::TRANSMIT_REQA)?;
         // ATQA arrives within ~100 us of the REQA end; poll the
@@ -281,6 +288,7 @@ async fn rf_probe(
             Timer::after(Duration::from_millis(2)).await;
             let irqs = drv.read_interrupts(spi)?;
             if irqs.main & regs::irq_main::RX_END != 0 {
+                saw_atqa = true;
                 let st = drv.fifo_status(spi)?;
                 let n = (st.bytes as usize).min(2);
                 let mut atqa = [0u8; 2];
@@ -489,10 +497,14 @@ async fn rf_probe(
         }
         Timer::after(Duration::from_millis(CARD_POLL_GAP_MS)).await;
     }
-    // No `nfc_nocard` emit here: this now runs once per wake-up trip,
-    // and a trip that turns up no card (drift, or a card already
-    // lifted) is normal and must not spam the event log or clear the
-    // screen's last card.
+    // A card ANSWERED the reader (ATQA) but none could be identified -
+    // an unsupported technology or a failed read. Report it as
+    // "unrecognized" so the screen shows a clear state. A bare trip
+    // where nothing answered (false trip, or the card lifted before the
+    // poll) stays silent - no spurious "not recognized".
+    if saw_atqa && presentations == 0 {
+        EVENTS.send(SystemEvent::NfcProbe { card: None }).await;
+    }
     Ok(presentations)
 }
 

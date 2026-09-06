@@ -44,6 +44,13 @@ pub trait Board {
     /// Stop the haptic motor. Boards without one: no-op.
     fn buzz_stop(&mut self);
 
+    /// Fire a one-shot, self-terminating haptic "click". Unlike
+    /// `buzz`/`buzz_stop`, there is no separate stop to lose, so it
+    /// cannot latch the motor on - used for the NFC scan-confirm,
+    /// which fires at a wake-from-sleep boundary. Default: no-op for
+    /// boards without a driver that supports it.
+    fn buzz_click(&mut self) {}
+
     /// Power the board off, for firmware-initiated shutdowns (the
     /// settings item, the low-battery cutoff) - releases a
     /// soft-power latch or writes the PMU's soft power-off. Must

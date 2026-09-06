@@ -458,8 +458,9 @@ pub fn classify_for_log(event: &SystemEvent) -> Option<LoggedEvent> {
         //   nfc_b  <pupi>       -            Type B - PUPI is exactly 4 B
         //   nfc_f  <idm[0..4]>  <idm[4..8]>  FeliCa - full 8-byte IDm
         //   nfc_v  <uid[0..4]>  <uid[4..8]>  NFC-V  - full 8-byte UID
-        // `nfc_nocard` marks a window that closed with nothing
-        // selectable.
+        // `nfc_unknown` marks a tap that woke the reader but yielded no
+        // identifiable card (an unreadable/unsupported card, or a trip
+        // with nothing selectable).
         SystemEvent::NfcProbe { card: Some(crate::nfc::CardIdentity::Iso14443a(a)) } =>
             LoggedEvent { tag: "nfc_a", detail: Some(le_u32(&a.uid)), detail2: Some(a.sak as u32) },
         SystemEvent::NfcProbe { card: Some(crate::nfc::CardIdentity::Iso14443b(b)) } =>
@@ -475,7 +476,7 @@ pub fn classify_for_log(event: &SystemEvent) -> Option<LoggedEvent> {
             detail2: Some(le_u32(&v.uid[4..])),
         },
         SystemEvent::NfcProbe { card: None } =>
-            LoggedEvent { tag: "nfc_nocard", detail: None, detail2: None },
+            LoggedEvent { tag: "nfc_unknown", detail: None, detail2: None },
         _ => return None,
     })
 }
@@ -514,12 +515,12 @@ mod tests {
             classify_for_log(&f),
             Some(LoggedEvent { tag: "nfc_f", detail: Some(0x0403_0201), detail2: Some(0x0807_0605) }),
         );
-        // A closed window logs its own tag with no detail - both
+        // An unidentified tap logs its own tag with no detail - both
         // outcomes are evidence.
         let miss = SystemEvent::NfcProbe { card: None };
         assert_eq!(
             classify_for_log(&miss),
-            Some(LoggedEvent { tag: "nfc_nocard", detail: None, detail2: None }),
+            Some(LoggedEvent { tag: "nfc_unknown", detail: None, detail2: None }),
         );
         // A probe finishing while the display sleeps must not wake
         // it, and it is not something the user did.
