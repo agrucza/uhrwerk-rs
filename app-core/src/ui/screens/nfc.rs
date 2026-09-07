@@ -270,9 +270,10 @@ impl NfcScreen {
 
         // -- Record metadata (below the panel) ---------------------------
         // The stored record's provenance: when this card was first saved
-        // and last seen, and whether a dump is held for it. `has_dump`
-        // is wired but always false until the dump lands in the record
-        // (a later step), so a dumpable card reads "NO DUMP" for now.
+        // and last seen, and - for a dumpable card - whether a dump is
+        // held and how complete it is ("N/total blk  N/total sec"). The
+        // totals come from the card kind, so no dump file is loaded to
+        // render this.
         let mx = panel.top_left.x + 4;
         let mut my = panel.top_left.y + PANEL_H + 22;
         let mut line: String<40> = String::new();
@@ -284,18 +285,31 @@ impl NfcScreen {
         fonts::draw_at(display, &fonts::caption(), line.as_str(), mx, my, theme::FG_MUTED);
         my += 28;
         if is_dumpable(card) {
-            let (txt, col) =
-                if meta.has_dump { ("DUMP STORED", theme::OK) } else { ("NO DUMP", theme::FG_MUTED) };
-            fonts::draw_at(display, &fonts::caption(), txt, mx, my, col);
+            if meta.has_dump {
+                let (bt, st) = match card {
+                    CardIdentity::Iso14443a(a) => {
+                        (a.kind.classic_blocks(), a.kind.classic_sectors())
+                    }
+                    _ => (0, 0),
+                };
+                line.clear();
+                let _ = write!(
+                    line, "DUMP STORED  {}/{} blk  {}/{} sec",
+                    meta.dump_blocks_read, bt, meta.dump_sectors_read, st,
+                );
+                fonts::draw_at(display, &fonts::caption(), line.as_str(), mx, my, theme::OK);
+            } else {
+                fonts::draw_at(display, &fonts::caption(), "NO DUMP", mx, my, theme::FG_MUTED);
+            }
         }
 
         // -- Controls (bottom): DUMP left, REMOVE right ------------------
-        // Two fixed tiles. Left is the DUMP affordance for a dumpable
-        // card - and, while a dump is armed / just finished, its prompt
-        // or confirmation text instead. Right is REMOVE for every card,
-        // signal-red (theme::DANGER) so it reads as destructive and
-        // distinct from the cyan DUMP, with a two-tap confirm (label
-        // flips to "CONFIRM?").
+        // Two fixed tiles. Left is the dump control for a dumpable card:
+        // "DUMP" (cyan) with no dump yet, toggling to "REMOVE DUMP"
+        // (amber) once one is stored, and the "present card" prompt
+        // while armed. Right is REMOVE for the whole card, signal-red
+        // (theme::DANGER) so it reads as destructive and distinct from
+        // both, with a two-tap confirm (label flips to "CONFIRM?").
         let [dump_tile, remove_tile] = layout::bottom_tile_row::<2>();
         let dump_cx = dump_tile.top_left.x + dump_tile.size.width as i32 / 2;
         let dump_cy = dump_tile.top_left.y + dump_tile.size.height as i32 / 2 - 8;
@@ -303,12 +317,14 @@ impl NfcScreen {
             fonts::draw_centered(
                 display, &fonts::label(), "PRESENT CARD", dump_cx, dump_cy, theme::WARN,
             );
-        } else if let Some(n) = data.nfc_dump_blocks {
-            let mut s: String<28> = String::new();
-            let _ = write!(s, "DUMPED {}", n);
-            fonts::draw_centered(display, &fonts::label(), s.as_str(), dump_cx, dump_cy, theme::OK);
         } else if is_dumpable(card) {
-            chamfered_button(display, dump_tile, "DUMP", ButtonVariant::Primary, ACCENT);
+            if meta.has_dump {
+                chamfered_button(
+                    display, dump_tile, "REMOVE DUMP", ButtonVariant::Primary, theme::WARN,
+                );
+            } else {
+                chamfered_button(display, dump_tile, "DUMP", ButtonVariant::Primary, ACCENT);
+            }
         }
 
         let remove_label = if self.confirm_remove { "CONFIRM?" } else { "REMOVE" };
@@ -346,14 +362,19 @@ impl NfcScreen {
                 // evaluated for the DUMP button.
                 let was_confirming = self.confirm_remove;
                 self.confirm_remove = false;
-                // DUMP: arm only when the selected card is dumpable and
-                // we're not already armed or showing a result.
-                let dumpable =
-                    data.card_library.get_by_id(&id).is_some_and(|m| is_dumpable(&m.identity));
-                let show_dump =
-                    dumpable && !data.nfc_dump_armed && data.nfc_dump_blocks.is_none();
-                if show_dump && rect_hit(dump_tile, *x, *y) {
-                    return Action::ArmNfcDump;
+                // DUMP tile: for a dumpable card that isn't armed, arm a
+                // dump when none is stored, or remove the stored dump
+                // when one is (the tile shows REMOVE DUMP then).
+                let (dumpable, has_dump) = match data.card_library.get_by_id(&id) {
+                    Some(m) => (is_dumpable(&m.identity), m.has_dump),
+                    None => (false, false),
+                };
+                if dumpable && !data.nfc_dump_armed && rect_hit(dump_tile, *x, *y) {
+                    return if has_dump {
+                        Action::RemoveNfcDump { id }
+                    } else {
+                        Action::ArmNfcDump
+                    };
                 }
                 // A stray tap that only dismissed the confirm still needs
                 // a redraw to restore the REMOVE label.

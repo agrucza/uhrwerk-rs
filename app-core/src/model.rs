@@ -159,6 +159,12 @@ pub enum Effect {
     /// updated by the Model when it emitted this.
     RemoveCard { id: heapless::Vec<u8, 10> },
 
+    /// Delete one card's structured dump file (the detail REMOVE DUMP),
+    /// keeping the card record. The manager resolves the dump path from
+    /// the id and removes the file; the Model already cleared the
+    /// card's `has_dump`/counts and re-saves the record via `SaveCard`.
+    RemoveDump { id: heapless::Vec<u8, 10> },
+
     /// Apply a new display brightness immediately. Value is the
     /// hardware register range (0..=255) after Model maps the
     /// slider percent. Fired by `Action::SetBrightness` so the
@@ -640,14 +646,6 @@ impl Model {
                     Some(c) => crate::nfc::NfcScan::Card(c.clone()),
                     None => crate::nfc::NfcScan::Unrecognized,
                 };
-                // A fresh presentation clears any prior dump result so
-                // the screen shows this card's DUMP button, not a stale
-                // "dumped N blocks" from the card before it. During an
-                // armed dump this NfcProbe still fires first (clearing
-                // the count), then NfcDumpComplete sets it again - the
-                // channel delivers them in that order, so the final
-                // state is correct.
-                self.cached_data.nfc_dump_blocks = None;
                 // An identified card enters the library (a new one is
                 // added at the front, a known one is bumped and
                 // refreshed). Persist the changed record unless the
@@ -684,11 +682,24 @@ impl Model {
                 // card was identified.
                 let _ = out.push(Effect::MotorClick);
             }
-            SystemEvent::NfcDumpComplete { blocks, ok } => {
-                // The armed dump finished. Disarm, record the count for
-                // the screen's "dumped" confirmation, and click.
+            SystemEvent::NfcDumpComplete { blocks, sectors, ok } => {
+                // The armed dump finished. Disarm and click.
                 self.cached_data.nfc_dump_armed = false;
-                self.cached_data.nfc_dump_blocks = ok.then_some(*blocks);
+                // On a good dump, record it on the just-dumped card (the
+                // last one presented): set `has_dump` and store the
+                // blocks/sectors captured, then persist. The dump file
+                // itself was streamed to flash by the NFC task during
+                // the sweep; this stores the completeness the detail
+                // shows.
+                if *ok {
+                    if let crate::nfc::NfcScan::Card(c) = &self.cached_data.last_nfc {
+                        let mut id: heapless::Vec<u8, 10> = heapless::Vec::new();
+                        let _ = id.extend_from_slice(c.id_bytes());
+                        if self.cached_data.card_library.set_dump(&id, *blocks, *sectors) {
+                            let _ = out.push(Effect::SaveCard { id });
+                        }
+                    }
+                }
                 self.needs_redraw = true;
                 let _ = out.push(Effect::MotorClick);
             }
@@ -1265,11 +1276,8 @@ impl Model {
             }
             Action::ArmNfcDump => {
                 // Mark the UI armed and tell the NFC task the next tap
-                // is a dump. The blocks-count from any prior dump is
-                // cleared so the screen shows "present card to dump",
-                // not a stale "dumped N".
+                // is a dump.
                 self.cached_data.nfc_dump_armed = true;
-                self.cached_data.nfc_dump_blocks = None;
                 let _ = out.push(Effect::NfcCommand(NfcCommand::ArmDump));
                 self.needs_redraw = true;
             }
@@ -1279,6 +1287,16 @@ impl Model {
                 // flash blob via the manager.
                 self.cached_data.card_library.remove(&id);
                 let _ = out.push(Effect::RemoveCard { id });
+                self.needs_redraw = true;
+            }
+            Action::RemoveNfcDump { id } => {
+                // Clear the card's stored dump (keep the record), delete
+                // the dump file via the manager, and re-save the record
+                // so the cleared `has_dump` persists.
+                if self.cached_data.card_library.clear_dump(&id) {
+                    let _ = out.push(Effect::RemoveDump { id: id.clone() });
+                    let _ = out.push(Effect::SaveCard { id });
+                }
                 self.needs_redraw = true;
             }
             Action::TimeSync => {

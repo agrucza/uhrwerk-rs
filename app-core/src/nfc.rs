@@ -115,6 +115,19 @@ impl CardKind {
             _ => 0,
         }
     }
+
+    /// Total 16-byte block count for the Classic families (0 for
+    /// non-Classic). Mini/1K are 4 blocks per sector; the 4K's first 32
+    /// sectors hold 4 blocks and its last 8 hold 16 (128 + 128 = 256).
+    /// Used as the denominator of a dump's completeness ("N/total").
+    pub fn classic_blocks(self) -> u16 {
+        match self {
+            CardKind::MifareClassicMini => 20,
+            CardKind::MifareClassic1K => 64,
+            CardKind::MifareClassic4K => 256,
+            _ => 0,
+        }
+    }
 }
 
 /// What every Type A card yields from anticollision, before any

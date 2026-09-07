@@ -77,6 +77,13 @@ pub struct CardMeta {
     /// Whether a structured dump file exists for this card. Written by
     /// the dump step; always `false` until then.
     pub has_dump: bool,
+    /// Blocks captured by the stored dump (0 when `!has_dump`). The
+    /// denominator is the card kind's total (`CardKind::classic_blocks`),
+    /// so the detail can show "N/total" without loading the dump file.
+    pub dump_blocks_read: u16,
+    /// Sectors the stored dump opened with a default key (0 when
+    /// `!has_dump`). Denominator is `CardKind::classic_sectors`.
+    pub dump_sectors_read: u8,
     /// Monotonic order key: higher is newer. Assigned by
     /// [`CardLibrary::upsert`]; used to rebuild newest-first order
     /// after loading files in arbitrary order.
@@ -84,7 +91,7 @@ pub struct CardMeta {
 }
 
 /// Stable TLV field ids for [`CardMeta`]. NEVER reuse a retired id; a
-/// type change allocates a new id. NEXT_FIELD_ID: 7.
+/// type change allocates a new id. NEXT_FIELD_ID: 9.
 #[cfg(feature = "serde")]
 mod meta_field {
     pub const IDENTITY: u16 = 1;
@@ -93,6 +100,8 @@ mod meta_field {
     pub const LAST_SEEN: u16 = 4;
     pub const HAS_DUMP: u16 = 5;
     pub const SEQ: u16 = 6;
+    pub const DUMP_BLOCKS: u16 = 7;
+    pub const DUMP_SECTORS: u16 = 8;
 }
 
 /// Upper bound on one card record's TLV payload. Identity ~16 B,
@@ -115,6 +124,8 @@ impl CardMeta {
         crate::tlv::put(buf, &mut at, LAST_SEEN, &self.last_seen)?;
         crate::tlv::put(buf, &mut at, HAS_DUMP, &self.has_dump)?;
         crate::tlv::put(buf, &mut at, SEQ, &self.seq)?;
+        crate::tlv::put(buf, &mut at, DUMP_BLOCKS, &self.dump_blocks_read)?;
+        crate::tlv::put(buf, &mut at, DUMP_SECTORS, &self.dump_sectors_read)?;
         Ok(at)
     }
 
@@ -131,6 +142,8 @@ impl CardMeta {
         let mut last_seen = TimeData::default();
         let mut has_dump = false;
         let mut seq = 0u32;
+        let mut dump_blocks_read = 0u16;
+        let mut dump_sectors_read = 0u8;
         for (id, val) in crate::tlv::entries(bytes) {
             match id {
                 IDENTITY => identity = postcard::from_bytes(val).ok(),
@@ -139,12 +152,17 @@ impl CardMeta {
                 LAST_SEEN => crate::tlv::get(val, &mut last_seen),
                 HAS_DUMP => crate::tlv::get(val, &mut has_dump),
                 SEQ => crate::tlv::get(val, &mut seq),
+                DUMP_BLOCKS => crate::tlv::get(val, &mut dump_blocks_read),
+                DUMP_SECTORS => crate::tlv::get(val, &mut dump_sectors_read),
                 _ => {} // written by a newer firmware - skip
             }
         }
         let identity = identity?;
         let label = label.unwrap_or_else(|| auto_label(&identity));
-        Some(CardMeta { identity, label, first_seen, last_seen, has_dump, seq })
+        Some(CardMeta {
+            identity, label, first_seen, last_seen, has_dump, seq,
+            dump_blocks_read, dump_sectors_read,
+        })
     }
 }
 
@@ -245,6 +263,8 @@ impl CardLibrary {
                 last_seen: now,
                 has_dump: false,
                 seq,
+                dump_blocks_read: 0,
+                dump_sectors_read: 0,
             };
             // Room checked above.
             let _ = self.cards.insert(0, meta);
@@ -267,6 +287,36 @@ impl CardLibrary {
     /// Borrow the card carrying these id bytes.
     pub fn get_by_id(&self, id: &[u8]) -> Option<&CardMeta> {
         self.cards.iter().find(|c| c.identity.id_bytes() == id)
+    }
+
+    /// Record a completed dump on the card carrying these id bytes:
+    /// set `has_dump` and store the blocks/sectors captured. Returns
+    /// `true` if a matching card was updated.
+    pub fn set_dump(&mut self, id: &[u8], blocks_read: u16, sectors_read: u8) -> bool {
+        match self.cards.iter_mut().find(|c| c.identity.id_bytes() == id) {
+            Some(c) => {
+                c.has_dump = true;
+                c.dump_blocks_read = blocks_read;
+                c.dump_sectors_read = sectors_read;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Clear a card's stored dump: drop `has_dump` and zero the
+    /// completeness counts. Returns `true` if a matching card was
+    /// updated. The dump file itself is deleted by the manager.
+    pub fn clear_dump(&mut self, id: &[u8]) -> bool {
+        match self.cards.iter_mut().find(|c| c.identity.id_bytes() == id) {
+            Some(c) => {
+                c.has_dump = false;
+                c.dump_blocks_read = 0;
+                c.dump_sectors_read = 0;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Append a record loaded from flash at boot. Silently ignores an
@@ -423,6 +473,8 @@ mod tests {
                 last_seen: now(1),
                 has_dump: false,
                 seq,
+                dump_blocks_read: 0,
+                dump_sectors_read: 0,
             });
         }
         lib.sort_newest_first();
@@ -455,6 +507,8 @@ mod tests {
             last_seen: now(9),
             has_dump: true,
             seq: 42,
+            dump_blocks_read: 48,
+            dump_sectors_read: 12,
         };
         let mut buf = [0u8; 256];
         let encoded = postcard::to_slice(&meta, &mut buf).expect("encode");

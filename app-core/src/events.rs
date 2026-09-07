@@ -209,7 +209,7 @@ pub enum SystemEvent {
     /// A dump session finished (armed via `NfcCommand::ArmDump`).
     /// `blocks` is how many were written; `ok` is whether it completed
     /// without a card-lost/partial abort.
-    NfcDumpComplete { blocks: u16, ok: bool },
+    NfcDumpComplete { blocks: u16, sectors: u8, ok: bool },
 
     // -- WiFi --
     /// Progress of the current WiFi session (scan or sync), emitted
@@ -482,7 +482,7 @@ pub fn classify_for_log(event: &SystemEvent) -> Option<LoggedEvent> {
         },
         SystemEvent::NfcProbe { card: None } =>
             LoggedEvent { tag: "nfc_unknown", detail: None, detail2: None },
-        SystemEvent::NfcDumpComplete { blocks, ok } =>
+        SystemEvent::NfcDumpComplete { blocks, sectors: _, ok } =>
             LoggedEvent { tag: "nfc_dump", detail: Some(*blocks as u32), detail2: Some(*ok as u32) },
         _ => return None,
     })

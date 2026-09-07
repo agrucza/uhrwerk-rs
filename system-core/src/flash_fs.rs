@@ -189,6 +189,7 @@ impl<'d> FlashFs<'d> {
         // NFC card library: one blob file per card under `nfc/cards`.
         let _ = fs.mkdir("/system/nfc");
         let _ = fs.mkdir("/system/nfc/cards");
+        let _ = fs.mkdir("/system/nfc/dumps");
         Self { fs, region_size: region.size }
     }
 

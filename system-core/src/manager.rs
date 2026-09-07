@@ -37,6 +37,10 @@ const CONFIG_VERSION: u8   = 2;
 // each a TLV record (see app-core card_library.rs). The dir is
 // enumerated at boot to rebuild the in-RAM list.
 const CARD_DIR:     &str = "/system/nfc/cards";
+// Structured per-card dumps live in a SEPARATE dir so the boot
+// enumeration of CARD_DIR (which parses every file as a CardMeta blob)
+// never trips over a `.dump` file. The NFC task streams dumps here.
+const DUMP_DIR:     &str = "/system/nfc/dumps";
 // v1 = the tagged per-field card record. Like the config store, the
 // TLV payload means this should never need to move.
 const CARD_VERSION: u8   = 1;
@@ -52,6 +56,19 @@ fn card_path(buf: &mut heapless::String<80>, id: &[u8]) -> core::fmt::Result {
         write!(buf, "{:02X}", b)?;
     }
     write!(buf, ".bin")
+}
+
+/// Build the structured-dump path `DUMP_DIR/<id-hex>.dump` for a card.
+/// Same id-hex stem as [`card_path`], so a card's meta and dump share a
+/// name across their two directories. Must match the path the NFC task
+/// streams the dump to.
+fn dump_path(buf: &mut heapless::String<80>, id: &[u8]) -> core::fmt::Result {
+    use core::fmt::Write;
+    write!(buf, "{}/", DUMP_DIR)?;
+    for b in id {
+        write!(buf, "{:02X}", b)?;
+    }
+    write!(buf, ".dump")
 }
 
 
@@ -722,7 +739,26 @@ impl<B: Board> SystemManager<'static, B> {
                     self.pending_card_saves.retain(|q| q != &id);
                     let mut path: heapless::String<80> = heapless::String::new();
                     if card_path(&mut path, &id).is_ok() {
-                        let _ = self.store.lock().await.flash_mut().reset_file(&path);
+                        let mut g = self.store.lock().await;
+                        let _ = g.flash_mut().reset_file(&path);
+                        // Also drop the card's structured dump file, if
+                        // any, so removing a card leaves nothing behind.
+                        let mut dpath: heapless::String<80> = heapless::String::new();
+                        if dump_path(&mut dpath, &id).is_ok() {
+                            let _ = g.flash_mut().reset_file(&dpath);
+                        }
+                        drop(g);
+                        self.refresh_storage_usage().await;
+                    }
+                }
+                Effect::RemoveDump { id } => {
+                    // Delete just the card's dump file; the record stays
+                    // (its has_dump was cleared and it is re-saved via a
+                    // queued SaveCard). Fired from a lit detail screen,
+                    // so an inline flash remove is fine.
+                    let mut dpath: heapless::String<80> = heapless::String::new();
+                    if dump_path(&mut dpath, &id).is_ok() {
+                        let _ = self.store.lock().await.flash_mut().reset_file(&dpath);
                         self.refresh_storage_usage().await;
                     }
                 }

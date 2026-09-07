@@ -82,7 +82,10 @@ const WAKEUP_REARM_SETTLE_MS: u64 = 200;
 /// armed, leaves `dump` `None` so the arm stays standing.
 struct ProbeOutcome {
     presentations: u32,
-    dump: Option<(u16, bool)>,
+    /// A completed dump's `(blocks_read, sectors_unlocked, ok)`, or
+    /// `None` when this probe did not dump (plain identify or false
+    /// trip). `ok` is false if the dump file could not be written.
+    dump: Option<(u16, u8, bool)>,
     /// A card answered REQA this window (identified or not), so one is
     /// physically resting on the coil. The caller waits for it to leave
     /// before re-arming wake-up mode.
@@ -305,7 +308,7 @@ async fn rf_probe(
     // Set when a Classic sweep actually ran this window (dump mode).
     // (blocks_read, ok). Carried out in the ProbeOutcome so the caller
     // can report NfcDumpComplete and disarm.
-    let mut dump: Option<(u16, bool)> = None;
+    let mut dump: Option<(u16, u8, bool)> = None;
     // Whether any card answered REQA (ATQA received), even if it then
     // failed to identify. Gates the "unrecognized" report so a bare
     // wake-up trip with no card answering (a false trip, or the card
@@ -346,6 +349,19 @@ async fn rf_probe(
                                 other.label(), other.id_bytes(),
                             ),
                         }
+                        // Announce the identified card NOW - before any
+                        // multi-second Classic sweep - so the recognition
+                        // click and the wake-to-screen land the instant
+                        // the card is read, not after the dump finishes.
+                        // This is also the presentation's event-log
+                        // record. On a dump the dump-done click then
+                        // arrives seconds later (NfcDumpComplete), so the
+                        // two reads as start/finish, not a double-click.
+                        // Clone so `card` stays for the dump borrow below.
+                        presentations += 1;
+                        EVENTS
+                            .send(SystemEvent::NfcProbe { card: Some(card.clone()) })
+                            .await;
                         // Step 3a: on a Type 2 tag - still ACTIVE
                         // straight after SELECT - read pages 0..=3 and
                         // check the UID they carry against the one
@@ -385,51 +401,60 @@ async fn rf_probe(
                                 // HALTED, so the plain HLTA at the end is skipped.
                                 if a.kind.is_mifare_classic() {
                                     let uid32 = nfc::mifare::uid_for_auth(&a.uid);
-                                    // Dump path /nfc/<first-4-UID-bytes>.NFC, FAT
-                                    // 8.3-safe (8 hex + 3-char ext). Built into a
-                                    // fixed ASCII buffer - no heapless in this bin.
+                                    // Structured dump streamed to a flash file,
+                                    // one record per readable block - NOTHING
+                                    // accumulates in RAM. Path
+                                    // /system/nfc/dumps/<full-UID-hex>.dump: same
+                                    // stem as the card's meta blob, its own dir
+                                    // so the card enumeration never parses it.
+                                    // Flash-only - a full-UID name exceeds the SD
+                                    // FAT 8.3 limit, and the library is a flash
+                                    // feature. Built into a fixed ASCII buffer -
+                                    // no heapless in this bin. Must match
+                                    // system-core's dump_path().
                                     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-                                    let mut pbuf = *b"/nfc/00000000.NFC";
-                                    for k in 0..4 {
-                                        let byte = a.uid.get(k).copied().unwrap_or(0);
-                                        pbuf[5 + k * 2] = HEX[(byte >> 4) as usize];
-                                        pbuf[6 + k * 2] = HEX[(byte & 0x0F) as usize];
+                                    let mut pbuf = [0u8; 64];
+                                    let prefix = b"/system/nfc/dumps/";
+                                    pbuf[..prefix.len()].copy_from_slice(prefix);
+                                    let mut plen = prefix.len();
+                                    for &byte in &a.uid[..] {
+                                        pbuf[plen] = HEX[(byte >> 4) as usize];
+                                        pbuf[plen + 1] = HEX[(byte & 0x0F) as usize];
+                                        plen += 2;
                                     }
-                                    let path = core::str::from_utf8(&pbuf).unwrap_or("/nfc/dump.NFC");
+                                    pbuf[plen..plen + 5].copy_from_slice(b".dump");
+                                    plen += 5;
+                                    let path = core::str::from_utf8(&pbuf[..plen])
+                                        .unwrap_or("/system/nfc/dumps/dump.dump");
 
-                                    // Truncate/create the dump up front (also makes
-                                    // the /nfc dir). SD-only, never mirrored to
-                                    // flash. If SD is offline the sweep still runs,
-                                    // serial-only - identify already succeeded.
-                                    let sd_dump = {
+                                    // Truncate/create with a small header: magic
+                                    // "NFD", format version, a card-kind byte
+                                    // (1=1K, 2=4K), and the 16-byte block size.
+                                    // Flash-only via flash_mut().
+                                    let kind_byte: u8 = match a.kind {
+                                        CardKind::MifareClassic1K => 1,
+                                        CardKind::MifareClassic4K => 2,
+                                        _ => 0,
+                                    };
+                                    let header = [b'N', b'F', b'D', 1u8, kind_byte, 16u8];
+                                    let created = {
                                         let mut g = store.lock().await;
-                                        if g.sd_online() {
-                                            match g.sd_mut().map(|sd| sd.write_file(path, &[])) {
-                                                Some(Ok(())) => true,
-                                                Some(Err(e)) => {
-                                                    log::warn!("NFC: dump create {} failed: {:?}", path, e);
-                                                    false
-                                                }
-                                                None => false,
+                                        match g.flash_mut().write_file(path, &header) {
+                                            Ok(()) => true,
+                                            Err(e) => {
+                                                log::warn!("NFC: dump create {} failed: {:?}", path, e);
+                                                false
                                             }
-                                        } else {
-                                            log::info!("NFC: no SD card - dumping to serial only");
-                                            false
                                         }
                                     };
 
-                                    // Byte offset of the next block in the image;
-                                    // locked sectors are zero-filled so block N
-                                    // always lands at byte N*16. `dump_failed`
-                                    // latches on the first SD write error so a
-                                    // flaky card yields a clearly-incomplete file,
-                                    // not a silently truncated one. Interior
-                                    // mutability: the async callback is
-                                    // FnMut -> Future and can't borrow &mut across
-                                    // calls.
-                                    let next = core::cell::Cell::new(0u16);
-                                    let next_ref = &next;
-                                    let dump_failed = core::cell::Cell::new(false);
+                                    // `dump_failed` latches on the first write
+                                    // error (create included) so a flaky card
+                                    // yields a clearly-incomplete file, not a
+                                    // silent truncation. Interior mutability: the
+                                    // async callback is FnMut -> Future and can't
+                                    // borrow &mut across calls.
+                                    let dump_failed = core::cell::Cell::new(!created);
                                     let dump_failed_ref = &dump_failed;
                                     let on_block = move |b: nfc::reader::SweepBlock| async move {
                                         log::info!(
@@ -441,67 +466,66 @@ async fn rf_probe(
                                             b.key,
                                             b.data,
                                         );
-                                        // Skip SD once there is no card, or once a
-                                        // prior write failed - serial logging above
-                                        // still runs either way.
-                                        if !sd_dump || dump_failed_ref.get() {
+                                        // Serial logging above always runs; skip
+                                        // the file once create or a prior write
+                                        // failed.
+                                        if dump_failed_ref.get() {
                                             return;
                                         }
-                                        // One lock, only synchronous SD writes
+                                        // One 25-byte record per block: sector,
+                                        // block, flags (bit0 key A, bit1 trailer),
+                                        // the 6-byte key, the 16 data bytes. A
+                                        // sector that never opens fires no
+                                        // callback, so it is simply ABSENT from
+                                        // the file - unambiguous, unlike a zero
+                                        // fill.
+                                        let flags = (b.key_is_a as u8) | ((b.is_trailer as u8) << 1);
+                                        let mut rec = [0u8; 25];
+                                        rec[0] = b.sector;
+                                        rec[1] = b.block;
+                                        rec[2] = flags;
+                                        rec[3..9].copy_from_slice(&b.key);
+                                        rec[9..25].copy_from_slice(&b.data);
+                                        // One lock, only synchronous flash writes
                                         // inside it, then release - the store lock
                                         // must never be held across an await.
                                         let mut g = store.lock().await;
-                                        if let Some(sd) = g.sd_mut() {
-                                            let target = b.block as u16;
-                                            let mut n = next_ref.get();
-                                            let mut ok = true;
-                                            while n < target {
-                                                if sd.append_line(path, &[0u8; 16]).is_err() {
-                                                    ok = false;
-                                                    break;
-                                                }
-                                                n += 1;
-                                            }
-                                            if ok {
-                                                ok = sd.append_line(path, &b.data).is_ok();
-                                            }
-                                            if ok {
-                                                next_ref.set(target + 1);
-                                            } else {
-                                                log::warn!(
-                                                    "NFC: dump write to {} failed at block {} - stopping, file incomplete",
-                                                    path, target,
-                                                );
-                                                dump_failed_ref.set(true);
-                                            }
+                                        if g.flash_mut().append_line(path, &rec).is_err() {
+                                            log::warn!(
+                                                "NFC: dump write to {} failed at S{:02} B{:03} - stopping, file incomplete",
+                                                path, b.sector, b.block,
+                                            );
+                                            dump_failed_ref.set(true);
                                         }
                                     };
                                     match reader.sweep_classic(a.kind, uid32, on_block).await {
                                         Ok(s) => {
-                                            let sd_status = if !sd_dump {
-                                                ""
-                                            } else if dump_failed.get() {
-                                                " (SD dump INCOMPLETE - write error)"
+                                            let status = if dump_failed.get() {
+                                                " (dump INCOMPLETE - write error)"
                                             } else {
-                                                " (saved to SD)"
+                                                " (saved to flash)"
                                             };
                                             log::info!(
                                                 "NFC: sweep done - {}/{} sectors unlocked, {} blocks read{}",
                                                 s.sectors_unlocked,
                                                 s.sectors_total,
                                                 s.blocks_read,
-                                                sd_status,
+                                                status,
                                             );
                                             // Report to the UI: blocks read, and OK
-                                            // only if no SD write failed midway.
-                                            dump = Some((s.blocks_read, !dump_failed.get()));
+                                            // only if the file wrote cleanly.
+                                            dump = Some((
+                                                s.blocks_read,
+                                                s.sectors_unlocked,
+                                                !dump_failed.get(),
+                                            ));
                                         }
                                         Err(e) => {
                                             log::warn!("NFC: sweep failed: {:?}", e);
                                             // Armed dump that could not complete -
                                             // report a failed result so the UI
                                             // disarms and the user can retry.
-                                            dump = Some((0, false));
+                                            dump = Some((0, 0, false));
                                         }
                                     }
                                     // The sweep leaves the card HALTED (encrypted
@@ -511,10 +535,6 @@ async fn rf_probe(
                                 }
                             }
                         } // end `if do_dump`
-                        presentations += 1;
-                        // Every presentation goes to the event log -
-                        // the evidence must survive a USB drop.
-                        EVENTS.send(SystemEvent::NfcProbe { card: Some(card) }).await;
                         // HALT the card so it stays quiet while it lies
                         // on the back; lifting it resets it to IDLE and
                         // the next presentation is detected afresh. No
@@ -628,9 +648,9 @@ async fn wakeup_loop(
                     // A dump actually ran (armed + a Classic card swept):
                     // report blocks/ok to the UI and disarm. Nothing to
                     // report for a plain identify or a false trip.
-                    if let Some((blocks, ok)) = outcome.dump {
+                    if let Some((blocks, sectors, ok)) = outcome.dump {
                         EVENTS
-                            .send(SystemEvent::NfcDumpComplete { blocks, ok })
+                            .send(SystemEvent::NfcDumpComplete { blocks, sectors, ok })
                             .await;
                         dump_armed = false;
                     }

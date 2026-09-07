@@ -280,6 +280,12 @@ pub enum Action {
     /// manager deletes the card's flash blob.
     RemoveNfcCard { id: heapless::Vec<u8, 10> },
 
+    /// Remove just the stored dump of one card (the detail's REMOVE
+    /// DUMP), keeping the card record. The Model clears the card's
+    /// `has_dump`/counts and forwards `Effect::RemoveDump` so the
+    /// manager deletes the card's `.dump` file; the record is re-saved.
+    RemoveNfcDump { id: heapless::Vec<u8, 10> },
+
     /// Set the clock from whichever time source this board has (the
     /// settings CLOCK view's TIME SYNC button). The Model picks ONE
     /// source per tap and does not chain: WiFi when the board has the
@@ -979,10 +985,6 @@ pub struct SystemData {
     /// than identified. Set on `Action::ArmNfcDump`, cleared on
     /// `SystemEvent::NfcDumpComplete` or when leaving the NFC screen.
     pub nfc_dump_armed: bool,
-
-    /// Blocks written by the most recent successful dump, for the NFC
-    /// screen's "dumped" confirmation; `None` until a dump completes.
-    pub nfc_dump_blocks: Option<u16>,
 
     /// The persistent card library: cards a scan has identified,
     /// newest first. Loaded from flash at boot by the manager and kept
