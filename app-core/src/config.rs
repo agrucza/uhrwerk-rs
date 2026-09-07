@@ -318,16 +318,7 @@ impl Config {
     fn decode_tagged(bytes: &[u8]) -> Config {
         use field_id::*;
         let mut c = Config::DEFAULT;
-        let mut i = 0usize;
-        while i + 3 <= bytes.len() {
-            let id = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
-            let len = bytes[i + 2] as usize;
-            i += 3;
-            if i + len > bytes.len() {
-                break;
-            }
-            let val = &bytes[i..i + len];
-            i += len;
+        for (id, val) in crate::tlv::entries(bytes) {
             match id {
                 DIM_TIMEOUT_S => get(val, &mut c.display.dim_timeout_s),
                 OFF_TIMEOUT_S => get(val, &mut c.display.off_timeout_s),
@@ -356,39 +347,12 @@ impl Config {
     }
 }
 
-/// Append one TLV entry. The value is postcard-encoded in place
-/// after a reserved 3-byte header.
+// TLV entry encode/decode primitives moved to `crate::tlv` so the
+// config store and the card library share one implementation. The
+// unqualified `put`/`get` calls in `encode_tagged`/`decode_tagged`
+// resolve through this use.
 #[cfg(feature = "serde")]
-fn put<T: serde::Serialize>(
-    buf: &mut [u8],
-    at: &mut usize,
-    id: u16,
-    value: &T,
-) -> Result<(), ()> {
-    let start = *at + 3;
-    if start > buf.len() {
-        return Err(());
-    }
-    let used = postcard::to_slice(value, &mut buf[start..])
-        .map_err(|_| ())?
-        .len();
-    if used > u8::MAX as usize {
-        return Err(());
-    }
-    buf[*at..*at + 2].copy_from_slice(&id.to_le_bytes());
-    buf[*at + 2] = used as u8;
-    *at = start + used;
-    Ok(())
-}
-
-/// Decode one field value; on failure the target keeps its default
-/// (per-field tolerance is the whole point of the tagged store).
-#[cfg(feature = "serde")]
-fn get<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8], into: &mut T) {
-    if let Ok(v) = postcard::from_bytes(bytes) {
-        *into = v;
-    }
-}
+use crate::tlv::{get, put};
 
 /// The blob-facing serde surface: `Config` serializes as one opaque
 /// `bytes` value containing the TLV list, so the storage layer's

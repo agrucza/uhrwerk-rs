@@ -1,0 +1,475 @@
+//! The on-watch card library: a small, persistent collection of the
+//! cards an NFC scan has identified.
+//!
+//! Pure data and list logic, no hardware and no storage I/O - it lives
+//! in `app-core` so a screen can render the list and the model can
+//! maintain it, while the manager owns the flash read/write.
+//!
+//! # On flash
+//!
+//! One small file per card, each a versioned blob whose payload is a
+//! TLV record (see [`crate::tlv`]): `id, len, postcard-value` per
+//! field. Reasons for a file per card rather than one index blob:
+//!
+//! * Each record is well under the storage layer's blob-buffer limit,
+//!   so nothing in the flash layer has to change.
+//! * A corrupt file costs one card, not the whole library.
+//! * Records are independent, matching the flat storage direction.
+//!
+//! The dump payload is a separate file per card (a later step), flagged
+//! here by [`CardMeta::has_dump`], so building or persisting the list
+//! never touches a dump.
+//!
+//! # Ordering
+//!
+//! Files enumerate in arbitrary order, so each record carries a
+//! monotonic [`CardMeta::seq`]; [`CardLibrary::sort_newest_first`]
+//! rebuilds newest-first order from it after a boot load, and
+//! [`CardLibrary::upsert`] assigns a fresh top `seq` so a scanned card
+//! goes to the front. Position is then the display order.
+//!
+//! # Forward compatibility
+//!
+//! Each field is a TLV entry with a stable id, so the record can gain
+//! a field in a future firmware version without invalidating the cards
+//! already stored: an old file simply lacks the new id and defaults
+//! it. Ids are assigned once in [`meta_field`] and never reused.
+
+#[cfg(feature = "serde")]
+use core::fmt::{self, Formatter};
+#[cfg(feature = "serde")]
+use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
+
+use heapless::{String, Vec};
+
+use crate::data::TimeData;
+use crate::nfc::{CardIdentity, CardKind};
+
+/// Maximum cards kept in the library. A HARD cap: at capacity a newly
+/// scanned card is still shown, but not stored until the user removes
+/// one. Flash is not the constraint (the store partition is
+/// megabytes); this bounds the in-RAM list and keeps it scrollable.
+pub const MAX_CARDS: usize = 30;
+
+/// Maximum characters in a card label (auto-generated for now;
+/// on-watch renaming is a later step).
+pub const LABEL_MAX: usize = 24;
+
+/// One stored card: its identity plus library metadata.
+///
+/// The dump is NOT carried here - see the module docs. `has_dump` is
+/// the only link to it, and stays `false` until the dump step lands.
+///
+/// Persisted via a hand-written TLV `Serialize`/`Deserialize` (below)
+/// rather than a derive, so its fields are individually tagged and the
+/// record can evolve without wiping stored cards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardMeta {
+    /// The identity an NFC scan assembled (UID/ATQA/SAK, or the other
+    /// technologies' fingerprints). Rendered on the detail screen.
+    pub identity: CardIdentity,
+    /// Display name. Auto-generated from kind + short id today.
+    pub label: String<LABEL_MAX>,
+    /// Wall-clock time this card was first added to the library.
+    pub first_seen: TimeData,
+    /// Wall-clock time of the most recent scan of this card.
+    pub last_seen: TimeData,
+    /// Whether a structured dump file exists for this card. Written by
+    /// the dump step; always `false` until then.
+    pub has_dump: bool,
+    /// Monotonic order key: higher is newer. Assigned by
+    /// [`CardLibrary::upsert`]; used to rebuild newest-first order
+    /// after loading files in arbitrary order.
+    pub seq: u32,
+}
+
+/// Stable TLV field ids for [`CardMeta`]. NEVER reuse a retired id; a
+/// type change allocates a new id. NEXT_FIELD_ID: 7.
+#[cfg(feature = "serde")]
+mod meta_field {
+    pub const IDENTITY: u16 = 1;
+    pub const LABEL: u16 = 2;
+    pub const FIRST_SEEN: u16 = 3;
+    pub const LAST_SEEN: u16 = 4;
+    pub const HAS_DUMP: u16 = 5;
+    pub const SEQ: u16 = 6;
+}
+
+/// Upper bound on one card record's TLV payload. Identity ~16 B,
+/// label ~28 B, two timestamps ~20 B, flag + seq ~12 B, with entry
+/// headers and headroom. Far under the storage layer's 512 B blob
+/// buffer.
+#[cfg(feature = "serde")]
+const META_TAGGED_MAX: usize = 128;
+
+#[cfg(feature = "serde")]
+impl CardMeta {
+    /// Serialize the fields as a TLV entry list into `buf`; returns the
+    /// used length. `Err` only on buffer overflow.
+    fn encode_tagged(&self, buf: &mut [u8]) -> Result<usize, ()> {
+        use meta_field::*;
+        let mut at = 0usize;
+        crate::tlv::put(buf, &mut at, IDENTITY, &self.identity)?;
+        crate::tlv::put(buf, &mut at, LABEL, &self.label)?;
+        crate::tlv::put(buf, &mut at, FIRST_SEEN, &self.first_seen)?;
+        crate::tlv::put(buf, &mut at, LAST_SEEN, &self.last_seen)?;
+        crate::tlv::put(buf, &mut at, HAS_DUMP, &self.has_dump)?;
+        crate::tlv::put(buf, &mut at, SEQ, &self.seq)?;
+        Ok(at)
+    }
+
+    /// Decode a TLV entry list. The identity is mandatory - a record
+    /// without it is not a card, so `None` is returned and the caller
+    /// drops the file. Every other field defaults if missing (label
+    /// regenerates from the identity), so a truncated or partially
+    /// unreadable record still yields a usable card.
+    fn decode_tagged(bytes: &[u8]) -> Option<CardMeta> {
+        use meta_field::*;
+        let mut identity: Option<CardIdentity> = None;
+        let mut label: Option<String<LABEL_MAX>> = None;
+        let mut first_seen = TimeData::default();
+        let mut last_seen = TimeData::default();
+        let mut has_dump = false;
+        let mut seq = 0u32;
+        for (id, val) in crate::tlv::entries(bytes) {
+            match id {
+                IDENTITY => identity = postcard::from_bytes(val).ok(),
+                LABEL => label = postcard::from_bytes(val).ok(),
+                FIRST_SEEN => crate::tlv::get(val, &mut first_seen),
+                LAST_SEEN => crate::tlv::get(val, &mut last_seen),
+                HAS_DUMP => crate::tlv::get(val, &mut has_dump),
+                SEQ => crate::tlv::get(val, &mut seq),
+                _ => {} // written by a newer firmware - skip
+            }
+        }
+        let identity = identity?;
+        let label = label.unwrap_or_else(|| auto_label(&identity));
+        Some(CardMeta { identity, label, first_seen, last_seen, has_dump, seq })
+    }
+}
+
+// Blob-facing serde surface: a `CardMeta` is one opaque `bytes` value
+// holding the TLV list, so the storage layer's generic `StoredBlob`
+// envelope and SD mirroring are untouched - exactly as `Config` does.
+#[cfg(feature = "serde")]
+impl Serialize for CardMeta {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut buf = [0u8; META_TAGGED_MAX];
+        let len = self
+            .encode_tagged(&mut buf)
+            .map_err(|_| ser::Error::custom("card meta overflow"))?;
+        s.serialize_bytes(&buf[..len])
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for CardMeta {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct BytesVisitor;
+        impl<'de> de::Visitor<'de> for BytesVisitor {
+            type Value = CardMeta;
+            fn expecting(&self, f: &mut Formatter) -> fmt::Result {
+                f.write_str("card meta bytes")
+            }
+            fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<CardMeta, E> {
+                CardMeta::decode_tagged(v)
+                    .ok_or_else(|| E::custom("card meta missing identity"))
+            }
+            fn visit_borrowed_bytes<E: de::Error>(self, v: &'de [u8]) -> Result<CardMeta, E> {
+                self.visit_bytes(v)
+            }
+        }
+        d.deserialize_bytes(BytesVisitor)
+    }
+}
+
+/// The card library: an in-RAM, newest-first list, capped at
+/// [`MAX_CARDS`]. Held in `SystemData`; the manager loads it from the
+/// per-card files at boot and persists changes one file at a time. Not
+/// serialized as a whole - each card is its own blob.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CardLibrary {
+    pub cards: Vec<CardMeta, MAX_CARDS>,
+}
+
+/// What an [`CardLibrary::upsert`] did, so the caller can react
+/// (persist, highlight the row, or warn that the library is full).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upsert {
+    /// A new card was inserted at the front.
+    Added,
+    /// A card already in the library was refreshed and moved to the
+    /// front.
+    Bumped,
+    /// The library is at capacity and this card is not already in it;
+    /// nothing was stored.
+    Full,
+}
+
+impl CardLibrary {
+    /// Index of the card whose identity carries these id bytes
+    /// (UID / PUPI / IDm), if any.
+    fn position_of(&self, id: &[u8]) -> Option<usize> {
+        self.cards.iter().position(|c| c.identity.id_bytes() == id)
+    }
+
+    /// Next order key: one past the current maximum.
+    fn next_seq(&self) -> u32 {
+        self.cards.iter().map(|c| c.seq).max().unwrap_or(0).wrapping_add(1)
+    }
+
+    /// Insert a scanned card, or refresh one already stored, keeping
+    /// newest-first order.
+    ///
+    /// Matching is by the identity's id bytes. An existing card has its
+    /// `last_seen`, `identity` (a re-read may refine the kind), and
+    /// `seq` refreshed and moves to the front. A new card is inserted
+    /// at the front with an auto label, unless the library is full.
+    pub fn upsert(&mut self, identity: &CardIdentity, now: TimeData) -> Upsert {
+        let seq = self.next_seq();
+        if let Some(i) = self.position_of(identity.id_bytes()) {
+            let mut meta = self.cards.remove(i);
+            meta.last_seen = now;
+            meta.identity = identity.clone();
+            meta.seq = seq;
+            // Room is guaranteed: we just removed this same entry.
+            let _ = self.cards.insert(0, meta);
+            Upsert::Bumped
+        } else if self.cards.len() >= MAX_CARDS {
+            Upsert::Full
+        } else {
+            let meta = CardMeta {
+                identity: identity.clone(),
+                label: auto_label(identity),
+                first_seen: now,
+                last_seen: now,
+                has_dump: false,
+                seq,
+            };
+            // Room checked above.
+            let _ = self.cards.insert(0, meta);
+            Upsert::Added
+        }
+    }
+
+    /// Remove the card carrying these id bytes. Returns `true` if one
+    /// was removed.
+    pub fn remove(&mut self, id: &[u8]) -> bool {
+        match self.position_of(id) {
+            Some(i) => {
+                self.cards.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Borrow the card carrying these id bytes.
+    pub fn get_by_id(&self, id: &[u8]) -> Option<&CardMeta> {
+        self.cards.iter().find(|c| c.identity.id_bytes() == id)
+    }
+
+    /// Append a record loaded from flash at boot. Silently ignores an
+    /// overflow past [`MAX_CARDS`] (the write path enforces the cap, so
+    /// more files than that should not exist; if they do, the extras
+    /// are simply not loaded).
+    pub fn push_loaded(&mut self, meta: CardMeta) {
+        let _ = self.cards.push(meta);
+    }
+
+    /// Rebuild newest-first order from `seq`. Call after loading files,
+    /// which enumerate in arbitrary order.
+    pub fn sort_newest_first(&mut self) {
+        self.cards.sort_unstable_by(|a, b| b.seq.cmp(&a.seq));
+    }
+
+    pub fn len(&self) -> usize {
+        self.cards.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cards.is_empty()
+    }
+
+    /// At capacity: the next new card cannot be stored until one is
+    /// removed.
+    pub fn is_full(&self) -> bool {
+        self.cards.len() >= MAX_CARDS
+    }
+}
+
+/// A short type tag for the auto label, kept tiny so the label fits.
+fn kind_tag(identity: &CardIdentity) -> &'static str {
+    match identity {
+        CardIdentity::Iso14443a(a) => match a.kind {
+            CardKind::MifareClassicMini => "Mini",
+            CardKind::MifareClassic1K => "1K",
+            CardKind::MifareClassic4K => "4K",
+            CardKind::MifareUltralight => "UL",
+            CardKind::MifareDesfire => "DESFire",
+            CardKind::MifarePlus => "Plus",
+            CardKind::Iso14443aOther => "A",
+        },
+        CardIdentity::Iso14443b(_) => "B",
+        CardIdentity::Felica(_) => "F",
+        CardIdentity::Iso15693(_) => "V",
+    }
+}
+
+/// Auto label: the short kind tag plus the first four id bytes in hex,
+/// e.g. `"1K 98D4DB3D"`. Bounded well under [`LABEL_MAX`]; a write that
+/// would overflow simply stops (never panics).
+pub fn auto_label(identity: &CardIdentity) -> String<LABEL_MAX> {
+    use core::fmt::Write;
+    let mut s: String<LABEL_MAX> = String::new();
+    let _ = write!(s, "{} ", kind_tag(identity));
+    for b in identity.id_bytes().iter().take(4) {
+        let _ = write!(s, "{:02X}", b);
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nfc::{TypeAInfo, Uid};
+
+    fn now(day: u8) -> TimeData {
+        TimeData { hour: 12, minute: 0, second: 0, year: 2026, month: 9, day }
+    }
+
+    /// A Type A card with the given UID and kind.
+    fn card(uid: &[u8], kind: CardKind) -> CardIdentity {
+        let mut u: Uid = Uid::new();
+        for &b in uid {
+            u.push(b).unwrap();
+        }
+        CardIdentity::Iso14443a(TypeAInfo { uid: u, atqa: [0x04, 0x00], sak: 0x08, kind })
+    }
+
+    fn ids(lib: &CardLibrary) -> heapless::Vec<u8, 32> {
+        lib.cards.iter().map(|c| c.identity.id_bytes()[0]).collect()
+    }
+
+    #[test]
+    fn add_puts_newest_at_front() {
+        let mut lib = CardLibrary::default();
+        assert_eq!(lib.upsert(&card(&[0xA1], CardKind::MifareClassic1K), now(1)), Upsert::Added);
+        assert_eq!(lib.upsert(&card(&[0xB2], CardKind::MifareClassic1K), now(2)), Upsert::Added);
+        assert_eq!(lib.upsert(&card(&[0xC3], CardKind::MifareClassic1K), now(3)), Upsert::Added);
+        assert_eq!(lib.len(), 3);
+        assert_eq!(&ids(&lib)[..], &[0xC3, 0xB2, 0xA1]);
+    }
+
+    #[test]
+    fn rescan_bumps_to_front_and_refreshes() {
+        let mut lib = CardLibrary::default();
+        lib.upsert(&card(&[0xA1], CardKind::MifareClassic1K), now(1));
+        lib.upsert(&card(&[0xB2], CardKind::MifareClassic1K), now(2));
+        assert_eq!(lib.upsert(&card(&[0xA1], CardKind::MifareClassic1K), now(5)), Upsert::Bumped);
+        assert_eq!(lib.len(), 2);
+        assert_eq!(&ids(&lib)[..], &[0xA1, 0xB2]);
+        assert_eq!(lib.cards[0].last_seen, now(5));
+        assert_eq!(lib.cards[0].first_seen, now(1));
+        // The bumped card must now hold the top seq.
+        assert!(lib.cards[0].seq > lib.cards[1].seq);
+    }
+
+    #[test]
+    fn rescan_can_refine_kind() {
+        let mut lib = CardLibrary::default();
+        lib.upsert(&card(&[0xA1], CardKind::Iso14443aOther), now(1));
+        lib.upsert(&card(&[0xA1], CardKind::MifareClassic1K), now(2));
+        assert_eq!(lib.len(), 1);
+        if let CardIdentity::Iso14443a(a) = &lib.cards[0].identity {
+            assert_eq!(a.kind, CardKind::MifareClassic1K);
+        } else {
+            panic!("expected Type A");
+        }
+    }
+
+    #[test]
+    fn full_refuses_new_but_still_bumps_existing() {
+        let mut lib = CardLibrary::default();
+        for i in 0..MAX_CARDS as u8 {
+            assert_eq!(lib.upsert(&card(&[i], CardKind::MifareClassic1K), now(1)), Upsert::Added);
+        }
+        assert!(lib.is_full());
+        assert_eq!(lib.upsert(&card(&[0xFF], CardKind::MifareClassic1K), now(2)), Upsert::Full);
+        assert_eq!(lib.len(), MAX_CARDS);
+        assert_eq!(lib.upsert(&card(&[0], CardKind::MifareClassic1K), now(3)), Upsert::Bumped);
+        assert_eq!(lib.cards[0].identity.id_bytes()[0], 0);
+    }
+
+    #[test]
+    fn remove_by_id() {
+        let mut lib = CardLibrary::default();
+        lib.upsert(&card(&[0xA1], CardKind::MifareClassic1K), now(1));
+        lib.upsert(&card(&[0xB2], CardKind::MifareClassic1K), now(2));
+        assert!(lib.remove(&[0xA1]));
+        assert!(!lib.remove(&[0xA1]));
+        assert_eq!(&ids(&lib)[..], &[0xB2]);
+    }
+
+    #[test]
+    fn sort_rebuilds_newest_first_from_seq() {
+        // Simulate a boot load: push in arbitrary (seq) order.
+        let mut lib = CardLibrary::default();
+        for (uid, seq) in [(0xA1u8, 3u32), (0xB2, 1), (0xC3, 2)] {
+            lib.push_loaded(CardMeta {
+                identity: card(&[uid], CardKind::MifareClassic1K),
+                label: String::new(),
+                first_seen: now(1),
+                last_seen: now(1),
+                has_dump: false,
+                seq,
+            });
+        }
+        lib.sort_newest_first();
+        // Highest seq (A1=3) first, then C3=2, then B2=1.
+        assert_eq!(&ids(&lib)[..], &[0xA1, 0xC3, 0xB2]);
+    }
+
+    #[test]
+    fn get_by_id_finds_the_card() {
+        let mut lib = CardLibrary::default();
+        lib.upsert(&card(&[0xA1, 0xA2], CardKind::MifareClassic1K), now(1));
+        assert!(lib.get_by_id(&[0xA1, 0xA2]).is_some());
+        assert!(lib.get_by_id(&[0x00]).is_none());
+    }
+
+    #[test]
+    fn label_is_short_and_kinded() {
+        let l = auto_label(&card(&[0x98, 0xD4, 0xDB, 0x3D], CardKind::MifareClassic1K));
+        assert_eq!(l.as_str(), "1K 98D4DB3D");
+        assert!(l.len() <= LABEL_MAX);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn record_blob_round_trips() {
+        let meta = CardMeta {
+            identity: card(&[0x98, 0xD4, 0xDB, 0x3D], CardKind::MifareClassic1K),
+            label: auto_label(&card(&[0x98, 0xD4, 0xDB, 0x3D], CardKind::MifareClassic1K)),
+            first_seen: now(1),
+            last_seen: now(9),
+            has_dump: true,
+            seq: 42,
+        };
+        let mut buf = [0u8; 256];
+        let encoded = postcard::to_slice(&meta, &mut buf).expect("encode");
+        let decoded: CardMeta = postcard::from_bytes(encoded).expect("decode");
+        assert_eq!(decoded, meta);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn record_missing_identity_fails_to_decode() {
+        // A TLV payload with only a seq entry (no identity) is not a
+        // card and must be rejected, not silently defaulted.
+        let mut inner = [0u8; 32];
+        let mut at = 0;
+        crate::tlv::put(&mut inner, &mut at, meta_field::SEQ, &5u32).unwrap();
+        assert!(CardMeta::decode_tagged(&inner[..at]).is_none());
+    }
+}

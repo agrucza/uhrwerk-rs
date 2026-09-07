@@ -977,6 +977,12 @@ pub struct SystemData {
     /// Blocks written by the most recent successful dump, for the NFC
     /// screen's "dumped" confirmation; `None` until a dump completes.
     pub nfc_dump_blocks: Option<u16>,
+
+    /// The persistent card library: cards a scan has identified,
+    /// newest first. Loaded from flash at boot by the manager and kept
+    /// in sync as scans upsert into it; rendered by the NFC library
+    /// screen. Empty on boards without NFC.
+    pub card_library: crate::card_library::CardLibrary,
 }
 
 // -- Screen trait -------------------------------------------------------------

@@ -421,6 +421,7 @@ pub type WifiScanList = heapless::Vec<WifiNetwork, MAX_WIFI_NETWORKS>;
 /// screens have something reasonable to render before the first
 /// RTC read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[allow(dead_code)] // `second` is read by future screens (seconds face)
 pub struct TimeData {
     pub hour: u8,

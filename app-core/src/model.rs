@@ -147,6 +147,12 @@ pub enum Effect {
     /// change to `cached_data.config`.
     SaveConfig,
 
+    /// Persist one card record to its per-card flash file. Carries the
+    /// card's identity id bytes; the manager writes the matching entry
+    /// from `cached_data.card_library`. Emitted after a scan upserts a
+    /// card into the library.
+    SaveCard { id: heapless::Vec<u8, 10> },
+
     /// Apply a new display brightness immediately. Value is the
     /// hardware register range (0..=255) after Model maps the
     /// slider percent. Fired by `Action::SetBrightness` so the
@@ -636,6 +642,22 @@ impl Model {
                 // channel delivers them in that order, so the final
                 // state is correct.
                 self.cached_data.nfc_dump_blocks = None;
+                // An identified card enters the library (a new one is
+                // added at the front, a known one is bumped and
+                // refreshed). Persist the changed record unless the
+                // library is full, in which case the card is shown but
+                // not stored until the user removes one.
+                if let Some(c) = card {
+                    let now = self.cached_data.time;
+                    if !matches!(
+                        self.cached_data.card_library.upsert(c, now),
+                        crate::card_library::Upsert::Full,
+                    ) {
+                        let mut id: heapless::Vec<u8, 10> = heapless::Vec::new();
+                        let _ = id.extend_from_slice(c.id_bytes());
+                        let _ = out.push(Effect::SaveCard { id });
+                    }
+                }
                 self.needs_redraw = true;
                 // Scan confirmation: a one-shot self-terminating click
                 // (manager gates it on haptics_enabled). NOT a

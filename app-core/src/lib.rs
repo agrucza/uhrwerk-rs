@@ -14,6 +14,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod buzz;
+pub mod card_library;
 pub mod commands;
 pub mod config;
 pub mod data;
@@ -22,4 +23,8 @@ pub mod log;
 pub mod model;
 pub mod nav;
 pub mod nfc;
+/// Shared TLV primitives for versioned flash records; only needed by
+/// the code that persists (config, card library), hence serde-gated.
+#[cfg(feature = "serde")]
+pub mod tlv;
 pub mod ui;

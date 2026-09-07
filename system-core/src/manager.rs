@@ -33,6 +33,27 @@ const CONFIG_PATH:    &str = "/system/config/config.bin";
 // with the tagged payload this version should never move again.
 const CONFIG_VERSION: u8   = 2;
 
+// The NFC card library: one small blob file per card under this dir,
+// each a TLV record (see app-core card_library.rs). The dir is
+// enumerated at boot to rebuild the in-RAM list.
+const CARD_DIR:     &str = "/system/nfc/cards";
+// v1 = the tagged per-field card record. Like the config store, the
+// TLV payload means this should never need to move.
+const CARD_VERSION: u8   = 1;
+
+/// Build the per-card blob path `CARD_DIR/<id-hex>.bin` from a card's
+/// identity id bytes. The id is at most 10 bytes (20 hex chars), so
+/// the result fits the fixed buffer with wide margin; `Err` only if it
+/// somehow does not.
+fn card_path(buf: &mut heapless::String<80>, id: &[u8]) -> core::fmt::Result {
+    use core::fmt::Write;
+    write!(buf, "{}/", CARD_DIR)?;
+    for b in id {
+        write!(buf, "{:02X}", b)?;
+    }
+    write!(buf, ".bin")
+}
+
 
 /// Framebuffer row stride in bytes. Used when sizing the per-tile
 /// FB slice handed to the hash function.
@@ -144,6 +165,9 @@ pub struct SystemParts<B: Board> {
     /// hardware that consumes a persisted setting was initialized
     /// (config-first boot).
     pub config: Config,
+    /// The NFC card library, rebuilt from the per-card flash files by
+    /// `run()`. Cached into `SystemData`.
+    pub card_library: app_core::card_library::CardLibrary,
 }
 
 /// The board-agnostic system brain. Generic over the [`Board`] seam;
@@ -286,6 +310,15 @@ pub struct SystemManager<'d, B: Board> {
     /// on battery. Reaching [`LOW_BATT_CONFIRM_READS`] triggers the
     /// clean shutdown in [`Self::check_low_battery`].
     low_batt_reads: u8,
+
+    /// Card ids whose records need writing to flash, deferred off the
+    /// wake path. `Effect::SaveCard` queues here instead of writing
+    /// inline: a scan fires while the display is off, and a synchronous
+    /// blob write (a littlefs create, on a new card) between the tap
+    /// and the panel lighting is visible lag. The flush runs at the end
+    /// of [`Self::tick`], after the wake reveal has already lit the
+    /// screen. Ids are small; the cap only bounds a burst.
+    pending_card_saves: heapless::Vec<heapless::Vec<u8, 10>, 4>,
 }
 
 /// How often the tick loop will retry an SD probe when the mirror
@@ -357,6 +390,7 @@ impl<B: Board> SystemManager<'static, B> {
             capabilities,
             safe_area,
             config: loaded_config,
+            card_library,
         } = parts;
 
         // Seed the shared wall clock so any SD writes before the
@@ -425,6 +459,7 @@ impl<B: Board> SystemManager<'static, B> {
         cached_data.storage = initial_usage;
         cached_data.capabilities = capabilities;
         cached_data.safe_area = safe_area;
+        cached_data.card_library = card_library;
         crate::event_log::load_battery_history(
             &mut store, &mut cached_data.battery_history,
         );
@@ -469,6 +504,7 @@ impl<B: Board> SystemManager<'static, B> {
             last_sd_recover_attempt: None,
             last_sd_detect_check: None,
             low_batt_reads: 0,
+            pending_card_saves: heapless::Vec::new(),
         };
 
         let bundle = TaskBundle {
@@ -664,6 +700,17 @@ impl<B: Board> SystemManager<'static, B> {
                         self.model.config(),
                     );
                     self.refresh_storage_usage().await;
+                }
+                Effect::SaveCard { id } => {
+                    // Defer the actual flash write: a scan fires with
+                    // the display off, and writing the blob inline here
+                    // (a littlefs create for a new card) stalls the tap
+                    // -> screen wake. Queue the id; `tick` flushes it
+                    // after the panel is lit. If a re-scan queues the
+                    // same id twice before a flush, one write suffices.
+                    if !self.pending_card_saves.iter().any(|q| q == &id) {
+                        let _ = self.pending_card_saves.push(id);
+                    }
                 }
                 Effect::SetDisplayBrightness(value) => {
                     self.display.set_brightness(value).await;
@@ -1118,6 +1165,34 @@ impl<B: Board> SystemManager<'static, B> {
         self.board.shutdown(&mut i2c);
     }
 
+    /// Write any card records queued by `Effect::SaveCard`. Runs at the
+    /// end of [`Self::tick`], after the wake reveal has lit the panel,
+    /// so a card save never sits between a tap and the screen coming
+    /// on. Each queued id is looked up in the model's live library and
+    /// its record written to its own blob file.
+    async fn flush_pending_card_saves(&mut self) {
+        if self.pending_card_saves.is_empty() {
+            return;
+        }
+        // Take the queue so the model/store borrows below don't overlap
+        // the field being drained.
+        let ids = core::mem::take(&mut self.pending_card_saves);
+        let mut wrote = false;
+        for id in &ids {
+            let meta = self.model.cached_data().card_library.get_by_id(id).cloned();
+            if let Some(meta) = meta {
+                let mut path: heapless::String<80> = heapless::String::new();
+                if card_path(&mut path, id).is_ok() {
+                    self.store.lock().await.save_blob(&path, CARD_VERSION, &meta);
+                    wrote = true;
+                }
+            }
+        }
+        if wrote {
+            self.refresh_storage_usage().await;
+        }
+    }
+
     /// Run one iteration of the main event loop.
     ///
     /// Waits on the global event channel with an idle-timeout, then
@@ -1224,6 +1299,10 @@ impl<B: Board> SystemManager<'static, B> {
             self.tick_count = self.tick_count.wrapping_add(1);
             self.model.set_tick_count(self.tick_count);
         }
+
+        // Deferred card-record writes (see `pending_card_saves`): the
+        // panel is lit by now, so the blob write is off the wake path.
+        self.flush_pending_card_saves().await;
     }
 
     /// One pass while the UI sleeps: drain pending events, then
@@ -1841,6 +1920,49 @@ pub async fn run<T: Bringup>(
         if loaded { "loaded" } else { "default (re-saved)" },
     );
 
+    // NFC card library: rebuild the in-RAM list from the per-card blob
+    // files under CARD_DIR. Missing dir on first boot -> empty list,
+    // nothing to save. Files enumerate in arbitrary order, so sort by
+    // the records' seq afterwards to restore newest-first.
+    let mut card_library = app_core::card_library::CardLibrary::default();
+    {
+        const CAP: usize = app_core::card_library::MAX_CARDS;
+        let mut names: heapless::Vec<heapless::String<40>, CAP> = heapless::Vec::new();
+        store.flash_mut().for_each_file(CARD_DIR, |name| {
+            let mut s: heapless::String<40> = heapless::String::new();
+            if s.push_str(name).is_ok() && names.push(s).is_ok() {
+                core::ops::ControlFlow::Continue(())
+            } else {
+                core::ops::ControlFlow::Break(())
+            }
+        });
+        for name in &names {
+            let mut path: heapless::String<80> = heapless::String::new();
+            if core::fmt::Write::write_fmt(&mut path, format_args!("{}/{}", CARD_DIR, name))
+                .is_err()
+            {
+                continue;
+            }
+            if let Some(meta) =
+                store.load_blob::<app_core::card_library::CardMeta>(&path, CARD_VERSION)
+            {
+                card_library.push_loaded(meta);
+            }
+        }
+    }
+    card_library.sort_newest_first();
+    log::info!("nfc library: {} card(s)", card_library.len());
+    for c in card_library.cards.iter() {
+        log::info!(
+            "nfc library:   #{} {} [{}] {:02X?}{}",
+            c.seq,
+            c.label.as_str(),
+            c.identity.label(),
+            c.identity.id_bytes(),
+            if c.has_dump { " +dump" } else { "" },
+        );
+    }
+
     let mut display = bringup.make_display(&config).await;
     let fb_canvas = bringup.take_fb_canvas();
     let lcd_te = bringup.make_lcd_te();
@@ -1937,6 +2059,7 @@ pub async fn run<T: Bringup>(
         },
         safe_area: bringup.safe_area(),
         config,
+        card_library,
     });
 
     // Each task is spawned exactly once at boot; `.unwrap()` on the

@@ -52,11 +52,15 @@ const CARD_POLL_SECS: u64 = 2;
 const CARD_POLL_GAP_MS: u64 = 500;
 
 /// Wake-up amplitude detection delta (`am_d<3:0>`, 0..=15). Lower =
-/// more sensitive. 4 reliably trips a MIFARE Classic and an NTAG216
-/// (the NTAG couples a little more weakly, so it needs a moment on the
-/// coil rather than a flick, but it does trip). Raise it if idle drift
-/// false-trips; lower toward 1 if a card genuinely won't trip.
-const WAKEUP_DELTA: u8 = 4;
+/// more sensitive: a smaller antenna-amplitude change trips the sensor.
+/// A MIFARE Classic 1K couples strongly and trips at almost any value;
+/// weaker couplers (an NTAG216, and a MIFARE Classic 4K) produce a
+/// smaller change and were missed at 4 - the NTAG hit-and-miss, the 4K
+/// not at all. 2 catches them. Raise it toward 15 if idle antenna
+/// drift false-trips (harmless-but-wasteful: the field powers up, no
+/// card answers, the gate keeps it silent); lower toward 1 if a card
+/// still won't trip.
+const WAKEUP_DELTA: u8 = 2;
 
 /// Settle delay before re-arming wake-up mode after handling a trip -
 /// keeps a run of false trips from hot-spinning the loop.
