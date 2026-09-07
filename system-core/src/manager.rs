@@ -1184,6 +1184,14 @@ impl<B: Board> SystemManager<'static, B> {
     /// so a card save never sits between a tap and the screen coming
     /// on. Each queued id is looked up in the model's live library and
     /// its record written to its own blob file.
+    ///
+    /// Card blobs are written FLASH-ONLY (`flash_mut().save_blob`), not
+    /// through the SD-mirroring `Store::save_blob`: the card library is
+    /// a flash feature, and a full-UID filename (e.g. a 7-byte NTAG ->
+    /// `048DC5122B5E80.bin`) exceeds the SD's FAT 8.3 name limit, which
+    /// would fail every mirror write and flap the SD offline. SD export
+    /// of cards, if ever wanted, is a separate feature with its own
+    /// naming.
     async fn flush_pending_card_saves(&mut self) {
         if self.pending_card_saves.is_empty() {
             return;
@@ -1197,7 +1205,7 @@ impl<B: Board> SystemManager<'static, B> {
             if let Some(meta) = meta {
                 let mut path: heapless::String<80> = heapless::String::new();
                 if card_path(&mut path, id).is_ok() {
-                    self.store.lock().await.save_blob(&path, CARD_VERSION, &meta);
+                    self.store.lock().await.flash_mut().save_blob(&path, CARD_VERSION, &meta);
                     wrote = true;
                 }
             }
