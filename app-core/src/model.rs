@@ -153,6 +153,12 @@ pub enum Effect {
     /// card into the library.
     SaveCard { id: heapless::Vec<u8, 10> },
 
+    /// Delete one card's persisted blob (the detail view's REMOVE).
+    /// Carries the card's identity id bytes; the manager resolves the
+    /// file path and removes it. The in-RAM `card_library` was already
+    /// updated by the Model when it emitted this.
+    RemoveCard { id: heapless::Vec<u8, 10> },
+
     /// Apply a new display brightness immediately. Value is the
     /// hardware register range (0..=255) after Model maps the
     /// slider percent. Fired by `Action::SetBrightness` so the
@@ -1255,6 +1261,14 @@ impl Model {
                 self.cached_data.nfc_dump_armed = true;
                 self.cached_data.nfc_dump_blocks = None;
                 let _ = out.push(Effect::NfcCommand(NfcCommand::ArmDump));
+                self.needs_redraw = true;
+            }
+            Action::RemoveNfcCard { id } => {
+                // Drop the record from the live library now (the detail
+                // view has already returned to the list) and delete its
+                // flash blob via the manager.
+                self.cached_data.card_library.remove(&id);
+                let _ = out.push(Effect::RemoveCard { id });
                 self.needs_redraw = true;
             }
             Action::TimeSync => {

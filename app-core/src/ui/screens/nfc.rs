@@ -26,6 +26,8 @@ use embedded_graphics::{
 };
 use heapless::{String, Vec};
 
+use crate::card_library::CardMeta;
+use crate::data::TimeData;
 use crate::events::SystemEvent;
 use crate::nfc::CardIdentity;
 use crate::ui::layout::{rect_hit, ScrollState};
@@ -41,9 +43,6 @@ use crate::ui::widgets::{
 
 /// Per-screen accent. NFC reads as "data / contactless comms".
 const ACCENT: Color = theme::INFO;
-
-/// Static system-code shown in the header's right-telemetry slot.
-const TELEMETRY: &str = "NFC.0001";
 
 /// Side margin, matching the settings sub-views and the stopwatch
 /// readout so content lines up across screens.
@@ -70,11 +69,16 @@ pub struct NfcScreen {
     view: NfcView,
     /// Vertical scroll of the list view.
     scroll: ScrollState,
+    /// Detail REMOVE is a two-tap confirm: the first tap sets this,
+    /// turning the button into "CONFIRM?"; a second tap deletes.
+    /// Reset when leaving the detail or opening a different card so a
+    /// pending confirm never carries across cards.
+    confirm_remove: bool,
 }
 
 impl NfcScreen {
     pub fn new() -> Self {
-        Self { view: NfcView::List, scroll: ScrollState::new() }
+        Self { view: NfcView::List, scroll: ScrollState::new(), confirm_remove: false }
     }
 
     // -- List view -----------------------------------------------------------
@@ -157,6 +161,7 @@ impl NfcScreen {
                         let mut id: CardId = Vec::new();
                         let _ = id.extend_from_slice(meta.identity.id_bytes());
                         self.view = NfcView::Detail(id);
+                        self.confirm_remove = false;
                         return Action::Redraw;
                     }
                 }
@@ -178,9 +183,10 @@ impl NfcScreen {
     // -- Detail view ---------------------------------------------------------
 
     fn render_detail<D: BlendTarget>(
-        &self, display: &mut D, data: &SystemData, card: &CardIdentity, ctx: &RenderCtx,
+        &self, display: &mut D, data: &SystemData, meta: &CardMeta, ctx: &RenderCtx,
     ) {
         let _ = ctx;
+        let card = &meta.identity;
         let content_top = app_content_top(&data.safe_area);
 
         // -- Card panel --------------------------------------------------
@@ -231,25 +237,51 @@ impl NfcScreen {
             fonts::draw_at(display, &fonts::caption(), extra.as_str(), x, y, theme::FG_MUTED);
         }
 
-        // -- Dump control (bottom) ---------------------------------------
-        // A dumpable card (MIFARE Classic) offers a DUMP button. Once
-        // armed, the button becomes a "present card to dump" prompt;
-        // after a dump, a "dumped N blocks" confirmation. Non-dumpable
-        // cards show nothing here.
-        let [btn] = layout::bottom_tile_row::<1>();
-        let cx = theme::SCREEN_W as i32 / 2;
-        let btn_cy = btn.top_left.y + btn.size.height as i32 / 2 - 8;
+        // -- Record metadata (below the panel) ---------------------------
+        // The stored record's provenance: when this card was first saved
+        // and last seen, and whether a dump is held for it. `has_dump`
+        // is wired but always false until the dump lands in the record
+        // (a later step), so a dumpable card reads "NO DUMP" for now.
+        let mx = panel.top_left.x + 4;
+        let mut my = panel.top_left.y + PANEL_H + 22;
+        let mut line: String<40> = String::new();
+        let _ = write!(line, "FIRST SEEN  {}", fmt_stamp(&meta.first_seen));
+        fonts::draw_at(display, &fonts::caption(), line.as_str(), mx, my, theme::FG_MUTED);
+        my += 28;
+        line.clear();
+        let _ = write!(line, "LAST SEEN   {}", fmt_stamp(&meta.last_seen));
+        fonts::draw_at(display, &fonts::caption(), line.as_str(), mx, my, theme::FG_MUTED);
+        my += 28;
+        if is_dumpable(card) {
+            let (txt, col) =
+                if meta.has_dump { ("DUMP STORED", theme::OK) } else { ("NO DUMP", theme::FG_MUTED) };
+            fonts::draw_at(display, &fonts::caption(), txt, mx, my, col);
+        }
+
+        // -- Controls (bottom): DUMP left, REMOVE right ------------------
+        // Two fixed tiles. Left is the DUMP affordance for a dumpable
+        // card - and, while a dump is armed / just finished, its prompt
+        // or confirmation text instead. Right is REMOVE for every card,
+        // signal-red (theme::DANGER) so it reads as destructive and
+        // distinct from the cyan DUMP, with a two-tap confirm (label
+        // flips to "CONFIRM?").
+        let [dump_tile, remove_tile] = layout::bottom_tile_row::<2>();
+        let dump_cx = dump_tile.top_left.x + dump_tile.size.width as i32 / 2;
+        let dump_cy = dump_tile.top_left.y + dump_tile.size.height as i32 / 2 - 8;
         if data.nfc_dump_armed {
             fonts::draw_centered(
-                display, &fonts::label(), "PRESENT CARD TO DUMP", cx, btn_cy, theme::WARN,
+                display, &fonts::label(), "PRESENT CARD", dump_cx, dump_cy, theme::WARN,
             );
         } else if let Some(n) = data.nfc_dump_blocks {
             let mut s: String<28> = String::new();
-            let _ = write!(s, "DUMPED {} BLOCKS", n);
-            fonts::draw_centered(display, &fonts::label(), s.as_str(), cx, btn_cy, theme::OK);
+            let _ = write!(s, "DUMPED {}", n);
+            fonts::draw_centered(display, &fonts::label(), s.as_str(), dump_cx, dump_cy, theme::OK);
         } else if is_dumpable(card) {
-            chamfered_button(display, btn, "DUMP", ButtonVariant::Primary, ACCENT);
+            chamfered_button(display, dump_tile, "DUMP", ButtonVariant::Primary, ACCENT);
         }
+
+        let remove_label = if self.confirm_remove { "CONFIRM?" } else { "REMOVE" };
+        chamfered_button(display, remove_tile, remove_label, ButtonVariant::Primary, theme::DANGER);
     }
 
     fn detail_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
@@ -259,23 +291,43 @@ impl NfcScreen {
             NfcView::List => return Action::None,
         };
         match event {
-            // Header back chevron: return to the list.
+            // Header back chevron: return to the list, dropping any
+            // pending remove-confirm.
             SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y, &data.safe_area) => {
+                self.confirm_remove = false;
                 self.view = NfcView::List;
                 Action::Redraw
             }
-            // DUMP button: arm the dump only when the selected card is
-            // dumpable and we're not already armed or showing a result.
             SystemEvent::Tap { x, y } => {
-                let dumpable = data
-                    .card_library
-                    .get_by_id(&id)
-                    .is_some_and(|m| is_dumpable(&m.identity));
+                let [dump_tile, remove_tile] = layout::bottom_tile_row::<2>();
+                // REMOVE (always present): first tap arms the confirm,
+                // second tap on it deletes and returns to the list.
+                if rect_hit(remove_tile, *x, *y) {
+                    if self.confirm_remove {
+                        self.confirm_remove = false;
+                        self.view = NfcView::List;
+                        return Action::RemoveNfcCard { id };
+                    }
+                    self.confirm_remove = true;
+                    return Action::Redraw;
+                }
+                // Any other tap cancels a pending confirm before it is
+                // evaluated for the DUMP button.
+                let was_confirming = self.confirm_remove;
+                self.confirm_remove = false;
+                // DUMP: arm only when the selected card is dumpable and
+                // we're not already armed or showing a result.
+                let dumpable =
+                    data.card_library.get_by_id(&id).is_some_and(|m| is_dumpable(&m.identity));
                 let show_dump =
                     dumpable && !data.nfc_dump_armed && data.nfc_dump_blocks.is_none();
-                let [btn] = layout::bottom_tile_row::<1>();
-                if show_dump && rect_hit(btn, *x, *y) {
-                    Action::ArmNfcDump
+                if show_dump && rect_hit(dump_tile, *x, *y) {
+                    return Action::ArmNfcDump;
+                }
+                // A stray tap that only dismissed the confirm still needs
+                // a redraw to restore the REMOVE label.
+                if was_confirming {
+                    Action::Redraw
                 } else {
                     Action::None
                 }
@@ -292,16 +344,37 @@ impl Screen for NfcScreen {
         // wake does not re-mount, so it keeps whatever view was open.
         self.view = NfcView::List;
         self.scroll = ScrollState::new();
+        self.confirm_remove = false;
     }
 
     fn render<D: BlendTarget>(&self, display: &mut D, data: &SystemData, ctx: &RenderCtx) {
-        draw_app_chrome(display, data, "NFC", TELEMETRY, ACCENT, ctx);
+        // Header telemetry reflects the active view: "NFC.LIST" on the
+        // list, "NFC.<n>" on a card detail where n is the card's 1-based
+        // position in the list (newest = 0001). A detail whose card has
+        // vanished falls back to the list, so its label does too.
+        let mut telem: String<12> = String::new();
+        match &self.view {
+            NfcView::Detail(id) => {
+                match data.card_library.cards.iter().position(|c| c.identity.id_bytes() == id.as_slice()) {
+                    Some(i) => {
+                        let _ = write!(telem, "NFC.{:04}", i + 1);
+                    }
+                    None => {
+                        let _ = write!(telem, "NFC.LIST");
+                    }
+                }
+            }
+            NfcView::List => {
+                let _ = write!(telem, "NFC.LIST");
+            }
+        }
+        draw_app_chrome(display, data, "NFC", telem.as_str(), ACCENT, ctx);
 
         // Detail only when its card still exists; otherwise fall back to
         // the list (a removed or never-found card can't be shown).
         if let NfcView::Detail(id) = &self.view {
             if let Some(meta) = data.card_library.get_by_id(id) {
-                self.render_detail(display, data, &meta.identity, ctx);
+                self.render_detail(display, data, meta, ctx);
                 return;
             }
         }
@@ -323,6 +396,7 @@ impl Screen for NfcScreen {
         } else {
             if matches!(self.view, NfcView::Detail(_)) {
                 self.view = NfcView::List;
+                self.confirm_remove = false;
             }
             self.list_event(event, data)
         }
@@ -339,6 +413,18 @@ fn id_hex(bytes: &[u8]) -> String<48> {
         }
         let _ = write!(s, "{:02X}", b);
     }
+    s
+}
+
+/// Format a record timestamp as "YYYY-MM-DD HH:MM:SS" for the detail
+/// view's provenance lines. A never-set RTC yields a low year; the
+/// value is shown as-is rather than hidden.
+fn fmt_stamp(t: &TimeData) -> String<24> {
+    let mut s: String<24> = String::new();
+    let _ = write!(
+        s, "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        t.year, t.month, t.day, t.hour, t.minute, t.second,
+    );
     s
 }
 

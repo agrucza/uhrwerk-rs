@@ -712,6 +712,20 @@ impl<B: Board> SystemManager<'static, B> {
                         let _ = self.pending_card_saves.push(id);
                     }
                 }
+                Effect::RemoveCard { id } => {
+                    // Delete the card's blob. Fired from a lit detail
+                    // screen (the user tapped REMOVE), not the wake
+                    // path, so an inline flash remove is fine - no
+                    // deferral like `SaveCard`. A queued save for the
+                    // same id is dropped so a just-removed card can't be
+                    // re-written by a stale pending save.
+                    self.pending_card_saves.retain(|q| q != &id);
+                    let mut path: heapless::String<80> = heapless::String::new();
+                    if card_path(&mut path, &id).is_ok() {
+                        let _ = self.store.lock().await.flash_mut().reset_file(&path);
+                        self.refresh_storage_usage().await;
+                    }
+                }
                 Effect::SetDisplayBrightness(value) => {
                     self.display.set_brightness(value).await;
                 }

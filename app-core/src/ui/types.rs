@@ -274,6 +274,12 @@ pub enum Action {
     /// of identifying. Result comes back as `SystemEvent::NfcDumpComplete`.
     ArmNfcDump,
 
+    /// Remove one card from the library (the detail view's REMOVE,
+    /// after its two-tap confirm). The Model drops the record from the
+    /// in-RAM `card_library` and forwards `Effect::RemoveCard` so the
+    /// manager deletes the card's flash blob.
+    RemoveNfcCard { id: heapless::Vec<u8, 10> },
+
     /// Set the clock from whichever time source this board has (the
     /// settings CLOCK view's TIME SYNC button). The Model picks ONE
     /// source per tap and does not chain: WiFi when the board has the
