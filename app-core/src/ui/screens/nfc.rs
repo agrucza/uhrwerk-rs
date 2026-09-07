@@ -1,15 +1,20 @@
-//! NFC screen - shows the last card an NFC scan identified.
+//! NFC screen - the on-watch card library.
 //!
-//! Display-only for now: it renders whatever `data.last_nfc` holds,
-//! which the Model fills from `SystemEvent::NfcProbe`. There is no
-//! scan trigger from this screen yet - a card appears when the boot
-//! probe (or, later, always-on tap detection) identifies one. When
-//! that lands, a tap will wake the display straight onto this screen.
+//! Internal state machine, like Settings: one [`NfcScreen`] holds an
+//! [`NfcView`] that is either the scrollable card [`List`](NfcView::List)
+//! or the [`Detail`](NfcView::Detail) of one selected card. Tapping a
+//! list row opens that card's detail; the header back chevron returns
+//! to the list, and backing out of the list pops the nav stack.
 //!
-//! Layout: standard app chrome ("NFC" title), a single chamfered
-//! panel tagged `CARD` with the family/technology label, the UID as
-//! spaced hex, and - for a Type A card - its ATQA/SAK. With no card
-//! seen this boot, a centered "PRESENT A CARD" caption.
+//! * **List** - a scrollable stack of the cards a scan has saved
+//!   ([`SystemData::card_library`]), newest first, each row an icon +
+//!   label + chevron. Empty until the first scan ("NO CARDS YET"); a
+//!   scan that could not be identified shows the transient "CARD NOT
+//!   RECOGNIZED" while the library is still empty.
+//! * **Detail** - a chamfered `CARD` panel with the family/technology
+//!   label, the UID as spaced hex, and the Type A ATQA/SAK, plus the
+//!   DUMP control for a MIFARE Classic. This is the view a card opens
+//!   into; the dump-arm flow is unchanged, now reached per card.
 //!
 //! Accent: info-cyan - reads as "data / comms", distinct from the
 //! other apps at a glance.
@@ -19,18 +24,19 @@ use embedded_graphics::{
     geometry::{Point, Size},
     primitives::Rectangle,
 };
-use heapless::String;
+use heapless::{String, Vec};
 
 use crate::events::SystemEvent;
 use crate::nfc::CardIdentity;
-use crate::ui::layout::rect_hit;
+use crate::ui::layout::{rect_hit, ScrollState};
 use crate::ui::theme::Color;
 use crate::ui::types::BlendTarget;
 use crate::ui::types::{Action, RenderCtx, Screen, SystemData};
-use crate::ui::{fonts, layout, theme};
+use crate::ui::{fonts, glyphs, layout, theme};
 use crate::ui::widgets::{
     app_chrome_back_hit, app_content_top, chamfered_button, chamfered_panel, draw_app_chrome,
-    tag_label, ButtonVariant, NOTCH, TAG_LABEL_H,
+    handle_scroll_drag, render_scrolled, row, tag_label, viewport_to_home_bar, ButtonVariant,
+    RowControl, NOTCH, ROW_H, SCROLLBAR_GUTTER, TAG_LABEL_H,
 };
 
 /// Per-screen accent. NFC reads as "data / contactless comms".
@@ -47,81 +53,135 @@ const SIDE_MARGIN: i32 = layout::VSTACK_SIDE_MARGIN;
 /// `UID` label + hex row, and the Type A ATQA/SAK line.
 const PANEL_H: i32 = 210;
 
-/// Format identifier bytes as spaced uppercase hex ("A4 AA 64 35").
-/// A Type A UID is at most 10 bytes -> 29 chars, well inside the cap.
-fn id_hex(bytes: &[u8]) -> String<48> {
-    let mut s: String<48> = String::new();
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 {
-            let _ = s.push(' ');
-        }
-        let _ = write!(s, "{:02X}", b);
-    }
-    s
+/// A card's identity id bytes (UID / PUPI / IDm), owned - the detail
+/// view's stable handle on its selected card, resolved against the
+/// library each frame so a re-scan or removal can't dangle an index.
+type CardId = Vec<u8, 10>;
+
+/// Which view the NFC screen is showing.
+enum NfcView {
+    /// The scrollable card library.
+    List,
+    /// One selected card, addressed by its id bytes.
+    Detail(CardId),
 }
 
-/// Whether a card supports the dump sweep (MIFARE Classic families).
-fn is_dumpable(card: &CardIdentity) -> bool {
-    matches!(card, CardIdentity::Iso14443a(a) if a.kind.is_mifare_classic())
+pub struct NfcScreen {
+    view: NfcView,
+    /// Vertical scroll of the list view.
+    scroll: ScrollState,
 }
-
-pub struct NfcScreen;
 
 impl NfcScreen {
     pub fn new() -> Self {
-        Self
+        Self { view: NfcView::List, scroll: ScrollState::new() }
     }
-}
 
-impl Screen for NfcScreen {
-    fn render<D: BlendTarget>(&self, display: &mut D, data: &SystemData, ctx: &RenderCtx) {
-        draw_app_chrome(display, data, "NFC", TELEMETRY, ACCENT, ctx);
+    // -- List view -----------------------------------------------------------
 
-        let safe = &data.safe_area;
-        let content_top = app_content_top(safe);
+    fn render_list<D: BlendTarget>(&self, display: &mut D, data: &SystemData, ctx: &RenderCtx) {
+        let lib = &data.card_library;
+        let content_top = app_content_top(&data.safe_area);
 
-        // Three states: a recognized card renders the panel below; the
-        // other two are a single centered caption.
-        let card = match &data.last_nfc {
-            crate::nfc::NfcScan::Card(c) => c,
-            other => {
-                let cy = content_top + (theme::SCREEN_H as i32 - content_top) / 2 - 20;
-                let cx = theme::SCREEN_W as i32 / 2;
-                match other {
-                    crate::nfc::NfcScan::Unrecognized => {
-                        // A card was there but couldn't be read.
-                        fonts::draw_centered(
-                            display,
-                            &fonts::headline(),
-                            "CARD NOT RECOGNIZED",
-                            cx,
-                            cy,
-                            theme::WARN,
-                        );
-                        fonts::draw_centered(
-                            display,
-                            &fonts::caption(),
-                            "unsupported or unreadable",
-                            cx,
-                            cy + 40,
-                            theme::FG_MUTED,
-                        );
+        // Empty library: a centered caption. If the last scan failed to
+        // identify (and there is nothing to list yet), show that
+        // instead so the "not recognized" feedback survives.
+        if lib.is_empty() {
+            let cx = theme::SCREEN_W as i32 / 2;
+            let cy = content_top + (theme::SCREEN_H as i32 - content_top) / 2 - 20;
+            if matches!(data.last_nfc, crate::nfc::NfcScan::Unrecognized) {
+                fonts::draw_centered(
+                    display, &fonts::headline(), "CARD NOT RECOGNIZED", cx, cy, theme::WARN,
+                );
+                fonts::draw_centered(
+                    display, &fonts::caption(), "unsupported or unreadable",
+                    cx, cy + 40, theme::FG_MUTED,
+                );
+            } else {
+                fonts::draw_centered(
+                    display, &fonts::headline(), "NO CARDS YET", cx, cy, theme::FG_MUTED,
+                );
+                fonts::draw_centered(
+                    display, &fonts::caption(), "present a card to save it",
+                    cx, cy + 40, theme::FG_MUTED,
+                );
+            }
+            return;
+        }
+
+        let viewport = list_viewport(&data.safe_area);
+        let content_h = lib.cards.len() as i32 * ROW_H;
+        render_scrolled(
+            display, self.scroll.offset(), viewport, content_h, ACCENT, ctx,
+            |clip, scroll| {
+                for (i, meta) in lib.cards.iter().enumerate() {
+                    let rect = list_row_rect(i, scroll, &data.safe_area);
+                    let y0 = rect.top_left.y;
+                    let y1 = y0 + rect.size.height as i32;
+                    if !ctx.intersects_y(y0, y1) {
+                        continue;
                     }
-                    _ => {
-                        // No scan yet this boot.
-                        fonts::draw_centered(
-                            display,
-                            &fonts::headline(),
-                            "PRESENT A CARD",
-                            cx,
-                            cy,
-                            theme::FG_MUTED,
-                        );
+                    row(
+                        clip, rect,
+                        |d, cx, cy, c| glyphs::chip(d, cx, cy, 8, c),
+                        ACCENT,
+                        meta.label.as_str(),
+                        RowControl::Chevron(ACCENT),
+                    );
+                }
+            },
+        );
+    }
+
+    fn list_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
+        match event {
+            // Header back chevron: pop the nav stack (leave the app).
+            SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y, &data.safe_area) => {
+                Action::Back
+            }
+            SystemEvent::Tap { x, y } => {
+                if data.card_library.is_empty() {
+                    return Action::None;
+                }
+                let viewport = list_viewport(&data.safe_area);
+                let pt = Point::new(*x as i32, *y as i32);
+                if !viewport.contains(pt) {
+                    return Action::None;
+                }
+                let scroll = self.scroll.offset();
+                // Index and rect mirror the render loop exactly, or draw
+                // and hit-test drift apart.
+                for (i, meta) in data.card_library.cards.iter().enumerate() {
+                    let rect = list_row_rect(i, scroll, &data.safe_area);
+                    if rect.contains(pt) {
+                        let mut id: CardId = Vec::new();
+                        let _ = id.extend_from_slice(meta.identity.id_bytes());
+                        self.view = NfcView::Detail(id);
+                        return Action::Redraw;
                     }
                 }
-                return;
+                Action::None
             }
-        };
+            SystemEvent::TouchPressed { .. } | SystemEvent::TouchReleased => {
+                let viewport_h = list_viewport(&data.safe_area).size.height as i32;
+                let content_h = data.card_library.cards.len() as i32 * ROW_H;
+                if handle_scroll_drag(&mut self.scroll, event, viewport_h, content_h) {
+                    Action::Redraw
+                } else {
+                    Action::None
+                }
+            }
+            _ => Action::None,
+        }
+    }
+
+    // -- Detail view ---------------------------------------------------------
+
+    fn render_detail<D: BlendTarget>(
+        &self, display: &mut D, data: &SystemData, card: &CardIdentity, ctx: &RenderCtx,
+    ) {
+        let _ = ctx;
+        let content_top = app_content_top(&data.safe_area);
 
         // -- Card panel --------------------------------------------------
         let panel = Rectangle::new(
@@ -181,12 +241,7 @@ impl Screen for NfcScreen {
         let btn_cy = btn.top_left.y + btn.size.height as i32 / 2 - 8;
         if data.nfc_dump_armed {
             fonts::draw_centered(
-                display,
-                &fonts::label(),
-                "PRESENT CARD TO DUMP",
-                cx,
-                btn_cy,
-                theme::WARN,
+                display, &fonts::label(), "PRESENT CARD TO DUMP", cx, btn_cy, theme::WARN,
             );
         } else if let Some(n) = data.nfc_dump_blocks {
             let mut s: String<28> = String::new();
@@ -197,19 +252,27 @@ impl Screen for NfcScreen {
         }
     }
 
-    fn on_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
+    fn detail_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
+        // The selected card's id; resolve its identity from the library.
+        let id: CardId = match &self.view {
+            NfcView::Detail(id) => id.clone(),
+            NfcView::List => return Action::None,
+        };
         match event {
-            SystemEvent::PowerButtonLong => Action::Shutdown,
-            // Header back chevron: pop the nav stack.
+            // Header back chevron: return to the list.
             SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y, &data.safe_area) => {
-                Action::Back
+                self.view = NfcView::List;
+                Action::Redraw
             }
-            // DUMP button: arm the dump only when a dumpable card is
-            // shown and we're not already armed or showing a result.
+            // DUMP button: arm the dump only when the selected card is
+            // dumpable and we're not already armed or showing a result.
             SystemEvent::Tap { x, y } => {
-                let show_dump = matches!(&data.last_nfc, crate::nfc::NfcScan::Card(c) if is_dumpable(c))
-                    && !data.nfc_dump_armed
-                    && data.nfc_dump_blocks.is_none();
+                let dumpable = data
+                    .card_library
+                    .get_by_id(&id)
+                    .is_some_and(|m| is_dumpable(&m.identity));
+                let show_dump =
+                    dumpable && !data.nfc_dump_armed && data.nfc_dump_blocks.is_none();
                 let [btn] = layout::bottom_tile_row::<1>();
                 if show_dump && rect_hit(btn, *x, *y) {
                     Action::ArmNfcDump
@@ -220,4 +283,82 @@ impl Screen for NfcScreen {
             _ => Action::None,
         }
     }
+}
+
+impl Screen for NfcScreen {
+    fn on_mount(&mut self, _data: &SystemData) {
+        // Opening the app - or a scan switching to it - always lands on
+        // the list, scrolled to the top (newest card first). A plain
+        // wake does not re-mount, so it keeps whatever view was open.
+        self.view = NfcView::List;
+        self.scroll = ScrollState::new();
+    }
+
+    fn render<D: BlendTarget>(&self, display: &mut D, data: &SystemData, ctx: &RenderCtx) {
+        draw_app_chrome(display, data, "NFC", TELEMETRY, ACCENT, ctx);
+
+        // Detail only when its card still exists; otherwise fall back to
+        // the list (a removed or never-found card can't be shown).
+        if let NfcView::Detail(id) = &self.view {
+            if let Some(meta) = data.card_library.get_by_id(id) {
+                self.render_detail(display, data, &meta.identity, ctx);
+                return;
+            }
+        }
+        self.render_list(display, data, ctx);
+    }
+
+    fn on_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
+        if let SystemEvent::PowerButtonLong = event {
+            return Action::Shutdown;
+        }
+        // Route to the active view. A detail whose card has vanished
+        // reverts to the list first.
+        let detail_live = matches!(
+            &self.view,
+            NfcView::Detail(id) if data.card_library.get_by_id(id).is_some()
+        );
+        if detail_live {
+            self.detail_event(event, data)
+        } else {
+            if matches!(self.view, NfcView::Detail(_)) {
+                self.view = NfcView::List;
+            }
+            self.list_event(event, data)
+        }
+    }
+}
+
+/// Format identifier bytes as spaced uppercase hex ("A4 AA 64 35").
+/// A Type A UID is at most 10 bytes -> 29 chars, well inside the cap.
+fn id_hex(bytes: &[u8]) -> String<48> {
+    let mut s: String<48> = String::new();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 {
+            let _ = s.push(' ');
+        }
+        let _ = write!(s, "{:02X}", b);
+    }
+    s
+}
+
+/// Whether a card supports the dump sweep (MIFARE Classic families).
+fn is_dumpable(card: &CardIdentity) -> bool {
+    matches!(card, CardIdentity::Iso14443a(a) if a.kind.is_mifare_classic())
+}
+
+/// Scroll viewport for the list: from the content top down to the home
+/// bar. Matches the settings index viewport.
+fn list_viewport(safe: &crate::data::SafeArea) -> Rectangle {
+    viewport_to_home_bar(app_content_top(safe), safe)
+}
+
+/// Rect for the Nth list row, shifted by the scroll offset. Width
+/// leaves a scrollbar gutter on the right, like the settings rows.
+fn list_row_rect(index: usize, scroll: i32, safe: &crate::data::SafeArea) -> Rectangle {
+    let y = app_content_top(safe) + index as i32 * ROW_H - scroll;
+    Rectangle::new(
+        Point::new(0, y),
+        Size::new((theme::SCREEN_W as i32 - SCROLLBAR_GUTTER) as u32, ROW_H as u32),
+    )
 }
