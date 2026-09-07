@@ -989,6 +989,14 @@ pub struct SystemData {
     /// in sync as scans upsert into it; rendered by the NFC library
     /// screen. Empty on boards without NFC.
     pub card_library: crate::card_library::CardLibrary,
+
+    /// The card a scan just matched or added, to highlight in the list.
+    /// The Model sets it on every identifying scan (`NfcProbe{Some}`) -
+    /// so a scan lands the highlight even when the NFC screen is
+    /// already open and does not re-mount - and the NFC screen clears
+    /// it on the first list interaction. `None` when there is nothing
+    /// to highlight (no scan yet, or the last scan was unrecognized).
+    pub nfc_highlight: Option<heapless::Vec<u8, 10>>,
 }
 
 // -- Screen trait -------------------------------------------------------------

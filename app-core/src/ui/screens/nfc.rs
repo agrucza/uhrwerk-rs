@@ -44,6 +44,14 @@ use crate::ui::widgets::{
 /// Per-screen accent. NFC reads as "data / contactless comms".
 const ACCENT: Color = theme::INFO;
 
+/// Brighter accent for the just-scanned row's icon + chevron.
+const ACCENT_HOT: Color = theme::INFO_HOT;
+
+/// Alpha of the translucent accent wash behind the just-scanned row
+/// (out of 255) - a subtle tint, not a solid fill, so the label stays
+/// readable on top.
+const HIGHLIGHT_ALPHA: u8 = 48;
+
 /// Side margin, matching the settings sub-views and the stopwatch
 /// readout so content lines up across screens.
 const SIDE_MARGIN: i32 = layout::VSTACK_SIDE_MARGIN;
@@ -78,7 +86,11 @@ pub struct NfcScreen {
 
 impl NfcScreen {
     pub fn new() -> Self {
-        Self { view: NfcView::List, scroll: ScrollState::new(), confirm_remove: false }
+        Self {
+            view: NfcView::List,
+            scroll: ScrollState::new(),
+            confirm_remove: false,
+        }
     }
 
     // -- List view -----------------------------------------------------------
@@ -125,12 +137,27 @@ impl NfcScreen {
                     if !ctx.intersects_y(y0, y1) {
                         continue;
                     }
+                    let hit = data.nfc_highlight.as_deref()
+                        == Some(meta.identity.id_bytes());
+                    if hit {
+                        // A translucent accent wash plus a solid left bar
+                        // mark the just-scanned card. Drawn before the row
+                        // so the icon/label/chevron sit on top. The row's
+                        // own bottom hairline stays visible (h - 1).
+                        let x = rect.top_left.x;
+                        let y = rect.top_left.y;
+                        let w = rect.size.width as i32;
+                        let h = rect.size.height as i32 - 1;
+                        clip.fill_blend(x, y, w, h, ACCENT, HIGHLIGHT_ALPHA);
+                        clip.fill_blend(x, y, 3, h, ACCENT, 255);
+                    }
+                    let accent = if hit { ACCENT_HOT } else { ACCENT };
                     row(
                         clip, rect,
                         |d, cx, cy, c| glyphs::chip(d, cx, cy, 8, c),
-                        ACCENT,
+                        accent,
                         meta.label.as_str(),
-                        RowControl::Chevron(ACCENT),
+                        RowControl::Chevron(accent),
                     );
                 }
             },
@@ -141,6 +168,7 @@ impl NfcScreen {
         match event {
             // Header back chevron: pop the nav stack (leave the app).
             SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y, &data.safe_area) => {
+                data.nfc_highlight = None;
                 Action::Back
             }
             SystemEvent::Tap { x, y } => {
@@ -162,6 +190,7 @@ impl NfcScreen {
                         let _ = id.extend_from_slice(meta.identity.id_bytes());
                         self.view = NfcView::Detail(id);
                         self.confirm_remove = false;
+                        data.nfc_highlight = None;
                         return Action::Redraw;
                     }
                 }
@@ -171,6 +200,8 @@ impl NfcScreen {
                 let viewport_h = list_viewport(&data.safe_area).size.height as i32;
                 let content_h = data.card_library.cards.len() as i32 * ROW_H;
                 if handle_scroll_drag(&mut self.scroll, event, viewport_h, content_h) {
+                    // Engaging the list dismisses the just-scanned mark.
+                    data.nfc_highlight = None;
                     Action::Redraw
                 } else {
                     Action::None

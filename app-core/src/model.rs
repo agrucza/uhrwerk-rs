@@ -655,14 +655,24 @@ impl Model {
                 // not stored until the user removes one.
                 if let Some(c) = card {
                     let now = self.cached_data.time;
+                    let mut id: heapless::Vec<u8, 10> = heapless::Vec::new();
+                    let _ = id.extend_from_slice(c.id_bytes());
+                    // Highlight this card in the list. Set on every
+                    // identifying scan (including a re-scan, and even
+                    // when the NFC screen is already open and so does
+                    // not re-mount); the screen clears it on the first
+                    // interaction.
+                    self.cached_data.nfc_highlight = Some(id.clone());
                     if !matches!(
                         self.cached_data.card_library.upsert(c, now),
                         crate::card_library::Upsert::Full,
                     ) {
-                        let mut id: heapless::Vec<u8, 10> = heapless::Vec::new();
-                        let _ = id.extend_from_slice(c.id_bytes());
                         let _ = out.push(Effect::SaveCard { id });
                     }
+                } else {
+                    // A present-but-unidentified tap: nothing to
+                    // highlight.
+                    self.cached_data.nfc_highlight = None;
                 }
                 self.needs_redraw = true;
                 // Scan confirmation: a one-shot self-terminating click
