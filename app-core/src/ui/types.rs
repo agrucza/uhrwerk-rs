@@ -268,6 +268,12 @@ pub enum Action {
     /// is already running).
     GpsSync,
 
+    /// Arm NFC dump mode (the NFC screen's DUMP button, shown only for
+    /// a dumpable card): the Model marks the UI armed and forwards
+    /// `Effect::NfcCommand(ArmDump)` so the next card tap dumps instead
+    /// of identifying. Result comes back as `SystemEvent::NfcDumpComplete`.
+    ArmNfcDump,
+
     /// Set the clock from whichever time source this board has (the
     /// settings CLOCK view's TIME SYNC button). The Model picks ONE
     /// source per tap and does not chain: WiFi when the board has the
@@ -961,6 +967,16 @@ pub struct SystemData {
     /// always on boards without NFC). Read by the NFC screen. Not
     /// live - a fresh scan replaces it.
     pub last_nfc: crate::nfc::NfcScan,
+
+    /// Dump mode is armed: the NFC screen showed the DUMP button and
+    /// the user tapped it, so the next card tap will be dumped rather
+    /// than identified. Set on `Action::ArmNfcDump`, cleared on
+    /// `SystemEvent::NfcDumpComplete` or when leaving the NFC screen.
+    pub nfc_dump_armed: bool,
+
+    /// Blocks written by the most recent successful dump, for the NFC
+    /// screen's "dumped" confirmation; `None` until a dump completes.
+    pub nfc_dump_blocks: Option<u16>,
 }
 
 // -- Screen trait -------------------------------------------------------------

@@ -34,7 +34,7 @@ use static_cell::StaticCell;
 // below still live here - they're hardware-coupled (task wakers,
 // interrupt-safe mutexes).
 pub use app_core::commands::{
-    AudioCommand, GpsCommand, ImuCommand, RtcCommand, SleepState, WifiCommand,
+    AudioCommand, GpsCommand, ImuCommand, NfcCommand, RtcCommand, SleepState, WifiCommand,
 };
 
 /// Size of the system event channel. Should be large enough to
@@ -150,6 +150,16 @@ pub static AUDIO_COMMAND: Channel<CriticalSectionRawMutex, AudioCommand, 4> = Ch
 ///
 /// Single-consumer: only the GPS task should call `wait()` on this.
 pub static GPS_COMMAND: Signal<CriticalSectionRawMutex, GpsCommand> = Signal::new();
+
+/// Main-to-NFC command signal.
+///
+/// The main loop publishes an [`NfcCommand`] here (`Effect::NfcCommand`)
+/// to arm/cancel the dump path. On boards with an NFC task it waits on
+/// this alongside the reader IRQ; elsewhere nothing listens (the UI
+/// entry is capability-gated).
+///
+/// Single-consumer: only the NFC task should call `wait()` on this.
+pub static NFC_COMMAND: Signal<CriticalSectionRawMutex, NfcCommand> = Signal::new();
 
 /// Main-to-WiFi command signal.
 ///

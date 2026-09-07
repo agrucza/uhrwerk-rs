@@ -20,7 +20,7 @@ use heapless::Vec;
 
 use crate::buzz::{BuzzAction, BuzzPattern};
 use crate::commands::{
-    AudioCommand, GpsCommand, ImuCommand, RtcCommand, SleepState, WifiCommand,
+    AudioCommand, GpsCommand, ImuCommand, NfcCommand, RtcCommand, SleepState, WifiCommand,
 };
 use crate::config::Config;
 use crate::data::TouchData;
@@ -99,6 +99,11 @@ pub enum Effect {
     /// point is capability-gated, so this only fires where hardware
     /// exists.
     GpsCommand(GpsCommand),
+
+    /// Forward a command to the board's NFC task via `NFC_COMMAND`.
+    /// Boards without an NFC task have no consumer; the UI entry point
+    /// is capability-gated, so this only fires where hardware exists.
+    NfcCommand(NfcCommand),
 
     /// Forward a command to the shared WiFi task via `WIFI_COMMAND`.
     /// Builds without the WiFi feature have no consumer; the UI entry
@@ -396,8 +401,13 @@ impl Model {
         // device (a tap-from-sleep lights the display here) and jump to
         // the NFC screen so the card, or a "not recognized" state, is
         // shown. The outcome is already cached (step 1); the event is
-        // consumed so it never reaches a screen's on_event.
-        if let SystemEvent::NfcProbe { .. } = event {
+        // consumed so it never reaches a screen's on_event. A dump
+        // completing is treated the same - keep the screen up to show
+        // the "dumped" result.
+        if matches!(
+            event,
+            SystemEvent::NfcProbe { .. } | SystemEvent::NfcDumpComplete { .. }
+        ) {
             self.last_activity = now;
             self.motion_wake_grace = None;
             if self.sleeping {
@@ -618,6 +628,14 @@ impl Model {
                     Some(c) => crate::nfc::NfcScan::Card(c.clone()),
                     None => crate::nfc::NfcScan::Unrecognized,
                 };
+                // A fresh presentation clears any prior dump result so
+                // the screen shows this card's DUMP button, not a stale
+                // "dumped N blocks" from the card before it. During an
+                // armed dump this NfcProbe still fires first (clearing
+                // the count), then NfcDumpComplete sets it again - the
+                // channel delivers them in that order, so the final
+                // state is correct.
+                self.cached_data.nfc_dump_blocks = None;
                 self.needs_redraw = true;
                 // Scan confirmation: a one-shot self-terminating click
                 // (manager gates it on haptics_enabled). NOT a
@@ -626,6 +644,14 @@ impl Model {
                 // separate Off to lose and the chip ends it itself, so
                 // it cannot latch. Same feedback whether or not the
                 // card was identified.
+                let _ = out.push(Effect::MotorClick);
+            }
+            SystemEvent::NfcDumpComplete { blocks, ok } => {
+                // The armed dump finished. Disarm, record the count for
+                // the screen's "dumped" confirmation, and click.
+                self.cached_data.nfc_dump_armed = false;
+                self.cached_data.nfc_dump_blocks = ok.then_some(*blocks);
+                self.needs_redraw = true;
                 let _ = out.push(Effect::MotorClick);
             }
             SystemEvent::WifiStatusUpdated { state } => {
@@ -914,6 +940,15 @@ impl Model {
     /// Dispatch a screen-returned `Action` into state mutations
     /// and effects.
     fn dispatch_action(&mut self, action: Action, out: &mut Effects) {
+        // Leaving the NFC screen cancels a pending dump arm, so a stale
+        // arm can't dump the next card the user taps elsewhere.
+        if matches!(action, Action::SwitchScreen(_) | Action::Back)
+            && self.screen.id() == ScreenId::Nfc
+            && self.cached_data.nfc_dump_armed
+        {
+            self.cached_data.nfc_dump_armed = false;
+            let _ = out.push(Effect::NfcCommand(NfcCommand::Disarm));
+        }
         match action {
             Action::None => {}
             Action::Redraw => self.needs_redraw = true,
@@ -1189,6 +1224,16 @@ impl Model {
                 // task's reported state, and the task publishes
                 // Syncing as its first act of the session -
                 // milliseconds behind the tap.
+            }
+            Action::ArmNfcDump => {
+                // Mark the UI armed and tell the NFC task the next tap
+                // is a dump. The blocks-count from any prior dump is
+                // cleared so the screen shows "present card to dump",
+                // not a stale "dumped N".
+                self.cached_data.nfc_dump_armed = true;
+                self.cached_data.nfc_dump_blocks = None;
+                let _ = out.push(Effect::NfcCommand(NfcCommand::ArmDump));
+                self.needs_redraw = true;
             }
             Action::TimeSync => {
                 // ONE source per tap, no chaining: WiFi when this

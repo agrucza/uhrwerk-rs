@@ -62,6 +62,21 @@ const WAKEUP_DELTA: u8 = 4;
 /// keeps a run of false trips from hot-spinning the loop.
 const WAKEUP_REARM_SETTLE_MS: u64 = 200;
 
+/// Outcome of one RF poll window. `presentations` counts every card
+/// that identified. `dump` is set only when the poll was armed for a
+/// dump AND a MIFARE Classic card was actually swept: the block count
+/// read and whether the sweep (and its SD write, when present)
+/// completed cleanly. A false trip, or a non-dumpable card tapped while
+/// armed, leaves `dump` `None` so the arm stays standing.
+struct ProbeOutcome {
+    presentations: u32,
+    dump: Option<(u16, bool)>,
+    /// A card answered REQA this window (identified or not), so one is
+    /// physically resting on the coil. The caller waits for it to leave
+    /// before re-arming wake-up mode.
+    saw_card: bool,
+}
+
 #[embassy_executor::task]
 pub async fn nfc_task(
     i2c_bus: &'static SharedI2c,
@@ -229,7 +244,7 @@ async fn rf_probe(
     // it never spins a multi-second sweep; dump mode (Phase 3) passes
     // `true`.
     do_dump: bool,
-) -> Result<u32, Error<SpiErr>> {
+) -> Result<ProbeOutcome, Error<SpiErr>> {
     // 3. Ready mode: oscillator + regulators on, proven by osc_ok.
     drv.update_reg(spi, regs::reg_a::OP_CONTROL, 0, regs::op_control::EN)?;
     let mut osc = false;
@@ -242,7 +257,7 @@ async fn rf_probe(
     }
     if !osc {
         log::warn!("NFC: 27.12 MHz oscillator never stabilized - RF probe skipped");
-        return Ok(0);
+        return Ok(ProbeOutcome { presentations: 0, dump: None, saw_card: false });
     }
     log::info!("NFC: oscillator running");
 
@@ -275,6 +290,10 @@ async fn rf_probe(
     );
     let deadline = Instant::now() + Duration::from_secs(CARD_POLL_SECS);
     let mut presentations: u32 = 0;
+    // Set when a Classic sweep actually ran this window (dump mode).
+    // (blocks_read, ok). Carried out in the ProbeOutcome so the caller
+    // can report NfcDumpComplete and disarm.
+    let mut dump: Option<(u16, bool)> = None;
     // Whether any card answered REQA (ATQA received), even if it then
     // failed to identify. Gates the "unrecognized" report so a bare
     // wake-up trip with no card answering (a false trip, or the card
@@ -461,8 +480,17 @@ async fn rf_probe(
                                                 s.blocks_read,
                                                 sd_status,
                                             );
+                                            // Report to the UI: blocks read, and OK
+                                            // only if no SD write failed midway.
+                                            dump = Some((s.blocks_read, !dump_failed.get()));
                                         }
-                                        Err(e) => log::warn!("NFC: sweep failed: {:?}", e),
+                                        Err(e) => {
+                                            log::warn!("NFC: sweep failed: {:?}", e);
+                                            // Armed dump that could not complete -
+                                            // report a failed result so the UI
+                                            // disarms and the user can retry.
+                                            dump = Some((0, false));
+                                        }
                                     }
                                     // The sweep leaves the card HALTED (encrypted
                                     // halt of the last sector, or a failed auth) -
@@ -505,38 +533,64 @@ async fn rf_probe(
     if saw_atqa && presentations == 0 {
         EVENTS.send(SystemEvent::NfcProbe { card: None }).await;
     }
-    Ok(presentations)
+    Ok(ProbeOutcome { presentations, dump, saw_card: saw_atqa })
 }
 
-/// Always-on wake-up standby (Phase 1 - tested while awake). Arms the
-/// chip's tag-detection mode, parks on the amplitude IRQ (GPIO5), and
-/// on a trip powers the field up for one short poll + identify, then
+/// Always-on wake-up standby. Arms the chip's tag-detection mode,
+/// parks on the amplitude IRQ (GPIO5) OR an arm/disarm command from the
+/// UI, and on a trip powers the field up for one short poll, then
 /// re-arms. Never returns.
 ///
-/// A wake lock is held ONLY while handling a trip, so the system
-/// light-sleeps between taps. GPIO5 is not yet a light-sleep wake
-/// source (Phase 2), so during sleep a tap is caught on the next
-/// heartbeat wake (the IRQ is level-held) rather than instantly.
+/// Identify vs dump: the NFC screen's DUMP button signals
+/// [`bus::NFC_COMMAND`] with `ArmDump`; leaving the screen (or a
+/// completed dump) signals `Disarm`. While armed, the next card trip
+/// runs the full read/sweep (`do_dump = true`) instead of a plain
+/// identify, then reports the block count as `NfcDumpComplete` and
+/// disarms. A false trip or a non-dumpable card tapped while armed
+/// leaves the arm standing so the user can present the right card.
 ///
-/// HARDWARE-ONLY, never run: the wake-up configuration and the
-/// [`WAKEUP_DELTA`] threshold may need tuning on the first flash.
+/// A wake lock is held ONLY while handling a trip, so the system
+/// light-sleeps between taps. GPIO5 is a high-level light-sleep wake
+/// source (Phase 2), so a tap wakes the system straight onto this
+/// screen.
 async fn wakeup_loop(
     drv: &St25r3916,
     spi: &mut SharedSpiDevice,
     irq: &mut Input<'static>,
     store: &'static bus::SharedStore,
 ) {
+    use embassy_futures::select::{select, Either};
+
+    // Armed by the UI's DUMP button; cleared on Disarm or after a dump
+    // actually runs. Local to the task - the single place identify and
+    // dump branch on.
+    let mut dump_armed = false;
+
     loop {
         if let Err(e) = drv.enter_wakeup_mode(spi, WAKEUP_DELTA) {
             log::error!("NFC: enter wake-up mode failed: {:?} - retry in 5 s", e);
             Timer::after(Duration::from_secs(5)).await;
             continue;
         }
-        log::info!("NFC: wake-up armed (delta {})", WAKEUP_DELTA);
+        log::info!(
+            "NFC: wake-up armed (delta {}, dump {})",
+            WAKEUP_DELTA,
+            if dump_armed { "on" } else { "off" },
+        );
 
-        // Park until a tap. A card already resting on the antenna
-        // leaves the level-held IRQ high, so this returns at once.
-        irq.wait_for_high().await;
+        // Park until either a tap (level-held IRQ - a card already
+        // resting on the antenna returns at once) or an arm/disarm
+        // command. A command only flips the flag and re-arms wake-up;
+        // it never powers the field.
+        match select(irq.wait_for_high(), bus::NFC_COMMAND.wait()).await {
+            Either::Second(cmd) => {
+                dump_armed = matches!(cmd, bus::NfcCommand::ArmDump);
+                log::info!("NFC: dump {}", if dump_armed { "ARMED" } else { "disarmed" });
+                continue;
+            }
+            Either::First(()) => {}
+        }
+
         let _wake = bus::WakeHold::new();
 
         // Reading the interrupt registers drops the level-held IRQ.
@@ -548,11 +602,32 @@ async fn wakeup_loop(
             }
         };
         if trip {
-            log::info!("NFC: wake-up trip - polling for a card");
-            // Identify only (do_dump = false): a tap shows the card;
-            // the sweep waits for dump mode (Phase 3).
-            match rf_probe(drv, spi, store, false).await {
-                Ok(n) => log::info!("NFC: poll done ({} card(s))", n),
+            log::info!(
+                "NFC: wake-up trip - polling for a card (dump {})",
+                if dump_armed { "on" } else { "off" },
+            );
+            match rf_probe(drv, spi, store, dump_armed).await {
+                Ok(outcome) => {
+                    log::info!("NFC: poll done ({} card(s))", outcome.presentations);
+                    // A dump actually ran (armed + a Classic card swept):
+                    // report blocks/ok to the UI and disarm. Nothing to
+                    // report for a plain identify or a false trip.
+                    if let Some((blocks, ok)) = outcome.dump {
+                        EVENTS
+                            .send(SystemEvent::NfcDumpComplete { blocks, ok })
+                            .await;
+                        dump_armed = false;
+                    }
+                    // A card is resting on the coil. Wait for it to be
+                    // removed before re-arming wake-up mode - otherwise
+                    // the next trip relights the field, resets the card
+                    // to IDLE, and re-identifies it endlessly. Field is
+                    // still lit from rf_probe; the wake lock is still
+                    // held.
+                    if outcome.saw_card {
+                        wait_for_removal(spi).await;
+                    }
+                }
                 Err(e) => log::error!("NFC: poll after trip failed: {:?}", e),
             }
         }
@@ -561,6 +636,56 @@ async fn wakeup_loop(
         // Let the antenna reference settle before re-arming so a run
         // of false trips can't hot-spin the loop.
         Timer::after(Duration::from_millis(WAKEUP_REARM_SETTLE_MS)).await;
+    }
+}
+
+/// Consecutive silent WUPA polls that mean the card is physically gone.
+/// Must be >= 2: a card resting on the coil answers, is woken to READY,
+/// and the next WUPA (no reply from READY) drops it back to IDLE - so a
+/// resting card yields at most ONE silent poll before answering again,
+/// never two in a row. A removed card is silent on every poll. 3 adds
+/// margin against a stray missed reply; a rare false "removed" only
+/// costs one extra re-identify (the loop re-arms, trips, and re-enters
+/// this wait), never a spin.
+const REMOVAL_SILENT_POLLS: u8 = 3;
+
+/// WUPA presence-poll cadence during the removal wait.
+const REMOVAL_POLL_GAP_MS: u64 = 120;
+
+/// Wait for a just-handled card to leave the coil before the caller
+/// re-arms wake-up mode.
+///
+/// Each wake-up re-trip relights the reader field, which power-cycles a
+/// resting card back to IDLE so it answers REQA and re-identifies -
+/// endlessly, for as long as it rests. So after handling a card, don't
+/// return to wake-up standby yet: keep the field lit (rf_probe leaves it
+/// up) and poll WUPA until the card is gone.
+///
+/// WUPA reaches a HALTed card, waking it to READY; a second WUPA from
+/// READY gets no reply and drops it back to IDLE (ISO14443-3,
+/// hardware-observed - see `Reader::identify`). So a resting card
+/// alternates answer/silence and never reads silent twice running,
+/// while a removed card reads silent every poll: hence
+/// [`REMOVAL_SILENT_POLLS`] consecutive silences = removed.
+///
+/// The wake lock is held by the caller across this, so the system stays
+/// awake with the field on while a card rests on the reader - correct,
+/// that is active use. Re-arming happens only once the antenna is
+/// empty.
+async fn wait_for_removal(spi: &mut SharedSpiDevice) {
+    let mut delay = Delay;
+    let mut reader = Reader::new(&mut *spi, &mut delay);
+    let mut silent: u8 = 0;
+    loop {
+        match reader.wake().await {
+            Ok(_) => silent = 0,
+            Err(_) => silent += 1,
+        }
+        if silent >= REMOVAL_SILENT_POLLS {
+            log::info!("NFC: card removed - re-arming wake-up");
+            return;
+        }
+        Timer::after(Duration::from_millis(REMOVAL_POLL_GAP_MS)).await;
     }
 }
 

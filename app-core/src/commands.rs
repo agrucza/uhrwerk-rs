@@ -100,6 +100,22 @@ pub enum GpsCommand {
     Abort,
 }
 
+/// Main-loop -> NFC task commands. The NFC task is otherwise driven by
+/// the reader IRQ (a tap identifies a card); this arms the alternate
+/// path so the next tap dumps the card instead of just identifying it.
+/// Boards without an NFC task have no consumer; the UI entry point is
+/// capability-gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NfcCommand {
+    /// Arm dump mode: the next card tap runs a full read (Classic
+    /// sweep to SD) instead of a plain identify, then disarms. Result
+    /// comes back as `SystemEvent::NfcDumpComplete`.
+    ArmDump,
+    /// Cancel a pending arm (the user left the NFC screen without
+    /// dumping). A no-op if not armed.
+    Disarm,
+}
+
 /// Main-loop -> WiFi task commands. The radio exists only for the
 /// seconds a session runs; every variant is one complete session
 /// (radio up -> work -> radio off). Carries the credentials so the

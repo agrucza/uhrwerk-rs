@@ -626,6 +626,7 @@ impl<B: Board> SystemManager<'static, B> {
                     }
                 }
                 Effect::GpsCommand(cmd) => crate::bus::GPS_COMMAND.signal(cmd),
+                Effect::NfcCommand(cmd) => crate::bus::NFC_COMMAND.signal(cmd),
                 Effect::WifiCommand(cmd) => crate::bus::WIFI_COMMAND.signal(cmd),
                 Effect::WifiStopServer => crate::bus::WIFI_STOP.signal(()),
                 Effect::Shutdown => {

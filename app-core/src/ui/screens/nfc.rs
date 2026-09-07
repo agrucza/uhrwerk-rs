@@ -23,13 +23,14 @@ use heapless::String;
 
 use crate::events::SystemEvent;
 use crate::nfc::CardIdentity;
+use crate::ui::layout::rect_hit;
 use crate::ui::theme::Color;
 use crate::ui::types::BlendTarget;
 use crate::ui::types::{Action, RenderCtx, Screen, SystemData};
 use crate::ui::{fonts, layout, theme};
 use crate::ui::widgets::{
-    app_chrome_back_hit, app_content_top, chamfered_panel, draw_app_chrome, tag_label,
-    NOTCH, TAG_LABEL_H,
+    app_chrome_back_hit, app_content_top, chamfered_button, chamfered_panel, draw_app_chrome,
+    tag_label, ButtonVariant, NOTCH, TAG_LABEL_H,
 };
 
 /// Per-screen accent. NFC reads as "data / contactless comms".
@@ -57,6 +58,11 @@ fn id_hex(bytes: &[u8]) -> String<48> {
         let _ = write!(s, "{:02X}", b);
     }
     s
+}
+
+/// Whether a card supports the dump sweep (MIFARE Classic families).
+fn is_dumpable(card: &CardIdentity) -> bool {
+    matches!(card, CardIdentity::Iso14443a(a) if a.kind.is_mifare_classic())
 }
 
 pub struct NfcScreen;
@@ -164,6 +170,31 @@ impl Screen for NfcScreen {
             );
             fonts::draw_at(display, &fonts::caption(), extra.as_str(), x, y, theme::FG_MUTED);
         }
+
+        // -- Dump control (bottom) ---------------------------------------
+        // A dumpable card (MIFARE Classic) offers a DUMP button. Once
+        // armed, the button becomes a "present card to dump" prompt;
+        // after a dump, a "dumped N blocks" confirmation. Non-dumpable
+        // cards show nothing here.
+        let [btn] = layout::bottom_tile_row::<1>();
+        let cx = theme::SCREEN_W as i32 / 2;
+        let btn_cy = btn.top_left.y + btn.size.height as i32 / 2 - 8;
+        if data.nfc_dump_armed {
+            fonts::draw_centered(
+                display,
+                &fonts::label(),
+                "PRESENT CARD TO DUMP",
+                cx,
+                btn_cy,
+                theme::WARN,
+            );
+        } else if let Some(n) = data.nfc_dump_blocks {
+            let mut s: String<28> = String::new();
+            let _ = write!(s, "DUMPED {} BLOCKS", n);
+            fonts::draw_centered(display, &fonts::label(), s.as_str(), cx, btn_cy, theme::OK);
+        } else if is_dumpable(card) {
+            chamfered_button(display, btn, "DUMP", ButtonVariant::Primary, ACCENT);
+        }
     }
 
     fn on_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
@@ -172,6 +203,19 @@ impl Screen for NfcScreen {
             // Header back chevron: pop the nav stack.
             SystemEvent::Tap { x, y } if app_chrome_back_hit(*x, *y, &data.safe_area) => {
                 Action::Back
+            }
+            // DUMP button: arm the dump only when a dumpable card is
+            // shown and we're not already armed or showing a result.
+            SystemEvent::Tap { x, y } => {
+                let show_dump = matches!(&data.last_nfc, crate::nfc::NfcScan::Card(c) if is_dumpable(c))
+                    && !data.nfc_dump_armed
+                    && data.nfc_dump_blocks.is_none();
+                let [btn] = layout::bottom_tile_row::<1>();
+                if show_dump && rect_hit(btn, *x, *y) {
+                    Action::ArmNfcDump
+                } else {
+                    Action::None
+                }
             }
             _ => Action::None,
         }
