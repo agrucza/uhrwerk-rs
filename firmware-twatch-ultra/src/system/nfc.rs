@@ -60,10 +60,18 @@ const CARD_POLL_GAP_MS: u64 = 500;
 /// drift false-trips (harmless-but-wasteful: the field powers up, no
 /// card answers, the gate keeps it silent); lower toward 1 if a card
 /// still won't trip.
+///
+/// The post-detection false-trip loop that a tight delta used to
+/// provoke is fixed at the source: `arm_wakeup` measures the empty
+/// antenna and arms with that as a FIXED reference (am_ae = 0) on every
+/// arm, so a card can no longer drag an auto-averaged reference off the
+/// baseline. That let delta stay at 2 (needed for the weakly-coupling
+/// 4K/NTAG) without the loop.
 const WAKEUP_DELTA: u8 = 2;
 
-/// Settle delay before re-arming wake-up mode after handling a trip -
-/// keeps a run of false trips from hot-spinning the loop.
+/// Field-off settle in `arm_wakeup` before the reference measurement:
+/// lets the reader field ring down so the measured amplitude is the
+/// empty-antenna baseline. Also throttles the arm loop between trips.
 const WAKEUP_REARM_SETTLE_MS: u64 = 200;
 
 /// Outcome of one RF poll window. `presentations` counts every card
@@ -571,14 +579,18 @@ async fn wakeup_loop(
     let mut dump_armed = false;
 
     loop {
-        if let Err(e) = drv.enter_wakeup_mode(spi, WAKEUP_DELTA) {
-            log::error!("NFC: enter wake-up mode failed: {:?} - retry in 5 s", e);
-            Timer::after(Duration::from_secs(5)).await;
-            continue;
-        }
+        let reference = match arm_wakeup(drv, spi, WAKEUP_DELTA).await {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("NFC: enter wake-up mode failed: {:?} - retry in 5 s", e);
+                Timer::after(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
         log::info!(
-            "NFC: wake-up armed (delta {}, dump {})",
+            "NFC: wake-up armed (delta {}, ref {}, dump {})",
             WAKEUP_DELTA,
+            reference,
             if dump_armed { "on" } else { "off" },
         );
 
@@ -637,10 +649,39 @@ async fn wakeup_loop(
         }
 
         drop(_wake);
-        // Let the antenna reference settle before re-arming so a run
-        // of false trips can't hot-spin the loop.
-        Timer::after(Duration::from_millis(WAKEUP_REARM_SETTLE_MS)).await;
+        // No settle here: the next iteration's `arm_wakeup` collapses
+        // the field, settles, and measures a fresh reference before
+        // re-arming (and its 5 s error retry throttles failures).
     }
+}
+
+/// Arm wake-up mode with a freshly-measured amplitude reference, and
+/// return that reference (for logging).
+///
+/// The chip's auto-averaged reference is seeded only once after
+/// power-up and is never re-seeded on a re-arm, so a card detection
+/// permanently drags it off the empty-antenna baseline and the sensor
+/// free-runs (datasheet 4.2.5). Instead: collapse the field, let the
+/// antenna go quiet, take a one-shot amplitude measurement (the Measure
+/// Amplitude command self-enables the oscillator and raises DCT on
+/// completion), and hand that value to `enter_wakeup_mode` as a FIXED
+/// reference (am_ae = 0). Re-measured every arm, it tracks slow drift
+/// yet a card can never contaminate it.
+async fn arm_wakeup(
+    drv: &St25r3916,
+    spi: &mut SharedSpiDevice,
+    delta: u8,
+) -> Result<u8, Error<SpiErr>> {
+    // Collapse the reader field and let the antenna go quiet so the
+    // measurement reflects the empty baseline, not residual field.
+    drv.field_off(spi)?;
+    Timer::after(Duration::from_millis(WAKEUP_REARM_SETTLE_MS)).await;
+    // One-shot empty-antenna amplitude measurement -> AD_RESULT.
+    drv.direct_command(spi, regs::cmd::MEASURE_AMPLITUDE)?;
+    wait_irq_timer_nfc(drv, spi, regs::irq_timer_nfc::DCT, 10).await?;
+    let reference = drv.ad_result(spi)?;
+    drv.enter_wakeup_mode(spi, delta, reference)?;
+    Ok(reference)
 }
 
 /// Consecutive silent WUPA polls that mean the card is physically gone.

@@ -322,17 +322,29 @@ impl St25r3916 {
         &self,
         spi: &mut S,
         delta: u8,
+        reference: u8,
     ) -> Result<(), Error<S::Error>> {
         // Everything off; the wake-up timer runs regardless.
         self.write_reg(spi, reg_a::OP_CONTROL, &[0])?;
-        // Amplitude measurement with an auto-averaged reference.
+        // Amplitude measurement against a FIXED, controller-set
+        // reference (am_ae = 0), not the auto-averaged one. Per the
+        // datasheet (DS12484 section 4.2.5) the auto-averaged reference
+        // is seeded ONLY ONCE - at the first wake-up entry after
+        // power-up - and is never re-seeded on a later re-arm (only a
+        // power cycle or Set default re-initializes it). A card
+        // detection drags that average off the empty-antenna baseline,
+        // and because each re-armed session takes a single measurement
+        // then trips, the average never crawls back: the sensor
+        // free-runs on an empty antenna (the false-trip loop that only
+        // appears after the first card). A reference the caller
+        // measures fresh on every arm and we hold fixed for the session
+        // cannot be pulled off by a card.
         self.write_reg(
             spi,
             reg_a::AMPLITUDE_MEASURE_CONF,
-            &[regs::amplitude_measure_conf::delta(delta)
-                | regs::amplitude_measure_conf::weight(2)
-                | regs::amplitude_measure_conf::AM_AE],
+            &[regs::amplitude_measure_conf::delta(delta)],
         )?;
+        self.write_reg(spi, reg_a::AMPLITUDE_MEASURE_REF, &[reference])?;
         // Run only the amplitude measurement, 100 ms base, shortest
         // multiplier (responsive), IRQ on a threshold cross only.
         self.write_reg(
@@ -348,6 +360,14 @@ impl St25r3916 {
         // Enter wake-up mode (wu = 1, en = 0).
         self.write_reg(spi, reg_a::OP_CONTROL, &[regs::op_control::WU])?;
         Ok(())
+    }
+
+    /// Turn the field and all activity off (OP_CONTROL = 0) without
+    /// entering wake-up mode. Used to quiet the antenna before a
+    /// standalone [`cmd::MEASURE_AMPLITUDE`] so the measured amplitude
+    /// reflects the empty baseline, not residual reader field.
+    pub fn field_off<S: SpiDevice<u8>>(&self, spi: &mut S) -> Result<(), Error<S::Error>> {
+        self.write_reg(spi, reg_a::OP_CONTROL, &[0])
     }
 
     /// Read (and clear) all four interrupt status registers in one
