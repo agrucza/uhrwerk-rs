@@ -205,10 +205,12 @@ impl NfcScreen {
                     if rect.contains(pt) {
                         let mut id: CardId = Vec::new();
                         let _ = id.extend_from_slice(meta.identity.id_bytes());
-                        self.view = NfcView::Detail(id);
+                        self.view = NfcView::Detail(id.clone());
                         self.confirm_remove = false;
                         data.nfc_highlight = None;
-                        return Action::Redraw;
+                        // The Model loads this card's sector summary
+                        // (if it has a dump) into the RAM slot.
+                        return Action::OpenNfcCard { id };
                     }
                 }
                 Action::None

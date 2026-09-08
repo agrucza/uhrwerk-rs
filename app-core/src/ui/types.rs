@@ -295,6 +295,12 @@ pub enum Action {
         label: heapless::String<{ crate::card_library::LABEL_MAX }>,
     },
 
+    /// The NFC list opened one card's detail. The Model drops a
+    /// summary slot that belongs to another card and forwards
+    /// `Effect::LoadDumpSummary` so the manager loads this card's
+    /// summary file (if it has a dump) into `nfc_summary`.
+    OpenNfcCard { id: heapless::Vec<u8, 10> },
+
     /// Set the clock from whichever time source this board has (the
     /// settings CLOCK view's TIME SYNC button). The Model picks ONE
     /// source per tap and does not chain: WiFi when the board has the
@@ -1008,6 +1014,14 @@ pub struct SystemData {
     /// it on the first list interaction. `None` when there is nothing
     /// to highlight (no scan yet, or the last scan was unrecognized).
     pub nfc_highlight: Option<heapless::Vec<u8, 10>>,
+
+    /// The ONE Classic sector summary in RAM (see
+    /// `card_library::ClassicSummary`): the card being dumped right now
+    /// (filled per sector as the sweep runs) or the card whose detail
+    /// is open (loaded from its summary file on `Action::OpenNfcCard`).
+    /// `None` when neither applies or the card has no dump. The NFC
+    /// detail renders it only when its `id` matches the shown card.
+    pub nfc_summary: Option<crate::card_library::CardSummary>,
 }
 
 // -- Screen trait -------------------------------------------------------------

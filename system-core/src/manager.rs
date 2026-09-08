@@ -71,6 +71,89 @@ fn dump_path(buf: &mut heapless::String<80>, id: &[u8]) -> core::fmt::Result {
     write!(buf, ".dump")
 }
 
+/// Blob version of a card's sector-summary file.
+const SUMMARY_VERSION: u8 = 1;
+
+/// Build the sector-summary path `DUMP_DIR/<id-hex>.sum` for a card:
+/// the `ClassicSummary` of its stored dump, as a versioned blob. Lives
+/// beside the dump, not in the card record, so the 30-card library
+/// stays small (see `card_library::ClassicSummary`).
+fn summary_path(buf: &mut heapless::String<80>, id: &[u8]) -> core::fmt::Result {
+    use core::fmt::Write;
+    write!(buf, "{}/", DUMP_DIR)?;
+    for b in id {
+        write!(buf, "{:02X}", b)?;
+    }
+    write!(buf, ".sum")
+}
+
+/// Rebuild the NFC card library IN PLACE from the per-card blob files
+/// under `CARD_DIR`, straight into its final home in `SystemData`.
+/// Missing dir on first boot -> empty list. Files enumerate in
+/// arbitrary order, so the list is re-sorted newest-first afterwards.
+///
+/// In place, like the battery history: the library is ~7 KB and lives
+/// in the boot future's static storage, so every intermediate copy
+/// (a local, a `SystemParts` field) costs that much again in RAM that
+/// would otherwise be main stack.
+fn load_card_library(
+    store: &mut crate::storage::Store,
+    out: &mut app_core::card_library::CardLibrary,
+) {
+    const CAP: usize = app_core::card_library::MAX_CARDS;
+    let mut names: heapless::Vec<heapless::String<40>, CAP> = heapless::Vec::new();
+    store.flash_mut().for_each_file(CARD_DIR, |name| {
+        let mut s: heapless::String<40> = heapless::String::new();
+        if s.push_str(name).is_ok() && names.push(s).is_ok() {
+            core::ops::ControlFlow::Continue(())
+        } else {
+            core::ops::ControlFlow::Break(())
+        }
+    });
+    for name in &names {
+        let mut path: heapless::String<80> = heapless::String::new();
+        if core::fmt::Write::write_fmt(&mut path, format_args!("{}/{}", CARD_DIR, name))
+            .is_err()
+        {
+            continue;
+        }
+        if let Some(meta) =
+            store.load_blob::<app_core::card_library::CardMeta>(&path, CARD_VERSION)
+        {
+            out.push_loaded(meta);
+        }
+    }
+    out.sort_newest_first();
+    log::info!("nfc library: {} card(s)", out.len());
+    for c in out.cards.iter() {
+        log::info!(
+            "nfc library:   #{} {} [{}] {:02X?}{}",
+            c.seq,
+            if c.label.is_empty() { "-" } else { c.label.as_str() },
+            c.identity.label(),
+            c.identity.id_bytes(),
+            if c.has_dump { " +dump" } else { "" },
+        );
+    }
+}
+
+/// Serial rendering of a sector summary, one char per sector (R read,
+/// P partial, L locked, . not swept) plus the key count. Logged when a
+/// summary file is written or loaded - the check that it persisted.
+fn log_summary(what: &str, s: &app_core::card_library::ClassicSummary) {
+    let mut map: heapless::String<40> = heapless::String::new();
+    for i in 0..s.sectors.len() {
+        let ch = match s.sector(i).map(|x| x.state) {
+            Some(app_core::nfc::SectorState::Read) => 'R',
+            Some(app_core::nfc::SectorState::Partial) => 'P',
+            Some(app_core::nfc::SectorState::Locked) => 'L',
+            None => '.',
+        };
+        let _ = map.push(ch);
+    }
+    log::info!("nfc summary {}: sectors {} keys {}", what, map.as_str(), s.keys.len());
+}
+
 
 /// Framebuffer row stride in bytes. Used when sizing the per-tile
 /// FB slice handed to the hash function.
@@ -182,9 +265,6 @@ pub struct SystemParts<B: Board> {
     /// hardware that consumes a persisted setting was initialized
     /// (config-first boot).
     pub config: Config,
-    /// The NFC card library, rebuilt from the per-card flash files by
-    /// `run()`. Cached into `SystemData`.
-    pub card_library: app_core::card_library::CardLibrary,
 }
 
 /// The board-agnostic system brain. Generic over the [`Board`] seam;
@@ -407,7 +487,6 @@ impl<B: Board> SystemManager<'static, B> {
             capabilities,
             safe_area,
             config: loaded_config,
-            card_library,
         } = parts;
 
         // Seed the shared wall clock so any SD writes before the
@@ -476,7 +555,9 @@ impl<B: Board> SystemManager<'static, B> {
         cached_data.storage = initial_usage;
         cached_data.capabilities = capabilities;
         cached_data.safe_area = safe_area;
-        cached_data.card_library = card_library;
+        // Both loaded straight into their SystemData slots - no
+        // intermediate copies (see `load_card_library`).
+        load_card_library(&mut store, &mut cached_data.card_library);
         crate::event_log::load_battery_history(
             &mut store, &mut cached_data.battery_history,
         );
@@ -741,10 +822,15 @@ impl<B: Board> SystemManager<'static, B> {
                     if card_path(&mut path, &id).is_ok() {
                         let mut g = self.store.lock().await;
                         let _ = g.flash_mut().reset_file(&path);
-                        // Also drop the card's structured dump file, if
-                        // any, so removing a card leaves nothing behind.
+                        // Also drop the card's structured dump file and
+                        // its sector summary, if any, so removing a card
+                        // leaves nothing behind.
                         let mut dpath: heapless::String<80> = heapless::String::new();
                         if dump_path(&mut dpath, &id).is_ok() {
+                            let _ = g.flash_mut().reset_file(&dpath);
+                        }
+                        dpath.clear();
+                        if summary_path(&mut dpath, &id).is_ok() {
                             let _ = g.flash_mut().reset_file(&dpath);
                         }
                         drop(g);
@@ -752,14 +838,64 @@ impl<B: Board> SystemManager<'static, B> {
                     }
                 }
                 Effect::RemoveDump { id } => {
-                    // Delete just the card's dump file; the record stays
-                    // (its has_dump was cleared and it is re-saved via a
-                    // queued SaveCard). Fired from a lit detail screen,
-                    // so an inline flash remove is fine.
+                    // Delete the card's dump file and its sector
+                    // summary; the record stays (its has_dump was
+                    // cleared and it is re-saved via a queued SaveCard).
+                    // Fired from a lit detail screen, so an inline flash
+                    // remove is fine.
                     let mut dpath: heapless::String<80> = heapless::String::new();
+                    let mut g = self.store.lock().await;
                     if dump_path(&mut dpath, &id).is_ok() {
-                        let _ = self.store.lock().await.flash_mut().reset_file(&dpath);
-                        self.refresh_storage_usage().await;
+                        let _ = g.flash_mut().reset_file(&dpath);
+                    }
+                    dpath.clear();
+                    if summary_path(&mut dpath, &id).is_ok() {
+                        let _ = g.flash_mut().reset_file(&dpath);
+                    }
+                    drop(g);
+                    self.refresh_storage_usage().await;
+                }
+                Effect::SaveDumpSummary { id } => {
+                    // The dump just completed: write the RAM slot's
+                    // summary to the card's .sum blob. The slot must
+                    // still belong to this card (the Model checked
+                    // before emitting; re-checked here since the
+                    // effect queue is drained after the event).
+                    let summary = self
+                        .model
+                        .cached_data()
+                        .nfc_summary
+                        .as_ref()
+                        .filter(|s| s.id == id)
+                        .map(|s| s.classic.clone());
+                    if let Some(summary) = summary {
+                        let mut path: heapless::String<80> = heapless::String::new();
+                        if summary_path(&mut path, &id).is_ok() {
+                            self.store.lock().await.flash_mut().save_blob(
+                                &path, SUMMARY_VERSION, &summary,
+                            );
+                            log_summary("saved", &summary);
+                            self.refresh_storage_usage().await;
+                        }
+                    }
+                }
+                Effect::LoadDumpSummary { id } => {
+                    // A card detail opened: load its summary file into
+                    // the RAM slot. No file (no dump, or one written
+                    // before summaries existed) leaves the slot empty.
+                    let mut path: heapless::String<80> = heapless::String::new();
+                    if summary_path(&mut path, &id).is_ok() {
+                        let loaded = self
+                            .store
+                            .lock()
+                            .await
+                            .load_blob::<app_core::card_library::ClassicSummary>(
+                                &path, SUMMARY_VERSION,
+                            );
+                        if let Some(summary) = loaded {
+                            log_summary("loaded", &summary);
+                            self.model.set_nfc_summary(id, summary);
+                        }
                     }
                 }
                 Effect::SetDisplayBrightness(value) => {
@@ -1978,49 +2114,6 @@ pub async fn run<T: Bringup>(
         if loaded { "loaded" } else { "default (re-saved)" },
     );
 
-    // NFC card library: rebuild the in-RAM list from the per-card blob
-    // files under CARD_DIR. Missing dir on first boot -> empty list,
-    // nothing to save. Files enumerate in arbitrary order, so sort by
-    // the records' seq afterwards to restore newest-first.
-    let mut card_library = app_core::card_library::CardLibrary::default();
-    {
-        const CAP: usize = app_core::card_library::MAX_CARDS;
-        let mut names: heapless::Vec<heapless::String<40>, CAP> = heapless::Vec::new();
-        store.flash_mut().for_each_file(CARD_DIR, |name| {
-            let mut s: heapless::String<40> = heapless::String::new();
-            if s.push_str(name).is_ok() && names.push(s).is_ok() {
-                core::ops::ControlFlow::Continue(())
-            } else {
-                core::ops::ControlFlow::Break(())
-            }
-        });
-        for name in &names {
-            let mut path: heapless::String<80> = heapless::String::new();
-            if core::fmt::Write::write_fmt(&mut path, format_args!("{}/{}", CARD_DIR, name))
-                .is_err()
-            {
-                continue;
-            }
-            if let Some(meta) =
-                store.load_blob::<app_core::card_library::CardMeta>(&path, CARD_VERSION)
-            {
-                card_library.push_loaded(meta);
-            }
-        }
-    }
-    card_library.sort_newest_first();
-    log::info!("nfc library: {} card(s)", card_library.len());
-    for c in card_library.cards.iter() {
-        log::info!(
-            "nfc library:   #{} {} [{}] {:02X?}{}",
-            c.seq,
-            if c.label.is_empty() { "-" } else { c.label.as_str() },
-            c.identity.label(),
-            c.identity.id_bytes(),
-            if c.has_dump { " +dump" } else { "" },
-        );
-    }
-
     let mut display = bringup.make_display(&config).await;
     let fb_canvas = bringup.take_fb_canvas();
     let lcd_te = bringup.make_lcd_te();
@@ -2117,7 +2210,6 @@ pub async fn run<T: Bringup>(
         },
         safe_area: bringup.safe_area(),
         config,
-        card_library,
     });
 
     // Each task is spawned exactly once at boot; `.unwrap()` on the

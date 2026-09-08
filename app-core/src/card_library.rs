@@ -43,9 +43,155 @@ use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 use heapless::{String, Vec};
 
 use crate::data::TimeData;
-use crate::nfc::CardIdentity;
+use crate::nfc::{CardIdentity, SectorState};
 #[cfg(any(feature = "serde", test))]
 use crate::nfc::CardKind;
+
+// -- Classic sweep summary ---------------------------------------------------
+
+/// Most sectors on any Classic family (the 4K).
+pub const CLASSIC_SECTORS_MAX: usize = 40;
+
+/// Distinct keys a summary can table. The sweep's dictionary holds 13,
+/// so this cannot overflow today; index 15 is reserved as "not
+/// tabled" should it ever grow past this.
+pub const CLASSIC_KEYS_MAX: usize = 15;
+
+/// Sector byte value for "not swept" (the card left the field before
+/// the sweep reached it, or no dump has run).
+const SECTOR_NONE: u8 = 0;
+
+/// Key index meaning "the key is not in the table".
+const KEY_UNTABLED: u8 = 0xF;
+
+/// Per-sector outcome of a card's stored dump plus the keys that
+/// opened it - what the detail's sector grid and KEYS section render.
+/// Classic-only; empty on every other card and until a dump runs.
+///
+/// NOT part of [`CardMeta`]: only one card's summary is ever on
+/// screen, so `SystemData` holds a single [`CardSummary`] slot and the
+/// summary persists as its own small per-card flash file next to the
+/// dump. Thirty copies inside the by-value library once cost 4 KB of
+/// boot-time stack and hit the guard.
+///
+/// One byte per sector, index = sector number:
+///
+/// | bits | meaning |
+/// |---|---|
+/// | 0-3 | index into `keys` (`Read`/`Partial` only; 0xF = not tabled) |
+/// | 4 | key B opened it (else key A) |
+/// | 5-6 | 0 not swept, 1 read, 2 partial, 3 locked |
+/// | 7 | reserved |
+///
+/// Keys are stored per card, not as dictionary indices, so the record
+/// stays valid if the sweep's dictionary is ever reordered.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ClassicSummary {
+    /// One byte per sector (see the type docs). Length is the card's
+    /// sector count once a dump has begun, 0 otherwise.
+    pub sectors: Vec<u8, CLASSIC_SECTORS_MAX>,
+    /// Distinct keys that opened a sector, in order of first use.
+    pub keys: Vec<[u8; 6], CLASSIC_KEYS_MAX>,
+}
+
+/// The one summary held in RAM: which card it belongs to, and the
+/// summary itself. Filled live by the sweep for the card being dumped,
+/// or loaded from that card's summary file when its detail opens. A
+/// screen renders it only when `id` matches the card it is showing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CardSummary {
+    pub id: Vec<u8, 10>,
+    pub classic: ClassicSummary,
+}
+
+/// A decoded sector byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectorInfo {
+    pub state: SectorState,
+    /// The key that opened it and whether it was key A - `None` for a
+    /// locked sector or a key that could not be tabled.
+    pub key: Option<([u8; 6], bool)>,
+}
+
+impl ClassicSummary {
+    /// Start a dump: every one of `sectors_total` sectors becomes "not
+    /// swept" and the key table is emptied.
+    pub fn begin(&mut self, sectors_total: u8) {
+        self.sectors.clear();
+        self.keys.clear();
+        let n = (sectors_total as usize).min(CLASSIC_SECTORS_MAX);
+        let _ = self.sectors.resize(n, SECTOR_NONE);
+    }
+
+    /// Record one sector's outcome. A sector outside `begin`'s range is
+    /// ignored. `key`/`key_is_a` are only consulted for an opened
+    /// sector.
+    pub fn record(&mut self, sector: u8, state: SectorState, key: [u8; 6], key_is_a: bool) {
+        let Some(slot) = self.sectors.get_mut(sector as usize) else {
+            return;
+        };
+        let state_bits = match state {
+            SectorState::Read => 1,
+            SectorState::Partial => 2,
+            SectorState::Locked => 3,
+        };
+        let mut byte = state_bits << 5;
+        if state != SectorState::Locked {
+            let idx = match self.keys.iter().position(|k| *k == key) {
+                Some(i) => i as u8,
+                None => match self.keys.push(key) {
+                    Ok(()) => (self.keys.len() - 1) as u8,
+                    Err(_) => KEY_UNTABLED,
+                },
+            };
+            byte |= idx & 0x0F;
+            if !key_is_a {
+                byte |= 1 << 4;
+            }
+        }
+        *slot = byte;
+    }
+
+    /// Decode sector `i`: `None` when it is out of range or not swept.
+    pub fn sector(&self, i: usize) -> Option<SectorInfo> {
+        let byte = *self.sectors.get(i)?;
+        let state = match (byte >> 5) & 0x3 {
+            1 => SectorState::Read,
+            2 => SectorState::Partial,
+            3 => SectorState::Locked,
+            _ => return None,
+        };
+        let key = if state == SectorState::Locked {
+            None
+        } else {
+            let idx = byte & 0x0F;
+            self.keys.get(idx as usize).map(|k| (*k, byte & (1 << 4) == 0))
+        };
+        Some(SectorInfo { state, key })
+    }
+
+    /// How many sectors key `idx` (into `keys`) opened.
+    pub fn key_sector_count(&self, idx: usize) -> u8 {
+        if idx >= self.keys.len() {
+            return 0;
+        }
+        self.sectors
+            .iter()
+            .filter(|&&b| (b >> 5) & 0x3 != 0 && (b >> 5) & 0x3 != 3 && (b & 0x0F) as usize == idx)
+            .count() as u8
+    }
+
+    /// No dump has begun.
+    pub fn is_empty(&self) -> bool {
+        self.sectors.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.sectors.clear();
+        self.keys.clear();
+    }
+}
 
 /// Maximum cards kept in the library. A HARD cap: at capacity a newly
 /// scanned card is still shown, but not stored until the user removes
@@ -94,7 +240,10 @@ pub struct CardMeta {
 }
 
 /// Stable TLV field ids for [`CardMeta`]. NEVER reuse a retired id; a
-/// type change allocates a new id. NEXT_FIELD_ID: 9.
+/// type change allocates a new id. Keep the record small: it is held
+/// thirty times in `SystemData`, which moves by value at boot. Bulky
+/// per-card data (a dump, its sector summary) lives in its own file.
+/// NEXT_FIELD_ID: 9.
 #[cfg(feature = "serde")]
 mod meta_field {
     pub const IDENTITY: u16 = 1;
@@ -337,7 +486,7 @@ impl CardLibrary {
 
     /// Clear a card's stored dump: drop `has_dump` and zero the
     /// completeness counts. Returns `true` if a matching card was
-    /// updated. The dump file itself is deleted by the manager.
+    /// updated. The dump and summary files are deleted by the manager.
     pub fn clear_dump(&mut self, id: &[u8]) -> bool {
         match self.cards.iter_mut().find(|c| c.identity.id_bytes() == id) {
             Some(c) => {
@@ -540,6 +689,73 @@ mod tests {
         assert!(lib.set_label(&[0xA1], ""));
         assert!(lib.cards[0].label.is_empty());
         assert!(!lib.set_label(&[0xFF], "x"));
+    }
+
+    const KEY_FF: [u8; 6] = [0xFF; 6];
+    const KEY_MAD: [u8; 6] = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
+
+    #[test]
+    fn summary_packs_state_key_and_side_per_sector() {
+        let mut s = ClassicSummary::default();
+        assert!(s.is_empty());
+        s.begin(16);
+        assert_eq!(s.sectors.len(), 16);
+        // Untouched sectors read as "not swept".
+        assert_eq!(s.sector(3), None);
+        s.record(0, SectorState::Read, KEY_MAD, true);
+        s.record(1, SectorState::Read, KEY_FF, true);
+        s.record(2, SectorState::Partial, KEY_FF, false);
+        s.record(3, SectorState::Locked, [0; 6], true);
+        // Out-of-range sector is ignored, not a panic.
+        s.record(40, SectorState::Read, KEY_FF, true);
+        assert_eq!(&s.keys[..], &[KEY_MAD, KEY_FF]);
+        assert_eq!(
+            s.sector(0),
+            Some(SectorInfo { state: SectorState::Read, key: Some((KEY_MAD, true)) }),
+        );
+        assert_eq!(
+            s.sector(2),
+            Some(SectorInfo { state: SectorState::Partial, key: Some((KEY_FF, false)) }),
+        );
+        assert_eq!(s.sector(3), Some(SectorInfo { state: SectorState::Locked, key: None }));
+        assert_eq!(s.sector(16), None);
+        assert_eq!(s.key_sector_count(0), 1);
+        assert_eq!(s.key_sector_count(1), 2);
+        assert_eq!(s.key_sector_count(5), 0);
+        s.clear();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn summary_key_table_overflow_marks_untabled() {
+        let mut s = ClassicSummary::default();
+        s.begin(40);
+        for i in 0..(CLASSIC_KEYS_MAX as u8 + 1) {
+            s.record(i, SectorState::Read, [i; 6], true);
+        }
+        assert_eq!(s.keys.len(), CLASSIC_KEYS_MAX);
+        // The 16th key has no table slot: still Read, key unknown.
+        let last = s.sector(CLASSIC_KEYS_MAX).unwrap();
+        assert_eq!(last.state, SectorState::Read);
+        assert_eq!(last.key, None);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn summary_blob_round_trips_and_stays_small() {
+        // The summary is its own per-card flash file (postcard, via the
+        // generic blob envelope). Worst case: 40 sectors, every key
+        // slot used.
+        let mut s = ClassicSummary::default();
+        s.begin(40);
+        for i in 0..40u8 {
+            s.record(i, SectorState::Read, [i % CLASSIC_KEYS_MAX as u8; 6], i % 2 == 0);
+        }
+        let mut buf = [0u8; 256];
+        let encoded = postcard::to_slice(&s, &mut buf).expect("encode");
+        assert!(encoded.len() < 160, "summary {} B", encoded.len());
+        let decoded: ClassicSummary = postcard::from_bytes(encoded).expect("decode");
+        assert_eq!(decoded, s);
     }
 
     #[cfg(feature = "serde")]

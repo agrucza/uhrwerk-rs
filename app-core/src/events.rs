@@ -211,6 +211,19 @@ pub enum SystemEvent {
     /// without a card-lost/partial abort.
     NfcDumpComplete { blocks: u16, sectors: u8, ok: bool },
 
+    /// One sector's outcome during an armed Classic dump, emitted as
+    /// the sweep finishes each sector (up to 40 per dump, in order).
+    /// Per-sector rather than one summary on `NfcDumpComplete` so the
+    /// event stays small (see `WifiScanEntry`). The Model accumulates
+    /// them into the just-presented card's record. `key`/`key_is_a`
+    /// are meaningful for `Read`/`Partial` only.
+    NfcDumpSector {
+        sector: u8,
+        state: crate::nfc::SectorState,
+        key: [u8; 6],
+        key_is_a: bool,
+    },
+
     // -- WiFi --
     /// Progress of the current WiFi session (scan or sync), emitted
     /// by the WiFi task. Cached in `cached_data.wifi` for the
@@ -628,6 +641,16 @@ mod tests {
         ] {
             assert_eq!(classify_for_log(&SystemEvent::ChargerPhaseChanged { phase }), None);
         }
+    }
+
+    #[test]
+    fn event_enum_stays_small() {
+        // The bus channel holds 32 of these in static RAM, so every
+        // variant must stay per-item sized (see `WifiScanEntry`).
+        // Bulk payloads go through per-item events, never one fat one.
+        let size = core::mem::size_of::<SystemEvent>();
+        println!("size_of::<SystemEvent>() = {size}");
+        assert!(size <= 64, "SystemEvent grew to {size} bytes");
     }
 
     #[test]

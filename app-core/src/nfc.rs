@@ -155,6 +155,21 @@ impl CardKind {
     }
 }
 
+/// Outcome of one MIFARE Classic sector in a default-key sweep, as
+/// reported per sector (`SystemEvent::NfcDumpSector`) and kept per
+/// card in the library record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum SectorState {
+    /// A dictionary key opened it and every block was read.
+    Read,
+    /// A dictionary key opened it but at least one block read failed
+    /// (the card moved mid-sector).
+    Partial,
+    /// No dictionary key opened it.
+    Locked,
+}
+
 /// What every Type A card yields from anticollision, before any
 /// authentication.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -165,6 +165,15 @@ pub enum Effect {
     /// card's `has_dump`/counts and re-saves the record via `SaveCard`.
     RemoveDump { id: heapless::Vec<u8, 10> },
 
+    /// Persist the sector summary a dump just completed: the manager
+    /// writes `cached_data.nfc_summary` (whose id must match) to the
+    /// card's summary file next to its dump.
+    SaveDumpSummary { id: heapless::Vec<u8, 10> },
+
+    /// Load one card's summary file into `cached_data.nfc_summary`
+    /// (the detail just opened). No file = no dump = slot stays `None`.
+    LoadDumpSummary { id: heapless::Vec<u8, 10> },
+
     /// Apply a new display brightness immediately. Value is the
     /// hardware register range (0..=255) after Model maps the
     /// slider percent. Fired by `Action::SetBrightness` so the
@@ -584,6 +593,27 @@ impl Model {
     /// host-test-stable; the manager calls this right after `tick`
     /// each loop. The cycle rate vs uptime distinguishes "really
     /// sleeping" from "active_secs is wrong".
+    /// The manager loaded a card's sector summary file
+    /// (`Effect::LoadDumpSummary`): install it in the one RAM slot.
+    /// Called from the manager directly rather than via an event - a
+    /// summary is ~140 B, too fat for the 48-byte event enum, and the
+    /// manager owns the Model anyway.
+    pub fn set_nfc_summary(
+        &mut self,
+        id: heapless::Vec<u8, 10>,
+        classic: crate::card_library::ClassicSummary,
+    ) {
+        self.cached_data.nfc_summary = Some(crate::card_library::CardSummary { id, classic });
+        self.needs_redraw = true;
+    }
+
+    /// Empty the summary slot if it belongs to card `id`.
+    fn drop_summary_slot_if(&mut self, id: &[u8]) {
+        if self.cached_data.nfc_summary.as_ref().is_some_and(|s| s.id == id) {
+            self.cached_data.nfc_summary = None;
+        }
+    }
+
     pub fn set_sleep_telemetry(&mut self, sleep_cycles: u32) {
         self.cached_data.sleep_cycles = sleep_cycles;
     }
@@ -665,7 +695,25 @@ impl Model {
                         self.cached_data.card_library.upsert(c, now),
                         crate::card_library::Upsert::Full,
                     ) {
-                        let _ = out.push(Effect::SaveCard { id });
+                        let _ = out.push(Effect::SaveCard { id: id.clone() });
+                    }
+                    // Armed and a Classic: the sweep starts right after
+                    // this probe (the NFC task sends the identify first
+                    // so the click lands immediately). Point the one
+                    // summary slot at this card with every sector "not
+                    // swept", so the per-sector results that follow
+                    // fill a clean slate. Persisted on NfcDumpComplete.
+                    if self.cached_data.nfc_dump_armed {
+                        if let crate::nfc::CardIdentity::Iso14443a(a) = c {
+                            if a.kind.is_mifare_classic() {
+                                let mut slot = crate::card_library::CardSummary {
+                                    id: id.clone(),
+                                    classic: Default::default(),
+                                };
+                                slot.classic.begin(a.kind.classic_sectors());
+                                self.cached_data.nfc_summary = Some(slot);
+                            }
+                        }
                     }
                 } else {
                     // A present-but-unidentified tap: nothing to
@@ -691,17 +739,48 @@ impl Model {
                 // itself was streamed to flash by the NFC task during
                 // the sweep; this stores the completeness the detail
                 // shows.
-                if *ok {
-                    if let crate::nfc::NfcScan::Card(c) = &self.cached_data.last_nfc {
-                        let mut id: heapless::Vec<u8, 10> = heapless::Vec::new();
-                        let _ = id.extend_from_slice(c.id_bytes());
-                        if self.cached_data.card_library.set_dump(&id, *blocks, *sectors) {
-                            let _ = out.push(Effect::SaveCard { id });
+                // A failed dump (file write error or sweep abort) has
+                // already truncated any earlier dump file at create,
+                // so the record must not keep claiming one: clear it
+                // and drop the half-filled summary slot. A good dump
+                // records the counts and persists the slot's summary
+                // to the card's summary file.
+                if let crate::nfc::NfcScan::Card(c) = &self.cached_data.last_nfc {
+                    let mut id: heapless::Vec<u8, 10> = heapless::Vec::new();
+                    let _ = id.extend_from_slice(c.id_bytes());
+                    let slot_is_this = self
+                        .cached_data
+                        .nfc_summary
+                        .as_ref()
+                        .is_some_and(|s| s.id == id);
+                    let changed = if *ok {
+                        if slot_is_this {
+                            let _ = out.push(Effect::SaveDumpSummary { id: id.clone() });
                         }
+                        self.cached_data.card_library.set_dump(&id, *blocks, *sectors)
+                    } else {
+                        if slot_is_this {
+                            self.cached_data.nfc_summary = None;
+                        }
+                        self.cached_data.card_library.clear_dump(&id)
+                    };
+                    if changed {
+                        let _ = out.push(Effect::SaveCard { id });
                     }
                 }
                 self.needs_redraw = true;
                 let _ = out.push(Effect::MotorClick);
+            }
+            SystemEvent::NfcDumpSector { sector, state, key, key_is_a } => {
+                // One sector of the running sweep: fill the summary
+                // slot, which NfcProbe pointed at the card being dumped.
+                // The summary is persisted once on NfcDumpComplete.
+                // NO redraw here: a 100-400 ms render between sectors
+                // made the clone card drop out mid-sweep (2026-09-08);
+                // the screen catches up on NfcDumpComplete.
+                if let Some(slot) = self.cached_data.nfc_summary.as_mut() {
+                    slot.classic.record(*sector, *state, *key, *key_is_a);
+                }
             }
             SystemEvent::WifiStatusUpdated { state } => {
                 if self.cached_data.wifi != *state {
@@ -1286,16 +1365,40 @@ impl Model {
                 // view has already returned to the list) and delete its
                 // flash blob via the manager.
                 self.cached_data.card_library.remove(&id);
+                self.drop_summary_slot_if(&id);
                 let _ = out.push(Effect::RemoveCard { id });
                 self.needs_redraw = true;
             }
             Action::RemoveNfcDump { id } => {
                 // Clear the card's stored dump (keep the record), delete
-                // the dump file via the manager, and re-save the record
-                // so the cleared `has_dump` persists.
+                // the dump + summary files via the manager, and re-save
+                // the record so the cleared `has_dump` persists.
                 if self.cached_data.card_library.clear_dump(&id) {
+                    self.drop_summary_slot_if(&id);
                     let _ = out.push(Effect::RemoveDump { id: id.clone() });
                     let _ = out.push(Effect::SaveCard { id });
+                }
+                self.needs_redraw = true;
+            }
+            Action::OpenNfcCard { id } => {
+                // A slot filled for another card must not show here;
+                // one already holding this card (a dump just ran, or a
+                // re-open) is kept and the load is skipped.
+                let already = self
+                    .cached_data
+                    .nfc_summary
+                    .as_ref()
+                    .is_some_and(|s| s.id == id);
+                if !already {
+                    self.cached_data.nfc_summary = None;
+                    let has_dump = self
+                        .cached_data
+                        .card_library
+                        .get_by_id(&id)
+                        .is_some_and(|m| m.has_dump);
+                    if has_dump {
+                        let _ = out.push(Effect::LoadDumpSummary { id });
+                    }
                 }
                 self.needs_redraw = true;
             }
@@ -1836,6 +1939,19 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn footprint_report() {
+        // Not an assertion, a measurement: the Model (with its
+        // SystemData and the 30-card library) lives in the main
+        // task's static future storage on the T-Watch, where it
+        // competes with the main stack. Run with --nocapture.
+        use core::mem::size_of;
+        println!("size_of CardMeta      = {}", size_of::<crate::card_library::CardMeta>());
+        println!("size_of CardLibrary   = {}", size_of::<crate::card_library::CardLibrary>());
+        println!("size_of SystemData    = {}", size_of::<SystemData>());
+        println!("size_of Model         = {}", size_of::<Model>());
+    }
 
     fn fresh() -> Model {
         Model::new(

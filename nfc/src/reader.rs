@@ -18,7 +18,7 @@
 //! bytes - on the error path too - so a failed cascade says exactly
 //! which exchange failed and what the chip actually delivered.
 
-use app_core::nfc::{CardIdentity, CardKind, NfcScanError, TypeAInfo, Uid};
+use app_core::nfc::{CardIdentity, CardKind, NfcScanError, SectorState, TypeAInfo, Uid};
 use drivers::st25r3916::{regs, St25r3916};
 use embedded_hal::spi::SpiDevice;
 use embedded_hal_async::delay::DelayNs;
@@ -32,6 +32,13 @@ use crate::{iso14443a, mifare, type2};
 /// command end, so this is generous.
 const RX_POLL_TRIES: u32 = 6;
 const RX_POLL_GAP_MS: u32 = 2;
+
+/// Wake attempts per sector before the sweep declares the card gone,
+/// and the gap between them. Three tries span ~100 ms: long enough to
+/// step past a transient, short enough that a lifted card still ends
+/// the sweep promptly.
+const REACTIVATE_TRIES: u32 = 3;
+const REACTIVATE_RETRY_GAP_MS: u32 = 30;
 
 /// Reader over one chip seat. Borrows the SPI device and a delay for
 /// the reader's lifetime; the field must already be up.
@@ -62,6 +69,21 @@ pub struct SweepBlock {
     pub key_is_a: bool,
     /// The 16 plaintext bytes.
     pub data: [u8; 16],
+}
+
+/// What [`Reader::sweep_classic`] streams to its callback: every
+/// readable block as it is read, and each sector's outcome once the
+/// sweep is done with that sector (after its blocks, or immediately
+/// for a locked one).
+pub enum SweepEvent {
+    Block(SweepBlock),
+    Sector {
+        sector: u8,
+        state: SectorState,
+        /// The key that opened it (`Read`/`Partial`); zeros for `Locked`.
+        key: [u8; 6],
+        key_is_a: bool,
+    },
 }
 
 /// Tally returned by [`Reader::sweep_classic`].
@@ -571,11 +593,13 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
         Ok(())
     }
 
-    /// Stream every readable block of a MIFARE Classic to `on_block`,
-    /// one block at a time, accumulating nothing: the sweep holds only
-    /// the current [`SweepBlock`] and its cipher, so the RAM footprint
-    /// is flat for a 1K or a 4K. This is the fix for the old in-RAM
-    /// whole-card dump that started the footprint disaster.
+    /// Stream every readable block of a MIFARE Classic to `on_event`
+    /// as a [`SweepEvent::Block`], one block at a time, plus one
+    /// [`SweepEvent::Sector`] per sector once its outcome is known,
+    /// accumulating nothing: the sweep holds only the current
+    /// [`SweepBlock`] and its cipher, so the RAM footprint is flat for
+    /// a 1K or a 4K. This is the fix for the old in-RAM whole-card
+    /// dump that started the footprint disaster.
     ///
     /// Precondition: the card is SELECTED and ACTIVE (call straight
     /// after [`identify`](Self::identify)). The card is put into HALT
@@ -593,10 +617,10 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
         &mut self,
         kind: CardKind,
         uid32: u32,
-        mut on_block: F,
+        mut on_event: F,
     ) -> Result<SweepStats, NfcScanError>
     where
-        F: FnMut(SweepBlock) -> Fut,
+        F: FnMut(SweepEvent) -> Fut,
         Fut: core::future::Future<Output = ()>,
     {
         let sectors = mifare::sector_count(kind);
@@ -616,14 +640,33 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
             let mut opened: Option<(Crypto1, [u8; 6], bool)> = None;
             'keys: for &key_is_a in &[true, false] {
                 for &key in mifare::DEFAULT_KEYS {
-                    // A wake/re-select failure here means the card left
-                    // the field (the small coil decouples easily on a
-                    // long sweep). That is not a sweep failure - keep
+                    // A wake/re-select failure here usually means the
+                    // card left the field (the small coil decouples
+                    // easily on a long sweep) - but a single unanswered
+                    // WUPA is also what a transient looks like (the
+                    // blank 1K dropped at sector 1 while resting still,
+                    // 2026-09-08). Retry a few times with a short gap
+                    // and log which attempt won: a removed card fails
+                    // them all. Only then is the sweep over - keep
                     // whatever was already read and return it.
-                    if self.reactivate().await.is_err() {
+                    let mut woke = false;
+                    for attempt in 0..REACTIVATE_TRIES {
+                        if self.reactivate().await.is_ok() {
+                            if attempt > 0 {
+                                log::warn!(
+                                    "nfc-dbg: sweep sector {} reactivate ok on retry {}",
+                                    sector, attempt,
+                                );
+                            }
+                            woke = true;
+                            break;
+                        }
+                        self.delay.delay_ms(REACTIVATE_RETRY_GAP_MS).await;
+                    }
+                    if !woke {
                         log::warn!(
-                            "nfc-dbg: sweep card lost at sector {} - partial dump, {} blocks read",
-                            sector, stats.blocks_read,
+                            "nfc-dbg: sweep card lost at sector {} ({} wake attempts) - partial dump, {} blocks read",
+                            sector, REACTIVATE_TRIES, stats.blocks_read,
                         );
                         return Ok(stats);
                     }
@@ -637,19 +680,21 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
             match opened {
                 Some((mut cipher, key, key_is_a)) => {
                     stats.sectors_unlocked += 1;
+                    let mut read_here: u8 = 0;
                     for b in 0..nblk {
                         let block = first + b;
                         match self.mifare_read_block(&mut cipher, block).await {
                             Ok(data) => {
                                 stats.blocks_read += 1;
-                                on_block(SweepBlock {
+                                read_here += 1;
+                                on_event(SweepEvent::Block(SweepBlock {
                                     sector,
                                     block,
                                     is_trailer: b + 1 == nblk,
                                     key,
                                     key_is_a,
                                     data,
-                                })
+                                }))
                                 .await;
                             }
                             Err(e) => log::warn!(
@@ -663,8 +708,23 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
                     if let Err(e) = self.mifare_halt(&mut cipher).await {
                         log::warn!("nfc-dbg: sweep sector {} halt failed: {:?}", sector, e);
                     }
+                    let state = if read_here == nblk {
+                        SectorState::Read
+                    } else {
+                        SectorState::Partial
+                    };
+                    on_event(SweepEvent::Sector { sector, state, key, key_is_a }).await;
                 }
-                None => log::warn!("nfc-dbg: sweep sector {} locked (no default key)", sector),
+                None => {
+                    log::warn!("nfc-dbg: sweep sector {} locked (no default key)", sector);
+                    on_event(SweepEvent::Sector {
+                        sector,
+                        state: SectorState::Locked,
+                        key: [0; 6],
+                        key_is_a: true,
+                    })
+                    .await;
+                }
             }
         }
         Ok(stats)

@@ -456,7 +456,37 @@ async fn rf_probe(
                                     // borrow &mut across calls.
                                     let dump_failed = core::cell::Cell::new(!created);
                                     let dump_failed_ref = &dump_failed;
-                                    let on_block = move |b: nfc::reader::SweepBlock| async move {
+                                    // Per-sector outcomes are COLLECTED here and
+                                    // sent to the UI only after the sweep
+                                    // returns. Sending them between sectors
+                                    // (a foreign await inside the RF sequence)
+                                    // made the re-keyed clone drop out at the
+                                    // next WUPA (2026-09-08); the sweep's timing
+                                    // must stay exactly the verified one. 40 =
+                                    // the 4K's sector count.
+                                    type SectorOutcome = (u8, app_core::nfc::SectorState, [u8; 6], bool);
+                                    let outcomes: core::cell::RefCell<([SectorOutcome; 40], usize)> =
+                                        core::cell::RefCell::new((
+                                            [(0u8, app_core::nfc::SectorState::Locked, [0u8; 6], true); 40],
+                                            0,
+                                        ));
+                                    let outcomes_ref = &outcomes;
+                                    let on_block = move |ev: nfc::reader::SweepEvent| async move {
+                                        // Nothing to write to the dump file for a
+                                        // sector outcome - a locked sector is
+                                        // simply absent there.
+                                        let b = match ev {
+                                            nfc::reader::SweepEvent::Sector { sector, state, key, key_is_a } => {
+                                                let mut o = outcomes_ref.borrow_mut();
+                                                let n = o.1;
+                                                if n < o.0.len() {
+                                                    o.0[n] = (sector, state, key, key_is_a);
+                                                    o.1 = n + 1;
+                                                }
+                                                return;
+                                            }
+                                            nfc::reader::SweepEvent::Block(b) => b,
+                                        };
                                         log::info!(
                                             "NFC: sweep S{:02} B{:03}{} key{} {:02X?} | {:02X?}",
                                             b.sector,
@@ -527,6 +557,21 @@ async fn rf_probe(
                                             // disarms and the user can retry.
                                             dump = Some((0, 0, false));
                                         }
+                                    }
+                                    // RF is done with the card: now hand the
+                                    // collected sector outcomes to the UI, one
+                                    // small event each, in sweep order. They
+                                    // land before the NfcDumpComplete the
+                                    // caller sends, so the model's summary slot
+                                    // is complete when it persists it.
+                                    let (list, n) = {
+                                        let o = outcomes.borrow();
+                                        (o.0, o.1)
+                                    };
+                                    for &(sector, state, key, key_is_a) in &list[..n] {
+                                        EVENTS
+                                            .send(SystemEvent::NfcDumpSector { sector, state, key, key_is_a })
+                                            .await;
                                     }
                                     // The sweep leaves the card HALTED (encrypted
                                     // halt of the last sector, or a failed auth) -
