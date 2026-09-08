@@ -222,6 +222,11 @@ pub struct Model {
     /// Cleared by any user activity; expiry in `tick` re-enters
     /// sleep.
     motion_wake_grace: Option<Instant>,
+    /// A Classic dump sweep is running (armed probe seen, no
+    /// `NfcDumpComplete` yet). Holds off idle dim and idle sleep: a 4K
+    /// sweep outlasts the idle timers, and the result should land on a
+    /// lit screen. Cleared on complete or disarm.
+    nfc_dump_running: bool,
     /// Last step-counter running total seen from the IMU. The first
     /// observation after boot is the baseline (no steps credited);
     /// afterwards each increase is added to `steps_today`. A total
@@ -318,6 +323,7 @@ impl Model {
             mic_test: MicTestMode::Off,
             mic_resume_on_wake: None,
             motion_wake_grace: None,
+            nfc_dump_running: false,
             last_step_total: None,
             last_track_kick: None,
             track_failures: 0,
@@ -329,8 +335,13 @@ impl Model {
 
     /// Current render-needed flag. Set internally by event
     /// handlers that mutate visible state.
+    /// Whether the manager should render now. Never during a Classic
+    /// dump: the card lies ON the panel, so pixels drawn then are
+    /// hidden under it, the panel radiates straight into the card's
+    /// coil, and the render competes with the sweep for the one core.
+    /// The flag stays set and the screen catches up on completion.
     pub fn needs_redraw(&self) -> bool {
-        self.needs_redraw
+        self.needs_redraw && !self.nfc_dump_running
     }
 
     /// Reset the redraw flag. Called by the manager after a
@@ -377,6 +388,20 @@ impl Model {
     /// caller to apply to hardware.
     pub fn handle_event(&mut self, event: &SystemEvent, now: Instant) -> Effects {
         let mut out: Effects = Vec::new();
+
+        // 0. Mid-dump the card rests on the touch panel and generates
+        // touches of its own. They are not the user: drop them so they
+        // neither scroll the detail nor count as activity.
+        if self.nfc_dump_running
+            && matches!(
+                event,
+                SystemEvent::Tap { .. }
+                    | SystemEvent::TouchPressed { .. }
+                    | SystemEvent::TouchReleased
+            )
+        {
+            return out;
+        }
 
         // 1. Snapshot events: update the cached fields.
         self.apply_snapshot(event, &mut out);
@@ -712,6 +737,9 @@ impl Model {
                                 };
                                 slot.classic.begin(a.kind.classic_sectors());
                                 self.cached_data.nfc_summary = Some(slot);
+                                // Hold the display and sleep off until
+                                // NfcDumpComplete.
+                                self.nfc_dump_running = true;
                             }
                         }
                     }
@@ -731,8 +759,12 @@ impl Model {
                 let _ = out.push(Effect::MotorClick);
             }
             SystemEvent::NfcDumpComplete { blocks, sectors, ok } => {
-                // The armed dump finished. Disarm and click.
+                // The armed dump finished. Disarm, release the idle
+                // hold, and click. handle_event already bumped
+                // last_activity for this event, so the idle timers
+                // restart from now.
                 self.cached_data.nfc_dump_armed = false;
+                self.nfc_dump_running = false;
                 // On a good dump, record it on the just-dumped card (the
                 // last one presented): set `has_dump` and store the
                 // blocks/sectors captured, then persist. The dump file
@@ -1875,8 +1907,12 @@ impl Model {
             }
             return;
         }
+        // A running dump keeps the panel lit: the sweep can outlast
+        // the dim timer, and its result lands on the open detail.
         let idle = now.duration_since(self.last_activity);
-        let target = if idle >= Duration::from_secs(self.config.display.dim_timeout_s) {
+        let target = if idle >= Duration::from_secs(self.config.display.dim_timeout_s)
+            && !self.nfc_dump_running
+        {
             DisplayState::Dim
         } else {
             DisplayState::Active
@@ -1905,6 +1941,12 @@ impl Model {
         // the device awake indefinitely; an alert auto-timeout is the
         // eventual fix for that.
         if self.buzz.is_some() {
+            return;
+        }
+        // Never idle-sleep mid-dump either: a 4K sweep runs for tens
+        // of seconds, and the result belongs on a lit screen, not on
+        // a watch that went to sleep halfway (seen 2026-09-08).
+        if self.nfc_dump_running {
             return;
         }
         let idle = now.duration_since(self.last_activity);
@@ -2528,6 +2570,44 @@ mod tests {
         let mut out: Effects = Vec::new();
         m.dispatch_action(Action::DismissAlarm, &mut out);
         let _ = m.tick(Instant::from_millis((off_timeout as u64 + 20) * 1000), 0);
+        assert!(m.sleeping);
+    }
+
+    #[test]
+    fn running_dump_holds_off_idle_dim_and_sleep() {
+        use crate::nfc::{CardIdentity, CardKind, TypeAInfo, Uid};
+        let mut m = fresh();
+        let mut out: Effects = Vec::new();
+        m.dispatch_action(Action::ArmNfcDump, &mut out);
+        let mut uid: Uid = Uid::new();
+        uid.extend_from_slice(&[0x98, 0xD4, 0xDB, 0x3D]).unwrap();
+        let card = CardIdentity::Iso14443a(TypeAInfo {
+            uid, atqa: [0x04, 0x00], sak: 0x08, kind: CardKind::MifareClassic1K,
+        });
+        // Armed probe of a Classic = the sweep is starting.
+        let _ = m.handle_event(&SystemEvent::NfcProbe { card: Some(card) }, Instant::from_millis(0));
+        assert!(m.nfc_dump_running);
+        // No rendering while the card covers the panel, and the
+        // card's own touches are dropped.
+        assert!(!m.needs_redraw());
+        let fx = m.handle_event(&SystemEvent::TouchPressed { x: 10, y: 10 }, Instant::from_millis(5));
+        assert!(fx.is_empty());
+        // Far past both idle thresholds: still lit, still awake.
+        let off_timeout = m.config.display.off_timeout_s;
+        let fx = m.tick(Instant::from_millis((off_timeout as u64 + 10) * 1000), 0);
+        assert!(!m.sleeping);
+        assert_eq!(m.display_state, DisplayState::Active);
+        assert!(!fx.contains(&Effect::BroadcastSleep(SleepState::Sleeping)));
+        // Completion releases the hold and restarts the idle clock.
+        let done_at = Instant::from_millis((off_timeout as u64 + 10) * 1000);
+        let _ = m.handle_event(
+            &SystemEvent::NfcDumpComplete { blocks: 64, sectors: 16, ok: true },
+            done_at,
+        );
+        assert!(!m.nfc_dump_running);
+        // The held-back redraw fires now that the card is gone.
+        assert!(m.needs_redraw());
+        let _ = m.tick(done_at + Duration::from_secs(off_timeout as u64 + 1), 0);
         assert!(m.sleeping);
     }
 

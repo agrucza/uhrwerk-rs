@@ -445,7 +445,9 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
         let (mut at_b, mut at_p) = ([0u8; 4], [0u8; 4]);
         let n = iso14443a::unpack_parity_stream(&rxs, rx_bits, &mut at_b, &mut at_p);
         if n < 4 {
-            log::warn!("nfc-dbg: auth2 short aT n={} ({} bits)", n, rx_bits);
+            // A 4-bit reply is the card's NAK: wrong key. One line per
+            // dictionary key on a re-keyed sector; per-attempt detail.
+            log::debug!("nfc-dbg: auth2 short aT n={} ({} bits)", n, rx_bits);
             return Err(NfcScanError::SelectFailed);
         }
         let mut cipher = frame.cipher;

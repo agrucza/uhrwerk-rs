@@ -14,10 +14,15 @@
 //!   one), and last seen + dump state. Empty until the first scan
 //!   ("NO CARDS YET"); a scan that could not be identified shows the
 //!   transient "CARD NOT RECOGNIZED" while the library is still empty.
-//! * **Detail** - a chamfered `CARD` panel with the name, family,
-//!   the UID as spaced hex, and the Type A ATQA/SAK, the record's
-//!   timestamps and dump status, and the bottom tiles: LABEL, the
-//!   DUMP control for a MIFARE Classic, and REMOVE.
+//! * **Detail** - a scrollable column: the chamfered `CARD` panel
+//!   (name, family, UID, Type A ATQA/SAK), the last-seen line, and
+//!   for a MIFARE Classic the SECTORS grid and the KEYS list, both
+//!   rendered from the one summary slot in `SystemData` when it
+//!   belongs to this card. Grid cells are colour-coded by state and
+//!   tappable; a status line under the grid names the tapped sector
+//!   and its key. Fixed bottom tiles: LABEL, DUMP / REMOVE DUMP, and
+//!   REMOVE. Other technologies show the panel and last seen only
+//!   until their reads exist.
 //! * **EditLabel** - the on-screen keyboard in text mode, seeded with
 //!   the current custom label. DONE stores the text (empty clears it,
 //!   back to the family name); CANCEL or the header back discards.
@@ -28,14 +33,16 @@
 use core::fmt::Write;
 use embedded_graphics::{
     geometry::{Point, Size},
-    primitives::Rectangle,
+    prelude::Primitive,
+    primitives::{PrimitiveStyle, Rectangle},
+    Drawable,
 };
 use heapless::{String, Vec};
 
-use crate::card_library::{CardMeta, LABEL_MAX};
-use crate::data::TimeData;
+use crate::card_library::{CardMeta, SectorInfo, LABEL_MAX};
+use crate::data::{SafeArea, TimeData};
 use crate::events::SystemEvent;
-use crate::nfc::CardIdentity;
+use crate::nfc::{CardIdentity, SectorState};
 use crate::ui::layout::{rect_hit, ScrollState};
 use crate::ui::theme::Color;
 use crate::ui::types::BlendTarget;
@@ -63,9 +70,24 @@ const HIGHLIGHT_ALPHA: u8 = 48;
 /// readout so content lines up across screens.
 const SIDE_MARGIN: i32 = layout::VSTACK_SIDE_MARGIN;
 
-/// Card panel height - room for the family line, technology, the
-/// `UID` label + hex row, and the Type A ATQA/SAK line.
-const PANEL_H: i32 = 210;
+/// Card panel height - room for the name, the family/technology
+/// caption, the UID line, and the Type A ATQA/SAK line (tag 29 +
+/// 42 + 30 + 28 + 10 of caption ink + 11 bottom pad).
+const PANEL_H: i32 = 150;
+
+/// Sector grid: square cells in lines of 16 (a 1K is one line, a 4K
+/// is 16 + 16 + 8). 16 cells at a 22 px pitch span 346 px, inside the
+/// 354 px panel width.
+const GRID_CELL: i32 = 16;
+const GRID_PITCH: i32 = 22;
+const GRID_PER_LINE: usize = 16;
+
+/// Pitch of the KEYS lines (body font).
+const KEY_LINE_H: i32 = 24;
+
+/// Space below the last line of the detail column. Small: a 1K with
+/// one key must end inside the viewport so it never scrolls.
+const COLUMN_END_PAD: i32 = 4;
 
 /// A card's identity id bytes (UID / PUPI / IDm), owned - the detail
 /// view's stable handle on its selected card, resolved against the
@@ -95,6 +117,11 @@ pub struct NfcScreen {
     /// The label editor, seeded with the card's current label on
     /// every open.
     keyboard: Keyboard,
+    /// Vertical scroll of the detail body (panel, grid, keys).
+    detail_scroll: ScrollState,
+    /// The sector cell the user tapped in the detail grid; the status
+    /// line under the grid names it. Reset when a card opens.
+    selected_sector: Option<u8>,
 }
 
 impl NfcScreen {
@@ -104,6 +131,8 @@ impl NfcScreen {
             scroll: ScrollState::new(),
             confirm_remove: false,
             keyboard: Keyboard::plain_text(LABEL_MAX, "CARD LABEL"),
+            detail_scroll: ScrollState::new(),
+            selected_sector: None,
         }
     }
 
@@ -207,6 +236,8 @@ impl NfcScreen {
                         let _ = id.extend_from_slice(meta.identity.id_bytes());
                         self.view = NfcView::Detail(id.clone());
                         self.confirm_remove = false;
+                        self.detail_scroll = ScrollState::new();
+                        self.selected_sector = None;
                         data.nfc_highlight = None;
                         // The Model loads this card's sector summary
                         // (if it has a dump) into the RAM slot.
@@ -235,87 +266,144 @@ impl NfcScreen {
     fn render_detail<D: BlendTarget>(
         &self, display: &mut D, data: &SystemData, meta: &CardMeta, ctx: &RenderCtx,
     ) {
-        let _ = ctx;
         let card = &meta.identity;
-        let content_top = app_content_top(&data.safe_area);
+        let lay = detail_layout(meta, &data.safe_area, key_lines(data, card.id_bytes()));
+        let viewport = detail_viewport(&data.safe_area);
+        // The summary slot, only when it is this card's.
+        let summary = data
+            .nfc_summary
+            .as_ref()
+            .filter(|s| s.id.as_slice() == card.id_bytes())
+            .map(|s| &s.classic);
+        let selected = self.selected_sector;
 
-        // -- Card panel --------------------------------------------------
-        let panel = Rectangle::new(
-            Point::new(SIDE_MARGIN, content_top + 8),
-            Size::new(
-                (theme::SCREEN_W as i32 - SIDE_MARGIN * 2) as u32,
-                PANEL_H as u32,
-            ),
-        );
-        chamfered_panel(display, panel, NOTCH, ACCENT, 1);
-        tag_label(display, panel.top_left.x, panel.top_left.y, "CARD", ACCENT, NOTCH);
+        // -- Scrollable body -------------------------------------------
+        // Everything above the bottom tiles scrolls as one column, so
+        // a 4K's three grid lines and a long key list fit on any card.
+        render_scrolled(
+            display, self.detail_scroll.offset(), viewport, lay.content_h, ACCENT, ctx,
+            |clip, scroll| {
+                let sy = |y: i32| y - scroll;
 
-        let x = panel.top_left.x + 16;
-        let mut y = panel.top_left.y + TAG_LABEL_H + 14;
-
-        // Headline: the custom label when set, else the family (e.g.
-        // "MIFARE Classic 1K"). The caption beneath then carries what
-        // the headline displaced: the family under a custom label, the
-        // RF technology under a family headline.
-        fonts::draw_at(display, &fonts::headline(), card_name(meta), x, y, theme::FG);
-        y += 42;
-        let sub = if meta.label.is_empty() { card.technology().label() } else { card.label() };
-        fonts::draw_at(display, &fonts::caption(), sub, x, y, theme::FG_MUTED);
-        y += 30;
-
-        // UID row: accent label then the spaced hex.
-        fonts::draw_at(display, &fonts::label(), "UID", x, y, ACCENT);
-        y += 22;
-        let hex = id_hex(card.id_bytes());
-        fonts::draw_at(display, &fonts::body(), hex.as_str(), x, y, theme::FG);
-        y += 34;
-
-        // Type A carries ATQA + SAK; other technologies have no
-        // equivalent single-line fingerprint yet.
-        if let CardIdentity::Iso14443a(a) = card {
-            let mut extra: String<40> = String::new();
-            let _ = write!(
-                extra,
-                "ATQA {:02X} {:02X}   SAK {:02X}",
-                a.atqa[0], a.atqa[1], a.sak,
-            );
-            fonts::draw_at(display, &fonts::caption(), extra.as_str(), x, y, theme::FG_MUTED);
-        }
-
-        // -- Record metadata (below the panel) ---------------------------
-        // The stored record's provenance: when this card was first saved
-        // and last seen, and - for a dumpable card - whether a dump is
-        // held and how complete it is ("N/total blk  N/total sec"). The
-        // totals come from the card kind, so no dump file is loaded to
-        // render this.
-        let mx = panel.top_left.x + 4;
-        let mut my = panel.top_left.y + PANEL_H + 22;
-        let mut line: String<40> = String::new();
-        let _ = write!(line, "FIRST SEEN  {}", fmt_stamp(&meta.first_seen));
-        fonts::draw_at(display, &fonts::caption(), line.as_str(), mx, my, theme::FG_MUTED);
-        my += 28;
-        line.clear();
-        let _ = write!(line, "LAST SEEN   {}", fmt_stamp(&meta.last_seen));
-        fonts::draw_at(display, &fonts::caption(), line.as_str(), mx, my, theme::FG_MUTED);
-        my += 28;
-        if is_dumpable(card) {
-            if meta.has_dump {
-                let (bt, st) = match card {
-                    CardIdentity::Iso14443a(a) => {
-                        (a.kind.classic_blocks(), a.kind.classic_sectors())
-                    }
-                    _ => (0, 0),
-                };
-                line.clear();
-                let _ = write!(
-                    line, "DUMP STORED  {}/{} blk  {}/{} sec",
-                    meta.dump_blocks_read, bt, meta.dump_sectors_read, st,
+                // -- Card panel: name, family, UID, ATQA/SAK --------
+                let panel = Rectangle::new(
+                    Point::new(SIDE_MARGIN, sy(lay.panel_top)),
+                    Size::new(
+                        (theme::SCREEN_W as i32 - SIDE_MARGIN * 2) as u32,
+                        PANEL_H as u32,
+                    ),
                 );
-                fonts::draw_at(display, &fonts::caption(), line.as_str(), mx, my, theme::OK);
-            } else {
-                fonts::draw_at(display, &fonts::caption(), "NO DUMP", mx, my, theme::FG_MUTED);
-            }
-        }
+                chamfered_panel(clip, panel, NOTCH, ACCENT, 1);
+                tag_label(clip, panel.top_left.x, panel.top_left.y, "CARD", ACCENT, NOTCH);
+                let x = panel.top_left.x + 16;
+                let mut y = panel.top_left.y + TAG_LABEL_H + 14;
+                // Headline: the custom label when set, else the family.
+                // The caption beneath carries what the headline
+                // displaced: the family under a custom label, the RF
+                // technology under a family headline.
+                fonts::draw_at(clip, &fonts::headline(), card_name(meta), x, y, theme::FG);
+                y += 42;
+                let sub = if meta.label.is_empty() {
+                    card.technology().label()
+                } else {
+                    card.label()
+                };
+                fonts::draw_at(clip, &fonts::caption(), sub, x, y, theme::FG_MUTED);
+                y += 30;
+                let mut line: String<48> = String::new();
+                let _ = write!(line, "UID  {}", id_hex(card.id_bytes()));
+                fonts::draw_at(clip, &fonts::body(), line.as_str(), x, y, theme::FG);
+                y += 28;
+                // Type A carries ATQA + SAK; other technologies have
+                // no equivalent single-line fingerprint yet.
+                if let CardIdentity::Iso14443a(a) = card {
+                    line.clear();
+                    let _ = write!(
+                        line, "ATQA {:02X} {:02X}   SAK {:02X}", a.atqa[0], a.atqa[1], a.sak,
+                    );
+                    fonts::draw_at(clip, &fonts::caption(), line.as_str(), x, y, theme::FG_MUTED);
+                }
+
+                // -- Last seen ----------------------------------------
+                line.clear();
+                let _ = write!(line, "LAST SEEN  {}", fmt_stamp(&meta.last_seen));
+                fonts::draw_at(
+                    clip, &fonts::caption(), line.as_str(),
+                    SIDE_MARGIN + 4, sy(lay.seen_y), theme::FG_MUTED,
+                );
+
+                // -- Classic: SECTORS grid + KEYS ---------------------
+                let Some(sectors_total) = lay.sectors_total else {
+                    return;
+                };
+                let gx = SIDE_MARGIN;
+                tag_label(clip, gx, sy(lay.sectors_tag_y), "SECTORS", ACCENT, NOTCH);
+                // Completeness beside the tag: blocks read / total,
+                // from the record (no summary needed).
+                if meta.has_dump {
+                    let total = match card {
+                        CardIdentity::Iso14443a(a) => a.kind.classic_blocks(),
+                        _ => 0,
+                    };
+                    line.clear();
+                    let _ = write!(line, "{}/{} blk", meta.dump_blocks_read, total);
+                    fonts::draw_right(
+                        clip, &fonts::caption(), line.as_str(),
+                        theme::SCREEN_W as i32 - SIDE_MARGIN, sy(lay.sectors_tag_y) + 2,
+                        theme::FG_MUTED,
+                    );
+                }
+                for i in 0..sectors_total as usize {
+                    let cell = grid_cell_rect(i, lay.grid_top, scroll);
+                    let info = summary.and_then(|s| s.sector(i));
+                    draw_sector_cell(clip, cell, info, selected == Some(i as u8));
+                }
+                // Status line: the tapped sector, or the hint.
+                line.clear();
+                let status_color = match selected {
+                    Some(s) => {
+                        sector_status_line(&mut line, s, summary.and_then(|m| m.sector(s as usize)));
+                        theme::FG
+                    }
+                    None => {
+                        let _ = if summary.is_some() {
+                            write!(line, "TAP A SECTOR")
+                        } else if meta.has_dump {
+                            write!(line, "LOADING")
+                        } else {
+                            write!(line, "NO DUMP")
+                        };
+                        theme::FG_MUTED
+                    }
+                };
+                fonts::draw_at(
+                    clip, &fonts::caption(), line.as_str(), gx + 4, sy(lay.status_y), status_color,
+                );
+
+                tag_label(clip, gx, sy(lay.keys_tag_y), "KEYS", ACCENT, NOTCH);
+                match summary {
+                    Some(s) if !s.keys.is_empty() => {
+                        for (k, key) in s.keys.iter().enumerate() {
+                            line.clear();
+                            for b in key {
+                                let _ = write!(line, "{:02X}", b);
+                            }
+                            let _ = write!(line, "  x{}", s.key_sector_count(k));
+                            fonts::draw_at(
+                                clip, &fonts::body(), line.as_str(),
+                                gx + 4, sy(lay.keys_top) + k as i32 * KEY_LINE_H, theme::FG,
+                            );
+                        }
+                    }
+                    _ => {
+                        let text = if meta.has_dump && summary.is_some() { "NONE" } else { "-" };
+                        fonts::draw_at(
+                            clip, &fonts::body(), text, gx + 4, sy(lay.keys_top), theme::FG_MUTED,
+                        );
+                    }
+                }
+            },
+        );
 
         // -- Controls (bottom): LABEL, DUMP, REMOVE ----------------------
         // Three fixed tiles. Left is LABEL (ghost, cyan): opens the
@@ -362,8 +450,42 @@ impl NfcScreen {
                 self.view = NfcView::List;
                 Action::Redraw
             }
+            // Drag scrolls the body. The bottom tiles sit outside the
+            // viewport, so a drag never starts on them.
+            SystemEvent::TouchPressed { .. } | SystemEvent::TouchReleased => {
+                let (viewport_h, content_h) = match data.card_library.get_by_id(&id) {
+                    Some(m) => (
+                        detail_viewport(&data.safe_area).size.height as i32,
+                        detail_layout(m, &data.safe_area, key_lines(data, &id)).content_h,
+                    ),
+                    None => return Action::None,
+                };
+                if handle_scroll_drag(&mut self.detail_scroll, event, viewport_h, content_h) {
+                    Action::Redraw
+                } else {
+                    Action::None
+                }
+            }
             SystemEvent::Tap { x, y } => {
                 let [label_tile, dump_tile, remove_tile] = layout::bottom_tile_row::<3>();
+                // A sector cell: select it (the status line names it).
+                // Same rect source as the render, shifted by the scroll.
+                if let Some(m) = data.card_library.get_by_id(&id) {
+                    let lay = detail_layout(m, &data.safe_area, key_lines(data, &id));
+                    let pt = Point::new(*x as i32, *y as i32);
+                    if let Some(total) = lay.sectors_total {
+                        if detail_viewport(&data.safe_area).contains(pt) {
+                            let scroll = self.detail_scroll.offset();
+                            for i in 0..total as usize {
+                                if grid_cell_rect(i, lay.grid_top, scroll).contains(pt) {
+                                    self.confirm_remove = false;
+                                    self.selected_sector = Some(i as u8);
+                                    return Action::Redraw;
+                                }
+                            }
+                        }
+                    }
+                }
                 // REMOVE (always present): first tap arms the confirm,
                 // second tap on it deletes and returns to the list.
                 if rect_hit(remove_tile, *x, *y) {
@@ -464,6 +586,8 @@ impl Screen for NfcScreen {
         self.view = NfcView::List;
         self.scroll = ScrollState::new();
         self.confirm_remove = false;
+        self.detail_scroll = ScrollState::new();
+        self.selected_sector = None;
     }
 
     fn render<D: BlendTarget>(&self, display: &mut D, data: &SystemData, ctx: &RenderCtx) {
@@ -565,6 +689,239 @@ fn fmt_stamp(t: &TimeData) -> String<24> {
 /// Whether a card supports the dump sweep (MIFARE Classic families).
 fn is_dumpable(card: &CardIdentity) -> bool {
     matches!(card, CardIdentity::Iso14443a(a) if a.kind.is_mifare_classic())
+}
+
+// -- Detail layout (one source for render AND hit-test) ----------------------
+
+/// Y positions of the detail column, in unscrolled screen coordinates
+/// (subtract the scroll offset to draw). `sectors_total` is `None` for
+/// a non-Classic card, whose column ends after the last-seen line.
+struct DetailLayout {
+    panel_top: i32,
+    seen_y: i32,
+    sectors_total: Option<u8>,
+    sectors_tag_y: i32,
+    grid_top: i32,
+    status_y: i32,
+    keys_tag_y: i32,
+    keys_top: i32,
+    /// Total column height, for the scroll range.
+    content_h: i32,
+}
+
+/// How many KEYS lines the column shows for this card: one per key in
+/// the summary slot when it belongs to the card, else one (the "-" /
+/// "NONE" placeholder).
+fn key_lines(data: &SystemData, id: &[u8]) -> usize {
+    data.nfc_summary
+        .as_ref()
+        .filter(|s| s.id.as_slice() == id)
+        .map(|s| s.classic.keys.len())
+        .unwrap_or(0)
+        .max(1)
+}
+
+/// `key_lines` is the number of KEYS rows to reserve (see
+/// [`key_lines`]); the column ends right after them.
+fn detail_layout(meta: &CardMeta, safe: &SafeArea, key_lines: usize) -> DetailLayout {
+    let top = app_content_top(safe);
+    let panel_top = top + 8;
+    let seen_y = panel_top + PANEL_H + 14;
+    let sectors_total = match &meta.identity {
+        CardIdentity::Iso14443a(a) if a.kind.is_mifare_classic() => {
+            Some(a.kind.classic_sectors())
+        }
+        _ => None,
+    };
+    let Some(total) = sectors_total else {
+        return DetailLayout {
+            panel_top,
+            seen_y,
+            sectors_total: None,
+            sectors_tag_y: 0,
+            grid_top: 0,
+            status_y: 0,
+            keys_tag_y: 0,
+            keys_top: 0,
+            content_h: seen_y + 14 + COLUMN_END_PAD - top,
+        };
+    };
+    let sectors_tag_y = seen_y + 26;
+    let grid_top = sectors_tag_y + TAG_LABEL_H + 10;
+    let lines = (total as usize).div_ceil(GRID_PER_LINE) as i32;
+    let status_y = grid_top + lines * GRID_PITCH + 4;
+    let keys_tag_y = status_y + 26;
+    let keys_top = keys_tag_y + TAG_LABEL_H + 10;
+    let keys_h = key_lines.max(1) as i32 * KEY_LINE_H;
+    DetailLayout {
+        panel_top,
+        seen_y,
+        sectors_total,
+        sectors_tag_y,
+        grid_top,
+        status_y,
+        keys_tag_y,
+        keys_top,
+        content_h: keys_top + keys_h + COLUMN_END_PAD - top,
+    }
+}
+
+/// The detail body's scroll viewport: content top down to just above
+/// the bottom tiles.
+fn detail_viewport(safe: &SafeArea) -> Rectangle {
+    let top = app_content_top(safe);
+    Rectangle::new(
+        Point::new(0, top),
+        Size::new(theme::SCREEN_W as u32, (layout::BOTTOM_TILE_Y - 8 - top).max(0) as u32),
+    )
+}
+
+/// Rect of sector cell `i`, shifted by the scroll offset.
+fn grid_cell_rect(i: usize, grid_top: i32, scroll: i32) -> Rectangle {
+    let col = (i % GRID_PER_LINE) as i32;
+    let row = (i / GRID_PER_LINE) as i32;
+    Rectangle::new(
+        Point::new(SIDE_MARGIN + col * GRID_PITCH, grid_top + row * GRID_PITCH - scroll),
+        Size::new(GRID_CELL as u32, GRID_CELL as u32),
+    )
+}
+
+/// One grid cell. Fill = opened (green, "B" when key B opened it;
+/// amber when a block read failed), red outline = locked, dim outline
+/// = not swept or no summary. The selected cell gets an accent ring.
+fn draw_sector_cell<D: BlendTarget>(
+    d: &mut D, cell: Rectangle, info: Option<SectorInfo>, selected: bool,
+) {
+    let x = cell.top_left.x;
+    let y = cell.top_left.y;
+    let w = cell.size.width as i32;
+    let h = cell.size.height as i32;
+    match info {
+        Some(SectorInfo { state: SectorState::Read, key }) => {
+            d.fill_blend(x, y, w, h, theme::OK, 255);
+            if matches!(key, Some((_, false))) {
+                fonts::draw_centered_in_rect(d, &fonts::caption(), "B", cell, theme::BG);
+            }
+        }
+        Some(SectorInfo { state: SectorState::Partial, .. }) => {
+            d.fill_blend(x, y, w, h, theme::WARN, 255);
+        }
+        Some(SectorInfo { state: SectorState::Locked, .. }) => {
+            cell.into_styled(PrimitiveStyle::with_stroke(theme::DANGER, 1)).draw(d).ok();
+        }
+        None => {
+            cell.into_styled(PrimitiveStyle::with_stroke(theme::FG_DIM, 1)).draw(d).ok();
+        }
+    }
+    if selected {
+        Rectangle::new(
+            Point::new(x - 2, y - 2),
+            Size::new((w + 4) as u32, (h + 4) as u32),
+        )
+        .into_styled(PrimitiveStyle::with_stroke(ACCENT, 2))
+        .draw(d)
+        .ok();
+    }
+}
+
+/// The status line for a tapped sector: "S07  READ  A FFFFFFFFFFFF",
+/// "S03  LOCKED", "S05  PARTIAL  B A0A1A2A3A4A5", "S09  NOT SWEPT".
+fn sector_status_line(out: &mut String<48>, sector: u8, info: Option<SectorInfo>) {
+    let _ = write!(out, "S{:02}  ", sector);
+    let Some(info) = info else {
+        let _ = write!(out, "NOT SWEPT");
+        return;
+    };
+    let _ = match info.state {
+        SectorState::Read => write!(out, "READ"),
+        SectorState::Partial => write!(out, "PARTIAL"),
+        SectorState::Locked => write!(out, "LOCKED"),
+    };
+    if let Some((key, is_a)) = info.key {
+        let _ = write!(out, "  {} ", if is_a { "A" } else { "B" });
+        for b in &key {
+            let _ = write!(out, "{:02X}", b);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nfc::{CardKind, TypeAInfo, Uid};
+
+    fn meta(kind: CardKind) -> CardMeta {
+        let mut uid: Uid = Uid::new();
+        uid.extend_from_slice(&[0x98, 0xD4, 0xDB, 0x3D]).unwrap();
+        CardMeta {
+            identity: CardIdentity::Iso14443a(TypeAInfo {
+                uid, atqa: [0x04, 0x00], sak: 0x08, kind,
+            }),
+            label: String::new(),
+            first_seen: TimeData::default(),
+            last_seen: TimeData::default(),
+            has_dump: true,
+            dump_blocks_read: 64,
+            dump_sectors_read: 16,
+            seq: 1,
+        }
+    }
+
+    #[test]
+    fn grid_fits_the_panel_width_for_every_classic() {
+        let safe = SafeArea::default();
+        for kind in [CardKind::MifareClassicMini, CardKind::MifareClassic1K, CardKind::MifareClassic4K] {
+            let lay = detail_layout(&meta(kind), &safe, 1);
+            let total = lay.sectors_total.unwrap() as usize;
+            for i in 0..total {
+                let r = grid_cell_rect(i, lay.grid_top, 0);
+                let right = r.top_left.x + r.size.width as i32;
+                assert!(right <= theme::SCREEN_W as i32 - SIDE_MARGIN, "{kind:?} cell {i}");
+            }
+            // The 4K needs three lines; the 1K one.
+            let lines = (lay.status_y - 4 - lay.grid_top) / GRID_PITCH;
+            assert_eq!(lines as usize, total.div_ceil(GRID_PER_LINE));
+        }
+    }
+
+    #[test]
+    fn column_ends_after_the_last_key() {
+        let safe = SafeArea::default();
+        let viewport_h = detail_viewport(&safe).size.height as i32;
+        // A 1K with one key fits without scrolling, and the column
+        // ends right after that key line (no reserved empty space).
+        let one_k = detail_layout(&meta(CardKind::MifareClassic1K), &safe, 1);
+        assert!(one_k.content_h <= viewport_h);
+        assert_eq!(
+            one_k.content_h,
+            one_k.keys_top + KEY_LINE_H + COLUMN_END_PAD - app_content_top(&safe),
+        );
+        // More keys, longer column, one line each.
+        let three = detail_layout(&meta(CardKind::MifareClassic1K), &safe, 3);
+        assert_eq!(three.content_h - one_k.content_h, 2 * KEY_LINE_H);
+        // A 4K with many keys scrolls.
+        let four_k = detail_layout(&meta(CardKind::MifareClassic4K), &safe, 6);
+        assert!(four_k.content_h > viewport_h);
+        // Non-Classic: no grid, short column.
+        let desfire = detail_layout(&meta(CardKind::MifareDesfire), &safe, 1);
+        assert!(desfire.sectors_total.is_none());
+        assert!(desfire.content_h < viewport_h);
+    }
+
+    #[test]
+    fn status_line_formats() {
+        let mut s: String<48> = String::new();
+        sector_status_line(&mut s, 7, Some(SectorInfo {
+            state: SectorState::Read, key: Some(([0xFF; 6], true)),
+        }));
+        assert_eq!(s.as_str(), "S07  READ  A FFFFFFFFFFFF");
+        s.clear();
+        sector_status_line(&mut s, 3, Some(SectorInfo { state: SectorState::Locked, key: None }));
+        assert_eq!(s.as_str(), "S03  LOCKED");
+        s.clear();
+        sector_status_line(&mut s, 9, None);
+        assert_eq!(s.as_str(), "S09  NOT SWEPT");
+    }
 }
 
 /// Scroll viewport for the list: from the content top down to the home
