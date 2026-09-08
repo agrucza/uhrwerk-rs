@@ -286,6 +286,15 @@ pub enum Action {
     /// manager deletes the card's `.dump` file; the record is re-saved.
     RemoveNfcDump { id: heapless::Vec<u8, 10> },
 
+    /// Set (or, with an empty string, clear) one card's custom label
+    /// (the detail's LABEL editor DONE). The Model writes it into the
+    /// in-RAM `card_library` and re-saves the record via
+    /// `Effect::SaveCard`.
+    SetNfcLabel {
+        id: heapless::Vec<u8, 10>,
+        label: heapless::String<{ crate::card_library::LABEL_MAX }>,
+    },
+
     /// Set the clock from whichever time source this board has (the
     /// settings CLOCK view's TIME SYNC button). The Model picks ONE
     /// source per tap and does not chain: WiFi when the board has the

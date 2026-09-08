@@ -1,20 +1,26 @@
 //! NFC screen - the on-watch card library.
 //!
 //! Internal state machine, like Settings: one [`NfcScreen`] holds an
-//! [`NfcView`] that is either the scrollable card [`List`](NfcView::List)
-//! or the [`Detail`](NfcView::Detail) of one selected card. Tapping a
-//! list row opens that card's detail; the header back chevron returns
-//! to the list, and backing out of the list pops the nav stack.
+//! [`NfcView`] that is the scrollable card [`List`](NfcView::List), the
+//! [`Detail`](NfcView::Detail) of one selected card, or that card's
+//! [`EditLabel`](NfcView::EditLabel) keyboard. Tapping a list row opens
+//! that card's detail; the header back chevron steps back one view,
+//! and backing out of the list pops the nav stack.
 //!
 //! * **List** - a scrollable stack of the cards a scan has saved
-//!   ([`SystemData::card_library`]), newest first, each row an icon +
-//!   label + chevron. Empty until the first scan ("NO CARDS YET"); a
-//!   scan that could not be identified shows the transient "CARD NOT
-//!   RECOGNIZED" while the library is still empty.
-//! * **Detail** - a chamfered `CARD` panel with the family/technology
-//!   label, the UID as spaced hex, and the Type A ATQA/SAK, plus the
-//!   DUMP control for a MIFARE Classic. This is the view a card opens
-//!   into; the dump-arm flow is unchanged, now reached per card.
+//!   ([`SystemData::card_library`]), newest first. Every row is three
+//!   lines: the card's name (its custom label, else its family), the
+//!   family + id bytes (just the id when the family is already line
+//!   one), and last seen + dump state. Empty until the first scan
+//!   ("NO CARDS YET"); a scan that could not be identified shows the
+//!   transient "CARD NOT RECOGNIZED" while the library is still empty.
+//! * **Detail** - a chamfered `CARD` panel with the name, family,
+//!   the UID as spaced hex, and the Type A ATQA/SAK, the record's
+//!   timestamps and dump status, and the bottom tiles: LABEL, the
+//!   DUMP control for a MIFARE Classic, and REMOVE.
+//! * **EditLabel** - the on-screen keyboard in text mode, seeded with
+//!   the current custom label. DONE stores the text (empty clears it,
+//!   back to the family name); CANCEL or the header back discards.
 //!
 //! Accent: info-cyan - reads as "data / comms", distinct from the
 //! other apps at a glance.
@@ -26,7 +32,7 @@ use embedded_graphics::{
 };
 use heapless::{String, Vec};
 
-use crate::card_library::CardMeta;
+use crate::card_library::{CardMeta, LABEL_MAX};
 use crate::data::TimeData;
 use crate::events::SystemEvent;
 use crate::nfc::CardIdentity;
@@ -37,8 +43,9 @@ use crate::ui::types::{Action, RenderCtx, Screen, SystemData};
 use crate::ui::{fonts, glyphs, layout, theme};
 use crate::ui::widgets::{
     app_chrome_back_hit, app_content_top, chamfered_button, chamfered_panel, draw_app_chrome,
-    handle_scroll_drag, render_scrolled, row, tag_label, viewport_to_home_bar, ButtonVariant,
-    RowControl, NOTCH, ROW_H, SCROLLBAR_GUTTER, TAG_LABEL_H,
+    handle_scroll_drag, render_scrolled, row_lines, row_lines_h, tag_label,
+    viewport_to_home_bar, ButtonVariant, Keyboard, KeyboardResult, RowControl, NOTCH,
+    SCROLLBAR_GUTTER, TAG_LABEL_H,
 };
 
 /// Per-screen accent. NFC reads as "data / contactless comms".
@@ -71,6 +78,9 @@ enum NfcView {
     List,
     /// One selected card, addressed by its id bytes.
     Detail(CardId),
+    /// The label keyboard for one card; DONE/CANCEL return to its
+    /// detail.
+    EditLabel(CardId),
 }
 
 pub struct NfcScreen {
@@ -82,6 +92,9 @@ pub struct NfcScreen {
     /// Reset when leaving the detail or opening a different card so a
     /// pending confirm never carries across cards.
     confirm_remove: bool,
+    /// The label editor, seeded with the card's current label on
+    /// every open.
+    keyboard: Keyboard,
 }
 
 impl NfcScreen {
@@ -90,6 +103,7 @@ impl NfcScreen {
             view: NfcView::List,
             scroll: ScrollState::new(),
             confirm_remove: false,
+            keyboard: Keyboard::plain_text(LABEL_MAX, "CARD LABEL"),
         }
     }
 
@@ -126,7 +140,7 @@ impl NfcScreen {
         }
 
         let viewport = list_viewport(&data.safe_area);
-        let content_h = lib.cards.len() as i32 * ROW_H;
+        let content_h = lib.cards.len() as i32 * card_row_h();
         render_scrolled(
             display, self.scroll.offset(), viewport, content_h, ACCENT, ctx,
             |clip, scroll| {
@@ -152,11 +166,14 @@ impl NfcScreen {
                         clip.fill_blend(x, y, 3, h, ACCENT, 255);
                     }
                     let accent = if hit { ACCENT_HOT } else { ACCENT };
-                    row(
+                    let id_line = row_id_line(meta);
+                    let seen_line = row_seen_line(meta);
+                    row_lines(
                         clip, rect,
                         |d, cx, cy, c| glyphs::chip(d, cx, cy, 8, c),
                         accent,
-                        meta.label.as_str(),
+                        card_name(meta),
+                        &[id_line.as_str(), seen_line.as_str()],
                         RowControl::Chevron(accent),
                     );
                 }
@@ -198,7 +215,7 @@ impl NfcScreen {
             }
             SystemEvent::TouchPressed { .. } | SystemEvent::TouchReleased => {
                 let viewport_h = list_viewport(&data.safe_area).size.height as i32;
-                let content_h = data.card_library.cards.len() as i32 * ROW_H;
+                let content_h = data.card_library.cards.len() as i32 * card_row_h();
                 if handle_scroll_drag(&mut self.scroll, event, viewport_h, content_h) {
                     // Engaging the list dismisses the just-scanned mark.
                     data.nfc_highlight = None;
@@ -234,19 +251,14 @@ impl NfcScreen {
         let x = panel.top_left.x + 16;
         let mut y = panel.top_left.y + TAG_LABEL_H + 14;
 
-        // Family / technology headline (e.g. "MIFARE Classic 1K").
-        fonts::draw_at(display, &fonts::headline(), card.label(), x, y, theme::FG);
+        // Headline: the custom label when set, else the family (e.g.
+        // "MIFARE Classic 1K"). The caption beneath then carries what
+        // the headline displaced: the family under a custom label, the
+        // RF technology under a family headline.
+        fonts::draw_at(display, &fonts::headline(), card_name(meta), x, y, theme::FG);
         y += 42;
-
-        // RF technology family beneath it.
-        fonts::draw_at(
-            display,
-            &fonts::caption(),
-            card.technology().label(),
-            x,
-            y,
-            theme::FG_MUTED,
-        );
+        let sub = if meta.label.is_empty() { card.technology().label() } else { card.label() };
+        fonts::draw_at(display, &fonts::caption(), sub, x, y, theme::FG_MUTED);
         y += 30;
 
         // UID row: accent label then the spaced hex.
@@ -303,14 +315,17 @@ impl NfcScreen {
             }
         }
 
-        // -- Controls (bottom): DUMP left, REMOVE right ------------------
-        // Two fixed tiles. Left is the dump control for a dumpable card:
-        // "DUMP" (cyan) with no dump yet, toggling to "REMOVE DUMP"
-        // (amber) once one is stored, and the "present card" prompt
-        // while armed. Right is REMOVE for the whole card, signal-red
-        // (theme::DANGER) so it reads as destructive and distinct from
-        // both, with a two-tap confirm (label flips to "CONFIRM?").
-        let [dump_tile, remove_tile] = layout::bottom_tile_row::<2>();
+        // -- Controls (bottom): LABEL, DUMP, REMOVE ----------------------
+        // Three fixed tiles. Left is LABEL (ghost, cyan): opens the
+        // label keyboard. Middle is the dump control for a dumpable
+        // card: "DUMP" (cyan) with no dump yet, toggling to "REMOVE
+        // DUMP" (amber) once one is stored, and the "present card"
+        // prompt while armed. Right is REMOVE for the whole card,
+        // signal-red (theme::DANGER) so it reads as destructive and
+        // distinct from both, with a two-tap confirm (label flips to
+        // "CONFIRM?").
+        let [label_tile, dump_tile, remove_tile] = layout::bottom_tile_row::<3>();
+        chamfered_button(display, label_tile, "LABEL", ButtonVariant::Ghost, ACCENT);
         let dump_cx = dump_tile.top_left.x + dump_tile.size.width as i32 / 2;
         let dump_cy = dump_tile.top_left.y + dump_tile.size.height as i32 / 2 - 8;
         if data.nfc_dump_armed {
@@ -335,7 +350,7 @@ impl NfcScreen {
         // The selected card's id; resolve its identity from the library.
         let id: CardId = match &self.view {
             NfcView::Detail(id) => id.clone(),
-            NfcView::List => return Action::None,
+            NfcView::List | NfcView::EditLabel(_) => return Action::None,
         };
         match event {
             // Header back chevron: return to the list, dropping any
@@ -346,7 +361,7 @@ impl NfcScreen {
                 Action::Redraw
             }
             SystemEvent::Tap { x, y } => {
-                let [dump_tile, remove_tile] = layout::bottom_tile_row::<2>();
+                let [label_tile, dump_tile, remove_tile] = layout::bottom_tile_row::<3>();
                 // REMOVE (always present): first tap arms the confirm,
                 // second tap on it deletes and returns to the list.
                 if rect_hit(remove_tile, *x, *y) {
@@ -359,9 +374,20 @@ impl NfcScreen {
                     return Action::Redraw;
                 }
                 // Any other tap cancels a pending confirm before it is
-                // evaluated for the DUMP button.
+                // evaluated for the LABEL / DUMP buttons.
                 let was_confirming = self.confirm_remove;
                 self.confirm_remove = false;
+                // LABEL: open the keyboard on the card's current label.
+                if rect_hit(label_tile, *x, *y) {
+                    let current = data
+                        .card_library
+                        .get_by_id(&id)
+                        .map(|m| m.label.as_str())
+                        .unwrap_or("");
+                    self.keyboard.seed(current);
+                    self.view = NfcView::EditLabel(id);
+                    return Action::Redraw;
+                }
                 // DUMP tile: for a dumpable card that isn't armed, arm a
                 // dump when none is stored, or remove the stored dump
                 // when one is (the tile shows REMOVE DUMP then).
@@ -387,6 +413,45 @@ impl NfcScreen {
             _ => Action::None,
         }
     }
+
+    // -- Edit-label view -----------------------------------------------------
+
+    fn render_edit_label<D: BlendTarget>(&self, display: &mut D) {
+        // The keyboard owns the whole content band below the app
+        // chrome (its field starts under the header).
+        self.keyboard.render(display);
+    }
+
+    fn edit_label_event(&mut self, event: &SystemEvent, data: &mut SystemData) -> Action {
+        let id: CardId = match &self.view {
+            NfcView::EditLabel(id) => id.clone(),
+            _ => return Action::None,
+        };
+        // Header back = cancel: nothing stored.
+        if let SystemEvent::Tap { x, y } = event {
+            if app_chrome_back_hit(*x, *y, &data.safe_area) {
+                self.view = NfcView::Detail(id);
+                return Action::Redraw;
+            }
+        }
+        match self.keyboard.handle_event(event) {
+            KeyboardResult::Changed => Action::Redraw,
+            KeyboardResult::Done => {
+                // Empty text clears the label (the family name shows
+                // again). Over-long text cannot happen: the keyboard is
+                // capped at LABEL_MAX.
+                let mut label: String<LABEL_MAX> = String::new();
+                let _ = label.push_str(self.keyboard.text());
+                self.view = NfcView::Detail(id.clone());
+                Action::SetNfcLabel { id, label }
+            }
+            KeyboardResult::Cancelled => {
+                self.view = NfcView::Detail(id);
+                Action::Redraw
+            }
+            KeyboardResult::None => Action::None,
+        }
+    }
 }
 
 impl Screen for NfcScreen {
@@ -402,8 +467,9 @@ impl Screen for NfcScreen {
     fn render<D: BlendTarget>(&self, display: &mut D, data: &SystemData, ctx: &RenderCtx) {
         // Header telemetry reflects the active view: "NFC.LIST" on the
         // list, "NFC.<n>" on a card detail where n is the card's 1-based
-        // position in the list (newest = 0001). A detail whose card has
-        // vanished falls back to the list, so its label does too.
+        // position in the list (newest = 0001), "NFC.LABEL" in the label
+        // editor. A detail or editor whose card has vanished falls back
+        // to the list, so its label does too.
         let mut telem: String<12> = String::new();
         match &self.view {
             NfcView::Detail(id) => {
@@ -416,19 +482,32 @@ impl Screen for NfcScreen {
                     }
                 }
             }
-            NfcView::List => {
+            NfcView::EditLabel(id) if data.card_library.get_by_id(id).is_some() => {
+                let _ = write!(telem, "NFC.LABEL");
+            }
+            NfcView::EditLabel(_) | NfcView::List => {
                 let _ = write!(telem, "NFC.LIST");
             }
         }
         draw_app_chrome(display, data, "NFC", telem.as_str(), ACCENT, ctx);
 
-        // Detail only when its card still exists; otherwise fall back to
-        // the list (a removed or never-found card can't be shown).
-        if let NfcView::Detail(id) = &self.view {
-            if let Some(meta) = data.card_library.get_by_id(id) {
-                self.render_detail(display, data, meta, ctx);
-                return;
+        // Detail / editor only when their card still exists; otherwise
+        // fall back to the list (a removed or never-found card can't be
+        // shown).
+        match &self.view {
+            NfcView::Detail(id) => {
+                if let Some(meta) = data.card_library.get_by_id(id) {
+                    self.render_detail(display, data, meta, ctx);
+                    return;
+                }
             }
+            NfcView::EditLabel(id) => {
+                if data.card_library.get_by_id(id).is_some() {
+                    self.render_edit_label(display);
+                    return;
+                }
+            }
+            NfcView::List => {}
         }
         self.render_list(display, data, ctx);
     }
@@ -437,20 +516,21 @@ impl Screen for NfcScreen {
         if let SystemEvent::PowerButtonLong = event {
             return Action::Shutdown;
         }
-        // Route to the active view. A detail whose card has vanished
-        // reverts to the list first.
-        let detail_live = matches!(
-            &self.view,
-            NfcView::Detail(id) if data.card_library.get_by_id(id).is_some()
-        );
-        if detail_live {
-            self.detail_event(event, data)
-        } else {
-            if matches!(self.view, NfcView::Detail(_)) {
+        // Route to the active view. A detail or editor whose card has
+        // vanished reverts to the list first.
+        match &self.view {
+            NfcView::Detail(id) if data.card_library.get_by_id(id).is_some() => {
+                self.detail_event(event, data)
+            }
+            NfcView::EditLabel(id) if data.card_library.get_by_id(id).is_some() => {
+                self.edit_label_event(event, data)
+            }
+            NfcView::Detail(_) | NfcView::EditLabel(_) => {
                 self.view = NfcView::List;
                 self.confirm_remove = false;
+                self.list_event(event, data)
             }
-            self.list_event(event, data)
+            NfcView::List => self.list_event(event, data),
         }
     }
 }
@@ -491,12 +571,58 @@ fn list_viewport(safe: &crate::data::SafeArea) -> Rectangle {
     viewport_to_home_bar(app_content_top(safe), safe)
 }
 
+/// Height of one card row: a primary line plus two caption lines.
+fn card_row_h() -> i32 {
+    row_lines_h(2)
+}
+
 /// Rect for the Nth list row, shifted by the scroll offset. Width
 /// leaves a scrollbar gutter on the right, like the settings rows.
 fn list_row_rect(index: usize, scroll: i32, safe: &crate::data::SafeArea) -> Rectangle {
-    let y = app_content_top(safe) + index as i32 * ROW_H - scroll;
+    let h = card_row_h();
+    let y = app_content_top(safe) + index as i32 * h - scroll;
     Rectangle::new(
         Point::new(0, y),
-        Size::new((theme::SCREEN_W as i32 - SCROLLBAR_GUTTER) as u32, ROW_H as u32),
+        Size::new((theme::SCREEN_W as i32 - SCROLLBAR_GUTTER) as u32, h as u32),
     )
+}
+
+/// The card's display name: its custom label, else its family
+/// ("MIFARE Classic 1K"). Row line one and the detail headline.
+fn card_name(meta: &CardMeta) -> &str {
+    if meta.label.is_empty() {
+        meta.identity.label()
+    } else {
+        meta.label.as_str()
+    }
+}
+
+/// Row line two: the id bytes in brackets, prefixed by the short
+/// family when a custom label occupies line one ("Classic 1K [98 D4
+/// DB 3D]"); just "[98 D4 DB 3D]" when the family is already the
+/// name. Longest case: 12-char family + a 10-byte id = 44 chars.
+fn row_id_line(meta: &CardMeta) -> String<48> {
+    let mut s: String<48> = String::new();
+    if !meta.label.is_empty() {
+        let _ = write!(s, "{} ", meta.identity.short_label());
+    }
+    let _ = write!(s, "[{}]", id_hex(meta.identity.id_bytes()));
+    s
+}
+
+/// Row line three: last seen, then the dump state for a dumpable card
+/// ("DUMP 64/64" blocks captured / total, or "NO DUMP").
+fn row_seen_line(meta: &CardMeta) -> String<40> {
+    let mut s: String<40> = String::new();
+    let _ = write!(s, "{}", fmt_stamp(&meta.last_seen));
+    if let CardIdentity::Iso14443a(a) = &meta.identity {
+        if a.kind.is_mifare_classic() {
+            if meta.has_dump {
+                let _ = write!(s, "  DUMP {}/{}", meta.dump_blocks_read, a.kind.classic_blocks());
+            } else {
+                let _ = write!(s, "  NO DUMP");
+            }
+        }
+    }
+    s
 }

@@ -2014,7 +2014,7 @@ pub async fn run<T: Bringup>(
         log::info!(
             "nfc library:   #{} {} [{}] {:02X?}{}",
             c.seq,
-            c.label.as_str(),
+            if c.label.is_empty() { "-" } else { c.label.as_str() },
             c.identity.label(),
             c.identity.id_bytes(),
             if c.has_dump { " +dump" } else { "" },

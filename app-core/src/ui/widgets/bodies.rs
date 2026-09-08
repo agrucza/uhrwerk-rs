@@ -60,10 +60,7 @@ where
     F: FnOnce(&mut D, i32, i32, Color),
 {
     let x = rect.top_left.x;
-    let y = rect.top_left.y;
-    let w = rect.size.width as i32;
-    let h = rect.size.height as i32;
-    let cy = y + h / 2;
+    let cy = rect.top_left.y + rect.size.height as i32 / 2;
 
     let icon_cx = x + ROW_PAD + 8;
     icon(display, icon_cx, cy, icon_color);
@@ -79,6 +76,16 @@ where
         theme::FG,
     );
 
+    row_control(display, rect, control);
+    row_hairline(display, rect);
+}
+
+/// The right-side control of a row, right-aligned to
+/// `rect.right - ROW_PAD` and centered on the row's midline.
+fn row_control<D: BlendTarget>(display: &mut D, rect: Rectangle, control: RowControl) {
+    let x = rect.top_left.x;
+    let w = rect.size.width as i32;
+    let cy = rect.top_left.y + rect.size.height as i32 / 2;
     match control {
         RowControl::Chevron(color) => {
             let right_x = x + w - ROW_PAD;
@@ -110,10 +117,81 @@ where
             );
         }
     }
+}
 
-    Line::new(
-        Point::new(x, y + h - 1),
-        Point::new(x + w - 1, y + h - 1),
-    ).into_styled(PrimitiveStyle::with_stroke(theme::BORDER, 1))
-    .draw(display).ok();
+/// 1 px steel hairline along the full width of a row's bottom.
+fn row_hairline<D: BlendTarget>(display: &mut D, rect: Rectangle) {
+    let x = rect.top_left.x;
+    let w = rect.size.width as i32;
+    let bottom = rect.top_left.y + rect.size.height as i32 - 1;
+    Line::new(Point::new(x, bottom), Point::new(x + w - 1, bottom))
+        .into_styled(PrimitiveStyle::with_stroke(theme::BORDER, 1))
+        .draw(display)
+        .ok();
+}
+
+// -- row_lines ---------------------------------------------------------------
+
+/// Vertical padding above the first and below the last text line of a
+/// `row_lines` row.
+const ROW_LINES_PAD: i32 = 10;
+
+/// Gap between consecutive text lines of a `row_lines` row.
+const ROW_LINE_GAP: i32 = 8;
+
+/// Height of a `row_lines` row with `captions` caption lines under
+/// the primary line. Two captions (the NFC card row) give 70 px.
+/// Use it for both the layout pitch and the rect passed to
+/// [`row_lines`], so draw and hit-test agree.
+pub fn row_lines_h(captions: usize) -> i32 {
+    2 * ROW_LINES_PAD
+        + fonts::body().ascent()
+        + captions as i32 * (ROW_LINE_GAP + fonts::caption().ascent())
+}
+
+/// A `row` whose label is a primary line followed by up to a few
+/// caption lines - for lists whose entries need a description under
+/// the name (a card's family + id + last seen). Same icon column,
+/// right control, and bottom hairline as [`row`]; the text block is
+/// vertically centered in `rect`, so pass a rect of
+/// [`row_lines_h`]`(captions.len())`.
+///
+/// `primary` is drawn in the body font in `FG`; each caption in the
+/// caption font, `FG_MUTED`. An empty caption still takes its line
+/// (keeps rows of one list the same height).
+pub fn row_lines<D, F>(
+    display: &mut D,
+    rect: Rectangle,
+    icon: F,
+    icon_color: Color,
+    primary: &str,
+    captions: &[&str],
+    control: RowControl,
+)
+where
+    D: BlendTarget,
+    F: FnOnce(&mut D, i32, i32, Color),
+{
+    let x = rect.top_left.x;
+    let cy = rect.top_left.y + rect.size.height as i32 / 2;
+
+    let icon_cx = x + ROW_PAD + 8;
+    icon(display, icon_cx, cy, icon_color);
+
+    let body = fonts::body();
+    let caption = fonts::caption();
+    let block_h = body.ascent()
+        + captions.len() as i32 * (ROW_LINE_GAP + caption.ascent());
+    let text_x = x + ROW_PAD + ROW_ICON_COL_W;
+    let mut ty = cy - block_h / 2;
+    fonts::draw_at(display, &body, primary, text_x, ty, theme::FG);
+    ty += body.ascent();
+    for line in captions {
+        ty += ROW_LINE_GAP;
+        fonts::draw_at(display, &caption, line, text_x, ty, theme::FG_MUTED);
+        ty += caption.ascent();
+    }
+
+    row_control(display, rect, control);
+    row_hairline(display, rect);
 }

@@ -28,7 +28,7 @@ pub mod picker;
 pub mod scrollable;
 pub mod wheel;
 
-pub use bodies::{row, RowControl, ROW_H};
+pub use bodies::{row, row_lines, row_lines_h, RowControl, ROW_H};
 pub use chrome::{
     app_chrome_back_hit, app_content_top, app_header_rect, app_header_top,
     app_home_bar_y, corner_safe_header_rect, draw_app_chrome, draw_overlay_chrome,

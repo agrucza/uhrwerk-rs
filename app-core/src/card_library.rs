@@ -43,7 +43,9 @@ use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 use heapless::{String, Vec};
 
 use crate::data::TimeData;
-use crate::nfc::{CardIdentity, CardKind};
+use crate::nfc::CardIdentity;
+#[cfg(any(feature = "serde", test))]
+use crate::nfc::CardKind;
 
 /// Maximum cards kept in the library. A HARD cap: at capacity a newly
 /// scanned card is still shown, but not stored until the user removes
@@ -51,8 +53,7 @@ use crate::nfc::{CardIdentity, CardKind};
 /// megabytes); this bounds the in-RAM list and keeps it scrollable.
 pub const MAX_CARDS: usize = 30;
 
-/// Maximum characters in a card label (auto-generated for now;
-/// on-watch renaming is a later step).
+/// Maximum characters in a card's custom label (typed on the watch).
 pub const LABEL_MAX: usize = 24;
 
 /// One stored card: its identity plus library metadata.
@@ -68,7 +69,9 @@ pub struct CardMeta {
     /// The identity an NFC scan assembled (UID/ATQA/SAK, or the other
     /// technologies' fingerprints). Rendered on the detail screen.
     pub identity: CardIdentity,
-    /// Display name. Auto-generated from kind + short id today.
+    /// Custom name typed on the watch; empty when none has been set,
+    /// in which case the UI shows the identity's family label instead.
+    /// Never auto-filled: a fresh scan stores it empty.
     pub label: String<LABEL_MAX>,
     /// Wall-clock time this card was first added to the library.
     pub first_seen: TimeData,
@@ -119,7 +122,10 @@ impl CardMeta {
         use meta_field::*;
         let mut at = 0usize;
         crate::tlv::put(buf, &mut at, IDENTITY, &self.identity)?;
-        crate::tlv::put(buf, &mut at, LABEL, &self.label)?;
+        // An unset label is simply absent; decode defaults it empty.
+        if !self.label.is_empty() {
+            crate::tlv::put(buf, &mut at, LABEL, &self.label)?;
+        }
         crate::tlv::put(buf, &mut at, FIRST_SEEN, &self.first_seen)?;
         crate::tlv::put(buf, &mut at, LAST_SEEN, &self.last_seen)?;
         crate::tlv::put(buf, &mut at, HAS_DUMP, &self.has_dump)?;
@@ -131,13 +137,18 @@ impl CardMeta {
 
     /// Decode a TLV entry list. The identity is mandatory - a record
     /// without it is not a card, so `None` is returned and the caller
-    /// drops the file. Every other field defaults if missing (label
-    /// regenerates from the identity), so a truncated or partially
-    /// unreadable record still yields a usable card.
+    /// drops the file. Every other field defaults if missing, so a
+    /// truncated or partially unreadable record still yields a usable
+    /// card.
+    ///
+    /// Records written before custom labels existed carry a generated
+    /// "<tag> <4 hex bytes>" text in the label field; one that still
+    /// matches [`legacy_auto_label`] is treated as unset so those cards
+    /// read like a fresh scan rather than as custom-named.
     fn decode_tagged(bytes: &[u8]) -> Option<CardMeta> {
         use meta_field::*;
         let mut identity: Option<CardIdentity> = None;
-        let mut label: Option<String<LABEL_MAX>> = None;
+        let mut label: String<LABEL_MAX> = String::new();
         let mut first_seen = TimeData::default();
         let mut last_seen = TimeData::default();
         let mut has_dump = false;
@@ -147,7 +158,7 @@ impl CardMeta {
         for (id, val) in crate::tlv::entries(bytes) {
             match id {
                 IDENTITY => identity = postcard::from_bytes(val).ok(),
-                LABEL => label = postcard::from_bytes(val).ok(),
+                LABEL => crate::tlv::get(val, &mut label),
                 FIRST_SEEN => crate::tlv::get(val, &mut first_seen),
                 LAST_SEEN => crate::tlv::get(val, &mut last_seen),
                 HAS_DUMP => crate::tlv::get(val, &mut has_dump),
@@ -158,7 +169,9 @@ impl CardMeta {
             }
         }
         let identity = identity?;
-        let label = label.unwrap_or_else(|| auto_label(&identity));
+        if label == legacy_auto_label(&identity) {
+            label.clear();
+        }
         Some(CardMeta {
             identity, label, first_seen, last_seen, has_dump, seq,
             dump_blocks_read, dump_sectors_read,
@@ -242,7 +255,7 @@ impl CardLibrary {
     /// Matching is by the identity's id bytes. An existing card has its
     /// `last_seen`, `identity` (a re-read may refine the kind), and
     /// `seq` refreshed and moves to the front. A new card is inserted
-    /// at the front with an auto label, unless the library is full.
+    /// at the front with no label, unless the library is full.
     pub fn upsert(&mut self, identity: &CardIdentity, now: TimeData) -> Upsert {
         let seq = self.next_seq();
         if let Some(i) = self.position_of(identity.id_bytes()) {
@@ -258,7 +271,7 @@ impl CardLibrary {
         } else {
             let meta = CardMeta {
                 identity: identity.clone(),
-                label: auto_label(identity),
+                label: String::new(),
                 first_seen: now,
                 last_seen: now,
                 has_dump: false,
@@ -298,6 +311,24 @@ impl CardLibrary {
                 c.has_dump = true;
                 c.dump_blocks_read = blocks_read;
                 c.dump_sectors_read = sectors_read;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Set (or, with an empty string, clear) the custom label of the
+    /// card carrying these id bytes. Text past [`LABEL_MAX`] is cut.
+    /// Returns `true` if a matching card was updated.
+    pub fn set_label(&mut self, id: &[u8], label: &str) -> bool {
+        match self.cards.iter_mut().find(|c| c.identity.id_bytes() == id) {
+            Some(c) => {
+                c.label.clear();
+                for ch in label.chars() {
+                    if c.label.push(ch).is_err() {
+                        break;
+                    }
+                }
                 true
             }
             None => false,
@@ -348,8 +379,11 @@ impl CardLibrary {
     }
 }
 
-/// A short type tag for the auto label, kept tiny so the label fits.
-fn kind_tag(identity: &CardIdentity) -> &'static str {
+/// The type tag of the pre-custom-label generated text (see
+/// [`legacy_auto_label`]). Frozen: it must keep matching what those
+/// records hold, independent of the UI's current short labels.
+#[cfg(feature = "serde")]
+fn legacy_kind_tag(identity: &CardIdentity) -> &'static str {
     match identity {
         CardIdentity::Iso14443a(a) => match a.kind {
             CardKind::MifareClassicMini => "Mini",
@@ -366,13 +400,15 @@ fn kind_tag(identity: &CardIdentity) -> &'static str {
     }
 }
 
-/// Auto label: the short kind tag plus the first four id bytes in hex,
-/// e.g. `"1K 98D4DB3D"`. Bounded well under [`LABEL_MAX`]; a write that
-/// would overflow simply stops (never panics).
-pub fn auto_label(identity: &CardIdentity) -> String<LABEL_MAX> {
+/// The label text records stored before custom labels existed: the
+/// short kind tag plus the first four id bytes in hex, e.g.
+/// `"1K 98D4DB3D"`. Only used by decode to recognise such a record
+/// and treat its label as unset.
+#[cfg(feature = "serde")]
+fn legacy_auto_label(identity: &CardIdentity) -> String<LABEL_MAX> {
     use core::fmt::Write;
     let mut s: String<LABEL_MAX> = String::new();
-    let _ = write!(s, "{} ", kind_tag(identity));
+    let _ = write!(s, "{} ", legacy_kind_tag(identity));
     for b in identity.id_bytes().iter().take(4) {
         let _ = write!(s, "{:02X}", b);
     }
@@ -491,10 +527,19 @@ mod tests {
     }
 
     #[test]
-    fn label_is_short_and_kinded() {
-        let l = auto_label(&card(&[0x98, 0xD4, 0xDB, 0x3D], CardKind::MifareClassic1K));
-        assert_eq!(l.as_str(), "1K 98D4DB3D");
-        assert!(l.len() <= LABEL_MAX);
+    fn new_card_has_no_label_until_set() {
+        let mut lib = CardLibrary::default();
+        lib.upsert(&card(&[0xA1], CardKind::MifareClassic1K), now(1));
+        assert!(lib.cards[0].label.is_empty());
+        assert!(lib.set_label(&[0xA1], "Office door"));
+        assert_eq!(lib.cards[0].label.as_str(), "Office door");
+        // Over-long text is cut at the cap, never rejected.
+        assert!(lib.set_label(&[0xA1], "0123456789012345678901234567"));
+        assert_eq!(lib.cards[0].label.len(), LABEL_MAX);
+        // Empty clears.
+        assert!(lib.set_label(&[0xA1], ""));
+        assert!(lib.cards[0].label.is_empty());
+        assert!(!lib.set_label(&[0xFF], "x"));
     }
 
     #[cfg(feature = "serde")]
@@ -502,7 +547,7 @@ mod tests {
     fn record_blob_round_trips() {
         let meta = CardMeta {
             identity: card(&[0x98, 0xD4, 0xDB, 0x3D], CardKind::MifareClassic1K),
-            label: auto_label(&card(&[0x98, 0xD4, 0xDB, 0x3D], CardKind::MifareClassic1K)),
+            label: String::try_from("Office door").unwrap(),
             first_seen: now(1),
             last_seen: now(9),
             has_dump: true,
@@ -514,6 +559,52 @@ mod tests {
         let encoded = postcard::to_slice(&meta, &mut buf).expect("encode");
         let decoded: CardMeta = postcard::from_bytes(encoded).expect("decode");
         assert_eq!(decoded, meta);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn unset_label_is_absent_on_wire_and_empty_on_decode() {
+        let mut meta = CardMeta {
+            identity: card(&[0x98, 0xD4, 0xDB, 0x3D], CardKind::MifareClassic1K),
+            label: String::new(),
+            first_seen: now(1),
+            last_seen: now(1),
+            has_dump: false,
+            seq: 1,
+            dump_blocks_read: 0,
+            dump_sectors_read: 0,
+        };
+        let mut buf = [0u8; 256];
+        let empty_len = meta.encode_tagged(&mut buf).unwrap();
+        assert!(CardMeta::decode_tagged(&buf[..empty_len]).unwrap().label.is_empty());
+        meta.label = String::try_from("x").unwrap();
+        let set_len = meta.encode_tagged(&mut buf).unwrap();
+        // The label entry only exists when set.
+        assert!(set_len > empty_len);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn legacy_generated_label_decodes_as_unset() {
+        // A record written before custom labels carries "<tag> <hex>"
+        // in the label field; it must not surface as a custom name.
+        let identity = card(&[0x98, 0xD4, 0xDB, 0x3D], CardKind::MifareClassic1K);
+        assert_eq!(legacy_auto_label(&identity).as_str(), "1K 98D4DB3D");
+        let mut inner = [0u8; 128];
+        let mut at = 0;
+        crate::tlv::put(&mut inner, &mut at, meta_field::IDENTITY, &identity).unwrap();
+        let legacy: String<LABEL_MAX> = String::try_from("1K 98D4DB3D").unwrap();
+        crate::tlv::put(&mut inner, &mut at, meta_field::LABEL, &legacy).unwrap();
+        assert!(CardMeta::decode_tagged(&inner[..at]).unwrap().label.is_empty());
+        // Anything else in the field is a real custom label.
+        let mut at = 0;
+        crate::tlv::put(&mut inner, &mut at, meta_field::IDENTITY, &identity).unwrap();
+        let custom: String<LABEL_MAX> = String::try_from("Office door").unwrap();
+        crate::tlv::put(&mut inner, &mut at, meta_field::LABEL, &custom).unwrap();
+        assert_eq!(
+            CardMeta::decode_tagged(&inner[..at]).unwrap().label.as_str(),
+            "Office door",
+        );
     }
 
     #[cfg(feature = "serde")]

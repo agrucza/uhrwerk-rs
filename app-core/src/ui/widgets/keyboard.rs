@@ -1,4 +1,4 @@
-//! On-screen QWERTY keyboard - free-text entry (passphrases first).
+//! On-screen QWERTY keyboard - free-text entry.
 //!
 //! A stateful widget in the `Wheel`/`Picker` family: the host
 //! sub-view owns an instance, forwards events, and reacts to the
@@ -6,6 +6,16 @@
 //! below the header (the host draws its own header); geometry
 //! derives from `theme::` so all key rows sit inside the
 //! corner-safe band.
+//!
+//! Two entry modes, fixed at construction ([`EntryMode`]):
+//!
+//! * **Password** ([`Keyboard::new`]) - masked field, SHOW/HIDE
+//!   middle action, DONE ghosted while empty (a passphrase cannot be
+//!   empty).
+//! * **Text** ([`Keyboard::plain_text`]) - the field shows the buffer in the
+//!   clear under a host-supplied placeholder, the middle action is
+//!   CLEAR, and DONE is always live: an empty DONE is how a host
+//!   clears a value (a card label reverting to its default).
 //!
 //! Layers: lowercase / uppercase (sticky shift, double-tap latches
 //! caps lock) / two symbol pages that together cover every printable
@@ -120,7 +130,8 @@ pub enum KeyboardResult {
     None,
     /// Visible state changed - redraw.
     Changed,
-    /// DONE tapped with a non-empty buffer.
+    /// DONE tapped: with a non-empty buffer in password mode, with any
+    /// buffer (empty included) in text mode.
     Done,
     /// CANCEL tapped.
     Cancelled,
@@ -128,11 +139,23 @@ pub enum KeyboardResult {
 
 // -- widget ------------------------------------------------------------------
 
+/// What the field holds - see the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryMode {
+    /// Masked entry; DONE needs a non-empty buffer.
+    Password,
+    /// Plain entry; DONE accepts an empty buffer.
+    Text,
+}
+
 pub struct Keyboard {
     buffer: String<64>,
     /// Semantic length cap (<= 64), set by the host: 63 for WPA2
-    /// passphrases, 32 for SSIDs.
+    /// passphrases, 32 for SSIDs, 24 for card labels.
     max_len: usize,
+    mode: EntryMode,
+    /// Field caption while the buffer is empty.
+    placeholder: &'static str,
     layer: Layer,
     /// Sticky shift: one uppercase character, then back to lower.
     /// Double-tapping shift latches caps lock until tapped again.
@@ -145,10 +168,23 @@ pub struct Keyboard {
 }
 
 impl Keyboard {
+    /// A password keyboard (masked field, SHOW/HIDE, DONE needs text).
     pub fn new(max_len: usize) -> Self {
+        Self::with_mode(max_len, EntryMode::Password, "ENTER PASSPHRASE")
+    }
+
+    /// A plain-text keyboard (field in the clear, CLEAR action, empty
+    /// DONE allowed). `placeholder` captions the empty field.
+    pub fn plain_text(max_len: usize, placeholder: &'static str) -> Self {
+        Self::with_mode(max_len, EntryMode::Text, placeholder)
+    }
+
+    fn with_mode(max_len: usize, mode: EntryMode, placeholder: &'static str) -> Self {
         Self {
             buffer: String::new(),
             max_len: max_len.min(64),
+            mode,
+            placeholder,
             layer: Layer::Lower,
             caps_lock: false,
             reveal: false,
@@ -176,8 +212,9 @@ impl Keyboard {
     pub fn handle_event(&mut self, event: &SystemEvent) -> KeyboardResult {
         match event {
             // 1 Hz mask tick: collapse the readable tail character.
+            // Nothing to mask in text mode.
             SystemEvent::TimeUpdated { .. } => {
-                if self.tail_visible {
+                if self.mode == EntryMode::Password && self.tail_visible {
                     self.tail_visible = false;
                     KeyboardResult::Changed
                 } else {
@@ -256,12 +293,26 @@ impl Keyboard {
             return KeyboardResult::Cancelled;
         }
         if contains(eye_rect(), x, y) {
-            self.reveal = !self.reveal;
-            return KeyboardResult::Changed;
+            return match self.mode {
+                EntryMode::Password => {
+                    self.reveal = !self.reveal;
+                    KeyboardResult::Changed
+                }
+                // CLEAR: an already-empty buffer is a no-op.
+                EntryMode::Text => {
+                    if self.buffer.is_empty() {
+                        KeyboardResult::None
+                    } else {
+                        self.buffer.clear();
+                        KeyboardResult::Changed
+                    }
+                }
+            };
         }
         if contains(done_rect(), x, y) {
-            // Ghosted while empty - the tap must die here too.
-            return if self.buffer.is_empty() {
+            // Password: ghosted while empty - the tap must die here
+            // too. Text: an empty DONE is a valid "clear" submit.
+            return if self.buffer.is_empty() && self.mode == EntryMode::Password {
                 KeyboardResult::None
             } else {
                 KeyboardResult::Done
@@ -320,9 +371,14 @@ impl Keyboard {
         draw_key(display, space_rect(), "", KeyStyle::Char);
 
         draw_key(display, cancel_rect(), "CANCEL", KeyStyle::Special);
-        let eye = if self.reveal { "HIDE" } else { "SHOW" };
-        draw_key(display, eye_rect(), eye, KeyStyle::Special);
-        let done_style = if self.buffer.is_empty() {
+        let middle = match self.mode {
+            EntryMode::Password if self.reveal => "HIDE",
+            EntryMode::Password => "SHOW",
+            EntryMode::Text => "CLEAR",
+        };
+        draw_key(display, eye_rect(), middle, KeyStyle::Special);
+        // Mirrors the tap rule: only a password DONE ghosts on empty.
+        let done_style = if self.buffer.is_empty() && self.mode == EntryMode::Password {
             KeyStyle::Ghost
         } else {
             KeyStyle::Hot
@@ -345,16 +401,17 @@ impl Keyboard {
             fonts::draw_centered_in_rect(
                 display,
                 &fonts::caption(),
-                "ENTER PASSPHRASE",
+                self.placeholder,
                 rect,
                 theme::FG_DIM,
             );
             return;
         }
 
-        // Masked: dots for everything except (optionally) the tail.
+        // Text mode and a revealed password show the buffer as-is;
+        // masked: dots for everything except (optionally) the tail.
         let mut shown: String<64> = String::new();
-        if self.reveal {
+        if self.reveal || self.mode == EntryMode::Text {
             let _ = shown.push_str(self.buffer.as_str());
         } else {
             let n = self.buffer.len();
@@ -669,6 +726,30 @@ mod tests {
         assert_eq!(kb.text(), "old-pass");
         assert!(!kb.caps_lock);
         assert_eq!(kb.layer, Layer::Lower);
+    }
+
+    #[test]
+    fn text_mode_done_accepts_empty_and_clear_empties() {
+        let mut kb = Keyboard::plain_text(24, "CARD LABEL");
+        // Empty DONE is a valid submit in text mode.
+        assert_eq!(tap_at(&mut kb, done_rect()), KeyboardResult::Done);
+        tap_char(&mut kb, 'a');
+        tap_char(&mut kb, 'b');
+        // The middle key is CLEAR here: empties the buffer.
+        assert_eq!(tap_at(&mut kb, eye_rect()), KeyboardResult::Changed);
+        assert_eq!(kb.text(), "");
+        assert_eq!(tap_at(&mut kb, eye_rect()), KeyboardResult::None);
+        assert!(!kb.reveal);
+    }
+
+    #[test]
+    fn text_mode_ignores_mask_tick() {
+        let mut kb = Keyboard::plain_text(24, "CARD LABEL");
+        tap_char(&mut kb, 'a');
+        let r = kb.handle_event(&SystemEvent::TimeUpdated {
+            data: crate::data::TimeData::default(),
+        });
+        assert_eq!(r, KeyboardResult::None);
     }
 
     #[test]

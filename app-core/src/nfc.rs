@@ -49,6 +49,16 @@ impl Technology {
             Technology::Iso15693 => "ISO15693 / NFC-V",
         }
     }
+
+    /// Short label for space-tight rows ("ISO-A", "FeliCa").
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Technology::Iso14443a => "ISO-A",
+            Technology::Iso14443b => "ISO-B",
+            Technology::Felica => "FeliCa",
+            Technology::Iso15693 => "ISO-V",
+        }
+    }
 }
 
 // ============================================================================
@@ -92,6 +102,21 @@ impl CardKind {
             CardKind::MifareDesfire => "MIFARE DESFire",
             CardKind::MifarePlus => "MIFARE Plus",
             CardKind::Iso14443aOther => "ISO14443-A",
+        }
+    }
+
+    /// Short family label for space-tight rows, where the full
+    /// [`label`](Self::label) plus a UID would not fit ("Classic 1K",
+    /// "Ultralight").
+    pub fn short_label(self) -> &'static str {
+        match self {
+            CardKind::MifareClassicMini => "Classic Mini",
+            CardKind::MifareClassic1K => "Classic 1K",
+            CardKind::MifareClassic4K => "Classic 4K",
+            CardKind::MifareUltralight => "Ultralight",
+            CardKind::MifareDesfire => "DESFire",
+            CardKind::MifarePlus => "Plus",
+            CardKind::Iso14443aOther => "ISO-A",
         }
     }
 
@@ -232,6 +257,15 @@ impl CardIdentity {
         match self {
             CardIdentity::Iso14443a(a) => a.kind.label(),
             other => other.technology().label(),
+        }
+    }
+
+    /// Short form of [`label`](Self::label) for rows that also carry
+    /// the id bytes.
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            CardIdentity::Iso14443a(a) => a.kind.short_label(),
+            other => other.technology().short_label(),
         }
     }
 }

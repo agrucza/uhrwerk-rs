@@ -1299,6 +1299,15 @@ impl Model {
                 }
                 self.needs_redraw = true;
             }
+            Action::SetNfcLabel { id, label } => {
+                // Write the label into the live record and persist it.
+                // The editor runs on a lit screen, so the deferred
+                // SaveCard flushes on the next tick.
+                if self.cached_data.card_library.set_label(&id, label.as_str()) {
+                    let _ = out.push(Effect::SaveCard { id });
+                }
+                self.needs_redraw = true;
+            }
             Action::TimeSync => {
                 // ONE source per tap, no chaining: WiFi when this
                 // board has the radio AND a network is stored,

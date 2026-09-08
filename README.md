@@ -43,7 +43,7 @@ License 1.1 - license text in `assets/fonts/LICENSE.txt`.
 | GPIO expander (XL9555) | n/a | n/a | working |
 | LoRa (SX1262) | n/a | n/a | working (RX + TX proven over the air vs a Meshtastic node; boot probe, session UI pending) |
 | GPS (MIA-M10Q) | n/a | n/a | working (rail-gated time sync, settings UI) |
-| NFC (ST25R3916) | n/a | n/a | working (ISO14443A card detect proven; rail-gated boot probe, session UI pending) |
+| NFC (ST25R3916) | n/a | n/a | working (Type A identify, MIFARE Classic default-key dump, always-on tap wake; on-watch card library with custom labels and on-flash dumps) |
 | WiFi / networking | working (scan, WPA2 join, DHCP, NTP time sync) | working | working |
 | Bluetooth LE | not started | not started | not started |
 | 802.15.4 (Zigbee / Thread) | n/a | not started | n/a |

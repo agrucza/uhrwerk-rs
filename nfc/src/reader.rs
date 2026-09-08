@@ -282,7 +282,9 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
                 return Ok(n);
             }
         }
-        log::warn!("nfc-dbg: {} no RX_END tx={:02X?} crc={}", what, tx, with_crc);
+        // A missing reply is the normal answer to a wrong key or an
+        // absent card, one line per attempt; per-frame detail only.
+        log::debug!("nfc-dbg: {} no RX_END tx={:02X?} crc={}", what, tx, with_crc);
         Err(NfcScanError::NoCard)
     }
 
@@ -364,7 +366,10 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
                 return Ok(bits);
             }
         }
-        log::warn!("nfc-dbg: {} raw no RX_END", what);
+        // Same as above: a locked sector answers none of the dictionary
+        // keys, so this fires once per key tried. The sweep logs the
+        // per-sector "locked" summary at warn instead.
+        log::debug!("nfc-dbg: {} raw no RX_END", what);
         Err(NfcScanError::NoCard)
     }
 
