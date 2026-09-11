@@ -252,11 +252,6 @@ impl TechSummary {
     }
 }
 
-/// `access` entry flag: decoded from a read trailer.
-const ACCESS_DECODED: u16 = 1 << 15;
-/// `access` entry flag: trailer read but its access bits are malformed.
-const ACCESS_INVALID: u16 = 1 << 14;
-
 /// The one summary held in RAM: which card it belongs to, and the
 /// summary itself. Filled live by the sweep for the card being dumped,
 /// or loaded from that card's summary file when its detail opens. A

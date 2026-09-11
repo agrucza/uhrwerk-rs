@@ -372,6 +372,14 @@ impl Model {
         &mut self.screen
     }
 
+    /// The active screen and the cached snapshot, borrowed together.
+    /// Rendering needs `&mut screen` and `&data` at the same time. The
+    /// two are disjoint fields, so this hands out both borrows without
+    /// copying `SystemData` (several KB) onto the stack per frame.
+    pub fn screen_and_data(&mut self) -> (&mut ActiveScreen, &SystemData) {
+        (&mut self.screen, &self.cached_data)
+    }
+
     /// Read-only view of runtime config. The manager passes
     /// `config().display` to display transitions.
     pub fn config(&self) -> &Config {
@@ -2106,6 +2114,10 @@ mod tests {
         println!("size_of CardLibrary   = {}", size_of::<crate::card_library::CardLibrary>());
         println!("size_of SystemData    = {}", size_of::<SystemData>());
         println!("size_of Model         = {}", size_of::<Model>());
+        println!("size_of SystemEvent   = {}", size_of::<SystemEvent>());
+        println!("size_of Effect        = {}", size_of::<Effect>());
+        println!("size_of Effects       = {}", size_of::<Effects>());
+        println!("size_of TechSummary   = {}", size_of::<crate::card_library::TechSummary>());
     }
 
     fn fresh() -> Model {

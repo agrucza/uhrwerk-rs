@@ -881,22 +881,24 @@ impl<B: Board> SystemManager<'static, B> {
                     // still belong to this card (the Model checked
                     // before emitting; re-checked here since the
                     // effect queue is drained after the event).
-                    let summary = self
-                        .model
-                        .cached_data()
-                        .nfc_summary
-                        .as_ref()
-                        .filter(|s| s.id == id)
-                        .map(|s| s.summary.clone());
-                    if let Some(summary) = summary {
-                        let mut path: heapless::String<80> = heapless::String::new();
-                        if summary_path(&mut path, &id).is_ok() {
-                            self.store.lock().await.flash_mut().save_blob(
-                                &path, SUMMARY_VERSION, &summary,
+                    // Saved straight from the slot: `store` and
+                    // `model` are disjoint fields, so no copy of the
+                    // summary is needed on the stack.
+                    let mut path: heapless::String<80> = heapless::String::new();
+                    let mut saved = false;
+                    if summary_path(&mut path, &id).is_ok() {
+                        let mut store = self.store.lock().await;
+                        let slot = self.model.cached_data().nfc_summary.as_ref();
+                        if let Some(s) = slot.filter(|s| s.id == id) {
+                            store.flash_mut().save_blob(
+                                &path, SUMMARY_VERSION, &s.summary,
                             );
-                            log_summary("saved", &summary);
-                            self.refresh_storage_usage().await;
+                            log_summary("saved", &s.summary);
+                            saved = true;
                         }
+                    }
+                    if saved {
+                        self.refresh_storage_usage().await;
                     }
                 }
                 Effect::LoadDumpSummary { id } => {
@@ -1714,12 +1716,10 @@ impl<B: Board> SystemManager<'static, B> {
     /// `force_full_redraw`, which re-renders + re-mirrors everything.
     async fn render(&mut self) {
         let render_start = Instant::now();
-        // Clone the cache so we can freely borrow `&mut self.model`
-        // (for `screen_mut()`) alongside `&mut self.display` below.
-        // `SystemData` was `Copy` before `battery_history` landed;
-        // the per-frame clone cost is ~400 bytes, well below the
-        // render-time budget at any realistic frame cadence.
-        let data = self.model.cached_data().clone();
+        // The screen and the snapshot are borrowed together through
+        // `screen_and_data` at each use below. `SystemData` is several
+        // KB; cloning it here used to cost that much main stack on
+        // every frame.
 
         // Decide which tiles need to be rendered this frame.
         //
@@ -1736,7 +1736,8 @@ impl<B: Board> SystemManager<'static, B> {
             self.force_full_redraw = false;
             DirtyRegion::FullScreen
         } else {
-            self.model.screen_mut().dirty_rects(&data)
+            let (screen, data) = self.model.screen_and_data();
+            screen.dirty_rects(data)
         };
         let tile_mask = dirty_to_tile_mask(&dirty);
         // On FullScreen frames (scroll, wake, screen-switch) we expect
@@ -1755,7 +1756,8 @@ impl<B: Board> SystemManager<'static, B> {
         // and update the screen's snapshot so the next on_event with no
         // visual effect doesn't keep waking us up.
         if tile_mask == 0 {
-            self.model.screen_mut().clear_dirty(&data);
+            let (screen, data) = self.model.screen_and_data();
+            screen.clear_dirty(data);
             self.model.clear_redraw();
             return;
         }
@@ -1785,7 +1787,8 @@ impl<B: Board> SystemManager<'static, B> {
             self.display.set_tile_y(tile_y);
             self.display.clear(app_core::ui::theme::BG).ok();
 
-            self.model.screen_mut().render(&mut self.display, &data, &ctx);
+            let (screen, data) = self.model.screen_and_data();
+            screen.render(&mut self.display, data, &ctx);
 
             // Decide whether this tile needs to go over QSPI. For
             // `FullScreen` dirty frames we already know the answer (yes)
@@ -1872,7 +1875,8 @@ impl<B: Board> SystemManager<'static, B> {
         // Update the screen's "last rendered" snapshot now that the
         // frame is on the panel - the next dirty_rects call diffs from
         // this baseline.
-        self.model.screen_mut().clear_dirty(&data);
+        let (screen, data) = self.model.screen_and_data();
+        screen.clear_dirty(data);
         self.model.clear_redraw();
 
         let render_ms = render_start.elapsed().as_millis();
@@ -1900,7 +1904,6 @@ impl<B: Board> SystemManager<'static, B> {
             return;
         }
         let sync_start = Instant::now();
-        let data = self.model.cached_data().clone();
 
         for tile_idx in 0..NUM_TILES {
             if self.canvas_stale & (1u16 << tile_idx) == 0 {
@@ -1912,7 +1915,8 @@ impl<B: Board> SystemManager<'static, B> {
 
             self.display.set_tile_y(tile_y);
             self.display.clear(app_core::ui::theme::BG).ok();
-            self.model.screen_mut().render(&mut self.display, &data, &ctx);
+            let (screen, data) = self.model.screen_and_data();
+            screen.render(&mut self.display, data, &ctx);
 
             let canvas = self.fb_canvas.as_deref_mut().unwrap();
             let start = tile_y as usize * ROW_STRIDE;
@@ -2085,10 +2089,6 @@ pub trait Bringup {
     }
 }
 
-/// Shared boot orchestration: build every piece via the board's
-/// [`Bringup`] in the canonical order, assemble the manager, spawn
-/// the per-device tasks, and run the event loop forever. Identical
-/// across boards, so it lives exactly once.
 /// Boot-time value of [`Board::sleep_clock_probe`], 0 = not seeded
 /// (the board has no such value, or the boot probe itself read 0).
 /// Every later sleep entry compares against it; see
@@ -2096,10 +2096,40 @@ pub trait Bringup {
 static SLEEP_CAL_BASELINE: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
+/// Shared boot orchestration: build every piece via the board's
+/// [`Bringup`] in the canonical order, assemble the manager, spawn
+/// the per-device tasks, and run the event loop forever. Identical
+/// across boards, so it lives exactly once.
+///
+/// The manager lives in this task's future for the life of the
+/// device. [`bring_up`] fills the slot and this function only owns
+/// the loop. Bring-up is polled as a boxed future on purpose: its
+/// poll frame carries the boot-only temporaries (the parts, the boot
+/// console, the manager before it moves into the slot), 18 KB of
+/// main stack in the T-Watch build. Boxing keeps that frame out of
+/// this function's poll, so it is gone once bring-up returns, and
+/// the bring-up state itself leaves the heap right after boot.
 pub async fn run<T: Bringup>(
-    mut bringup: T,
+    bringup: T,
     spawner: embassy_executor::Spawner,
 ) -> ! {
+    let mut slot: Option<SystemManager<'static, T::Board>> = None;
+    let manager =
+        alloc::boxed::Box::pin(bring_up(bringup, spawner, &mut slot)).await;
+    loop {
+        manager.tick().await;
+    }
+}
+
+/// Boot: build every subsystem in the canonical order, narrate it on
+/// the boot console, spawn the per-device tasks, and leave the
+/// assembled manager in `slot`. Returns the manager borrowed from the
+/// slot, ready for its first tick.
+async fn bring_up<'a, T: Bringup>(
+    mut bringup: T,
+    spawner: embassy_executor::Spawner,
+    slot: &'a mut Option<SystemManager<'static, T::Board>>,
+) -> &'a mut SystemManager<'static, T::Board> {
     use crate::tasks::{
         boot_button::boot_button_task, imu::imu_task, power::power_task,
         rtc::rtc_task, touch::touch_task,
@@ -2207,7 +2237,7 @@ pub async fn run<T: Bringup>(
     let rtc = bringup.make_rtc_ctrl();
 
     // Assemble + spawn + run - board-agnostic, single-sourced.
-    let (mut manager, bundle) = SystemManager::new(SystemParts {
+    let (manager, bundle) = SystemManager::new(SystemParts {
         i2c_bus,
         board,
         display,
@@ -2231,6 +2261,9 @@ pub async fn run<T: Bringup>(
         safe_area: bringup.safe_area(),
         config,
     });
+    // Into the task future's slot; everything below works through
+    // the borrow, so no second copy of the manager is ever built.
+    let manager = slot.insert(manager);
 
     // Each task is spawned exactly once at boot; `.unwrap()` on the
     // task fn is the "must succeed" shape (embassy-executor 0.10
@@ -2311,8 +2344,5 @@ pub async fn run<T: Bringup>(
     Timer::after(Duration::from_millis(400)).await;
     manager.render().await;
     manager.sync_canvas();
-
-    loop {
-        manager.tick().await;
-    }
+    manager
 }
