@@ -12,8 +12,13 @@
 //!   lines: the card's name (its custom label, else its family), the
 //!   family + id bytes (just the id when the family is already line
 //!   one), and last seen + dump state. Empty until the first scan
-//!   ("NO CARDS YET"); a scan that could not be identified shows the
-//!   transient "CARD NOT RECOGNIZED" while the library is still empty.
+//!   ("NO CARDS YET"). A scan that could not be identified, or one
+//!   that could not be stored because the library is full, lands here
+//!   with a banner above the rows until the list is used.
+//!
+//! An identified scan lands on that card's **Detail**: the Model
+//! re-mounts the screen with `nfc_open_card` set, and the mount opens
+//! it. The list keeps the highlight for when the user backs out.
 //! * **Detail** - a scrollable column: the chamfered `CARD` panel
 //!   (name, family, UID, Type A ATQA/SAK), the last-seen line, and
 //!   for a MIFARE Classic the SECTORS grid and the KEYS list, both
@@ -122,6 +127,10 @@ pub struct NfcScreen {
     /// The sector cell the user tapped in the detail grid; the status
     /// line under the grid names it. Reset when a card opens.
     selected_sector: Option<u8>,
+    /// The list's scan banner ("CARD NOT RECOGNIZED" / "LIBRARY
+    /// FULL") was dismissed by a list interaction. A scan re-mounts
+    /// the screen, which brings the banner back.
+    banner_dismissed: bool,
 }
 
 impl NfcScreen {
@@ -133,7 +142,25 @@ impl NfcScreen {
             keyboard: Keyboard::plain_text(LABEL_MAX, "CARD LABEL"),
             detail_scroll: ScrollState::new(),
             selected_sector: None,
+            banner_dismissed: false,
         }
+    }
+
+    /// The banner the list shows above its rows for the last scan,
+    /// if any and not yet dismissed.
+    fn banner(&self, data: &SystemData) -> Option<ListBanner> {
+        if self.banner_dismissed {
+            return None;
+        }
+        if data.nfc_library_full {
+            if let crate::nfc::NfcScan::Card(c) = &data.last_nfc {
+                return Some(ListBanner::Full(c.clone()));
+            }
+        }
+        if matches!(data.last_nfc, crate::nfc::NfcScan::Unrecognized) {
+            return Some(ListBanner::Unrecognized);
+        }
+        None
     }
 
     // -- List view -----------------------------------------------------------
@@ -141,40 +168,39 @@ impl NfcScreen {
     fn render_list<D: BlendTarget>(&self, display: &mut D, data: &SystemData, ctx: &RenderCtx) {
         let lib = &data.card_library;
         let content_top = app_content_top(&data.safe_area);
+        let banner = self.banner(data);
+        let offset = banner.as_ref().map_or(0, |_| BANNER_H);
 
-        // Empty library: a centered caption. If the last scan failed to
-        // identify (and there is nothing to list yet), show that
-        // instead so the "not recognized" feedback survives.
+        // Empty library: a centered caption (under the scan banner,
+        // if one is up).
         if lib.is_empty() {
-            let cx = theme::SCREEN_W as i32 / 2;
-            let cy = content_top + (theme::SCREEN_H as i32 - content_top) / 2 - 20;
-            if matches!(data.last_nfc, crate::nfc::NfcScan::Unrecognized) {
-                fonts::draw_centered(
-                    display, &fonts::headline(), "CARD NOT RECOGNIZED", cx, cy, theme::WARN,
-                );
-                fonts::draw_centered(
-                    display, &fonts::caption(), "unsupported or unreadable",
-                    cx, cy + 40, theme::FG_MUTED,
-                );
-            } else {
-                fonts::draw_centered(
-                    display, &fonts::headline(), "NO CARDS YET", cx, cy, theme::FG_MUTED,
-                );
-                fonts::draw_centered(
-                    display, &fonts::caption(), "present a card to save it",
-                    cx, cy + 40, theme::FG_MUTED,
-                );
+            if let Some(b) = &banner {
+                draw_banner(display, content_top, b);
             }
+            let cx = theme::SCREEN_W as i32 / 2;
+            let cy = content_top + offset + (theme::SCREEN_H as i32 - content_top - offset) / 2 - 20;
+            fonts::draw_centered(
+                display, &fonts::headline(), "NO CARDS YET", cx, cy, theme::FG_MUTED,
+            );
+            fonts::draw_centered(
+                display, &fonts::caption(), "present a card to save it",
+                cx, cy + 40, theme::FG_MUTED,
+            );
             return;
         }
 
+        // The banner sits above the rows and scrolls with them: it is
+        // part of the column, so a long list still reaches the top.
         let viewport = list_viewport(&data.safe_area);
-        let content_h = lib.cards.len() as i32 * card_row_h();
+        let content_h = offset + lib.cards.len() as i32 * card_row_h();
         render_scrolled(
             display, self.scroll.offset(), viewport, content_h, ACCENT, ctx,
             |clip, scroll| {
+                if let Some(b) = &banner {
+                    draw_banner(clip, content_top - scroll, b);
+                }
                 for (i, meta) in lib.cards.iter().enumerate() {
-                    let rect = list_row_rect(i, scroll, &data.safe_area);
+                    let rect = list_row_rect(i, scroll, offset, &data.safe_area);
                     let y0 = rect.top_left.y;
                     let y1 = y0 + rect.size.height as i32;
                     if !ctx.intersects_y(y0, y1) {
@@ -227,10 +253,11 @@ impl NfcScreen {
                     return Action::None;
                 }
                 let scroll = self.scroll.offset();
+                let offset = self.banner(data).map_or(0, |_| BANNER_H);
                 // Index and rect mirror the render loop exactly, or draw
                 // and hit-test drift apart.
                 for (i, meta) in data.card_library.cards.iter().enumerate() {
-                    let rect = list_row_rect(i, scroll, &data.safe_area);
+                    let rect = list_row_rect(i, scroll, offset, &data.safe_area);
                     if rect.contains(pt) {
                         let mut id: CardId = Vec::new();
                         let _ = id.extend_from_slice(meta.identity.id_bytes());
@@ -238,6 +265,7 @@ impl NfcScreen {
                         self.confirm_remove = false;
                         self.detail_scroll = ScrollState::new();
                         self.selected_sector = None;
+                        self.banner_dismissed = true;
                         data.nfc_highlight = None;
                         // The Model loads this card's sector summary
                         // (if it has a dump) into the RAM slot.
@@ -248,7 +276,8 @@ impl NfcScreen {
             }
             SystemEvent::TouchPressed { .. } | SystemEvent::TouchReleased => {
                 let viewport_h = list_viewport(&data.safe_area).size.height as i32;
-                let content_h = data.card_library.cards.len() as i32 * card_row_h();
+                let offset = self.banner(data).map_or(0, |_| BANNER_H);
+                let content_h = offset + data.card_library.cards.len() as i32 * card_row_h();
                 if handle_scroll_drag(&mut self.scroll, event, viewport_h, content_h) {
                     // Engaging the list dismisses the just-scanned mark.
                     data.nfc_highlight = None;
@@ -579,40 +608,47 @@ impl NfcScreen {
 }
 
 impl Screen for NfcScreen {
-    fn on_mount(&mut self, _data: &SystemData) {
-        // Opening the app - or a scan switching to it - always lands on
-        // the list, scrolled to the top (newest card first). A plain
-        // wake does not re-mount, so it keeps whatever view was open.
-        self.view = NfcView::List;
+    fn on_mount(&mut self, data: &SystemData) {
+        // An identified scan re-mounts the screen with the card to
+        // open in `nfc_open_card`: land on that card's detail. Anything
+        // else (app-drawer open, unrecognized scan, library full) lands
+        // on the list, scrolled to the top. A plain wake does not
+        // re-mount, so it keeps whatever view was open.
+        self.view = match &data.nfc_open_card {
+            Some(id) if data.card_library.get_by_id(id).is_some() => NfcView::Detail(id.clone()),
+            _ => NfcView::List,
+        };
         self.scroll = ScrollState::new();
         self.confirm_remove = false;
         self.detail_scroll = ScrollState::new();
         self.selected_sector = None;
+        self.banner_dismissed = false;
     }
 
     fn render<D: BlendTarget>(&self, display: &mut D, data: &SystemData, ctx: &RenderCtx) {
-        // Header telemetry reflects the active view: "NFC.LIST" on the
-        // list, "NFC.<n>" on a card detail where n is the card's 1-based
-        // position in the list (newest = 0001), "NFC.LABEL" in the label
-        // editor. A detail or editor whose card has vanished falls back
-        // to the list, so its label does too.
+        // Header telemetry reflects the active view: "CARDS n/cap" on
+        // the list (stored / capacity), "CARD i/n" on a detail where i
+        // is the card's 1-based position (newest = 1), "LABEL" in the
+        // label editor. A detail or editor whose card has vanished
+        // falls back to the list, so its label does too.
+        let count = data.card_library.len();
         let mut telem: String<12> = String::new();
         match &self.view {
             NfcView::Detail(id) => {
                 match data.card_library.cards.iter().position(|c| c.identity.id_bytes() == id.as_slice()) {
                     Some(i) => {
-                        let _ = write!(telem, "NFC.{:04}", i + 1);
+                        let _ = write!(telem, "CARD {}/{}", i + 1, count);
                     }
                     None => {
-                        let _ = write!(telem, "NFC.LIST");
+                        let _ = write!(telem, "CARDS {}/{}", count, crate::card_library::MAX_CARDS);
                     }
                 }
             }
             NfcView::EditLabel(id) if data.card_library.get_by_id(id).is_some() => {
-                let _ = write!(telem, "NFC.LABEL");
+                let _ = write!(telem, "LABEL");
             }
             NfcView::EditLabel(_) | NfcView::List => {
-                let _ = write!(telem, "NFC.LIST");
+                let _ = write!(telem, "CARDS {}/{}", count, crate::card_library::MAX_CARDS);
             }
         }
         draw_app_chrome(display, data, "NFC", telem.as_str(), ACCENT, ctx);
@@ -985,11 +1021,45 @@ fn card_row_h() -> i32 {
     row_lines_h(2)
 }
 
-/// Rect for the Nth list row, shifted by the scroll offset. Width
-/// leaves a scrollbar gutter on the right, like the settings rows.
-fn list_row_rect(index: usize, scroll: i32, safe: &crate::data::SafeArea) -> Rectangle {
+/// Height of the scan banner above the list rows: headline + caption.
+const BANNER_H: i32 = 64;
+
+/// What the list says about the last scan, above its rows.
+enum ListBanner {
+    /// The tap answered but no technology identified it.
+    Unrecognized,
+    /// Identified, but the library is at capacity: this card was not
+    /// stored and has no row.
+    Full(CardIdentity),
+}
+
+/// Draw the scan banner with its top edge at `top`.
+fn draw_banner<D: BlendTarget>(d: &mut D, top: i32, banner: &ListBanner) {
+    let x = SIDE_MARGIN + 4;
+    match banner {
+        ListBanner::Unrecognized => {
+            fonts::draw_at(d, &fonts::headline(), "CARD NOT RECOGNIZED", x, top + 8, theme::WARN);
+            fonts::draw_at(
+                d, &fonts::caption(), "unsupported or unreadable", x, top + 42, theme::FG_MUTED,
+            );
+        }
+        ListBanner::Full(card) => {
+            fonts::draw_at(d, &fonts::headline(), "LIBRARY FULL", x, top + 8, theme::WARN);
+            let mut line: String<48> = String::new();
+            let _ = write!(line, "{} [{}] not stored", card.short_label(), id_hex(card.id_bytes()));
+            fonts::draw_at(d, &fonts::caption(), line.as_str(), x, top + 42, theme::FG_MUTED);
+        }
+    }
+}
+
+/// Rect for the Nth list row, shifted by the scroll offset and pushed
+/// down by `offset` (the banner's height when one is up). Width leaves
+/// a scrollbar gutter on the right, like the settings rows.
+fn list_row_rect(
+    index: usize, scroll: i32, offset: i32, safe: &crate::data::SafeArea,
+) -> Rectangle {
     let h = card_row_h();
-    let y = app_content_top(safe) + index as i32 * h - scroll;
+    let y = app_content_top(safe) + offset + index as i32 * h - scroll;
     Rectangle::new(
         Point::new(0, y),
         Size::new((theme::SCREEN_W as i32 - SCROLLBAR_GUTTER) as u32, h as u32),

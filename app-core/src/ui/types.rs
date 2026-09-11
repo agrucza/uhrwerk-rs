@@ -1022,6 +1022,17 @@ pub struct SystemData {
     /// `None` when neither applies or the card has no dump. The NFC
     /// detail renders it only when its `id` matches the shown card.
     pub nfc_summary: Option<crate::card_library::CardSummary>,
+
+    /// One-shot: the card whose detail the NFC screen should open on
+    /// its next mount. The Model sets it for an identified scan right
+    /// before re-mounting the screen and clears it after, so a plain
+    /// app-drawer open still lands on the list.
+    pub nfc_open_card: Option<heapless::Vec<u8, 10>>,
+
+    /// The last identified scan could not be stored: the library is at
+    /// capacity. The list shows a LIBRARY FULL banner naming the card
+    /// (`last_nfc`) until the next scan or a removal.
+    pub nfc_library_full: bool,
 }
 
 // -- Screen trait -------------------------------------------------------------

@@ -476,7 +476,16 @@ impl Model {
                     self.nav_stack.push(self.screen.id());
                 }
                 self.screen.switch_to(ScreenId::Nfc, &self.cached_data);
+            } else if matches!(event, SystemEvent::NfcProbe { .. }) {
+                // Already on the NFC screen: a scan still re-mounts it,
+                // so the screen lands where the scan says (the card's
+                // detail, or the list with a banner) instead of staying
+                // on whatever was open. A dump completing does not:
+                // the detail showing the grid stays as it is.
+                self.screen.switch_to(ScreenId::Nfc, &self.cached_data);
             }
+            // The open-detail request is consumed by that mount.
+            self.cached_data.nfc_open_card = None;
             self.needs_redraw = true;
             return out;
         }
@@ -632,6 +641,31 @@ impl Model {
         self.needs_redraw = true;
     }
 
+    /// A card's detail is about to show (row tap or scan): make the
+    /// summary slot its own. A slot filled for another card is
+    /// dropped; one already holding this card (a dump just ran, or a
+    /// re-open) is kept and the load is skipped. With a stored dump
+    /// the manager loads the card's summary file into the slot.
+    fn prepare_card_summary(&mut self, id: &heapless::Vec<u8, 10>, out: &mut Effects) {
+        let already = self
+            .cached_data
+            .nfc_summary
+            .as_ref()
+            .is_some_and(|s| &s.id == id);
+        if already {
+            return;
+        }
+        self.cached_data.nfc_summary = None;
+        let has_dump = self
+            .cached_data
+            .card_library
+            .get_by_id(id)
+            .is_some_and(|m| m.has_dump);
+        if has_dump {
+            let _ = out.push(Effect::LoadDumpSummary { id: id.clone() });
+        }
+    }
+
     /// Empty the summary slot if it belongs to card `id`.
     fn drop_summary_slot_if(&mut self, id: &[u8]) {
         if self.cached_data.nfc_summary.as_ref().is_some_and(|s| s.id == id) {
@@ -716,11 +750,31 @@ impl Model {
                     // not re-mount); the screen clears it on the first
                     // interaction.
                     self.cached_data.nfc_highlight = Some(id.clone());
-                    if !matches!(
+                    self.cached_data.nfc_library_full = false;
+                    if matches!(
                         self.cached_data.card_library.upsert(c, now),
                         crate::card_library::Upsert::Full,
                     ) {
+                        // Not stored: no record to open, nothing to
+                        // highlight. The list shows LIBRARY FULL.
+                        self.cached_data.nfc_library_full = true;
+                        self.cached_data.nfc_highlight = None;
+                        self.cached_data.nfc_open_card = None;
+                    } else {
                         let _ = out.push(Effect::SaveCard { id: id.clone() });
+                        // The scan lands on this card's detail: ask the
+                        // screen to open it on the re-mount that follows,
+                        // and bring its summary in like a row tap would.
+                        self.cached_data.nfc_open_card = Some(id.clone());
+                        // Not when a dump is about to run on it: the
+                        // armed block below points the slot at a fresh
+                        // summary, and a file load landing after that
+                        // would overwrite the sweep's live results.
+                        let will_dump = self.cached_data.nfc_dump_armed
+                            && matches!(c, crate::nfc::CardIdentity::Iso14443a(a) if a.kind.is_mifare_classic());
+                        if !will_dump {
+                            self.prepare_card_summary(&id, out);
+                        }
                     }
                     // Armed and a Classic: the sweep starts right after
                     // this probe (the NFC task sends the identify first
@@ -745,8 +799,11 @@ impl Model {
                     }
                 } else {
                     // A present-but-unidentified tap: nothing to
-                    // highlight.
+                    // highlight, nothing to open; the list shows the
+                    // "not recognized" banner.
                     self.cached_data.nfc_highlight = None;
+                    self.cached_data.nfc_open_card = None;
+                    self.cached_data.nfc_library_full = false;
                 }
                 self.needs_redraw = true;
                 // Scan confirmation: a one-shot self-terminating click
@@ -1398,6 +1455,8 @@ impl Model {
                 // flash blob via the manager.
                 self.cached_data.card_library.remove(&id);
                 self.drop_summary_slot_if(&id);
+                // A slot is free again: the LIBRARY FULL banner goes.
+                self.cached_data.nfc_library_full = false;
                 let _ = out.push(Effect::RemoveCard { id });
                 self.needs_redraw = true;
             }
@@ -1413,25 +1472,7 @@ impl Model {
                 self.needs_redraw = true;
             }
             Action::OpenNfcCard { id } => {
-                // A slot filled for another card must not show here;
-                // one already holding this card (a dump just ran, or a
-                // re-open) is kept and the load is skipped.
-                let already = self
-                    .cached_data
-                    .nfc_summary
-                    .as_ref()
-                    .is_some_and(|s| s.id == id);
-                if !already {
-                    self.cached_data.nfc_summary = None;
-                    let has_dump = self
-                        .cached_data
-                        .card_library
-                        .get_by_id(&id)
-                        .is_some_and(|m| m.has_dump);
-                    if has_dump {
-                        let _ = out.push(Effect::LoadDumpSummary { id });
-                    }
-                }
+                self.prepare_card_summary(&id, out);
                 self.needs_redraw = true;
             }
             Action::SetNfcLabel { id, label } => {
@@ -2571,6 +2612,62 @@ mod tests {
         m.dispatch_action(Action::DismissAlarm, &mut out);
         let _ = m.tick(Instant::from_millis((off_timeout as u64 + 20) * 1000), 0);
         assert!(m.sleeping);
+    }
+
+    #[test]
+    fn identified_scan_opens_the_card_and_loads_its_summary() {
+        use crate::nfc::{CardIdentity, CardKind, TypeAInfo, Uid};
+        let mut m = fresh();
+        let mut uid: Uid = Uid::new();
+        uid.extend_from_slice(&[0x98, 0xD4, 0xDB, 0x3D]).unwrap();
+        let card = CardIdentity::Iso14443a(TypeAInfo {
+            uid, atqa: [0x04, 0x00], sak: 0x08, kind: CardKind::MifareClassic1K,
+        });
+        // First scan: stored, screen switched, open request consumed
+        // by the mount, no dump yet so no summary load.
+        let fx = m.handle_event(&SystemEvent::NfcProbe { card: Some(card.clone()) }, Instant::from_millis(0));
+        assert_eq!(m.screen.id(), ScreenId::Nfc);
+        assert!(m.cached_data.nfc_open_card.is_none());
+        assert!(!m.cached_data.nfc_library_full);
+        assert!(!fx.iter().any(|e| matches!(e, Effect::LoadDumpSummary { .. })));
+        // With a dump on record, a re-scan asks for the summary file.
+        assert!(m.cached_data.card_library.set_dump(card.id_bytes(), 64, 16));
+        let fx = m.handle_event(&SystemEvent::NfcProbe { card: Some(card.clone()) }, Instant::from_millis(10));
+        assert!(fx.iter().any(|e| matches!(e, Effect::LoadDumpSummary { .. })));
+        // Armed for a dump: the slot is the fresh sweep summary, and no
+        // file load may overwrite it.
+        let mut out: Effects = Vec::new();
+        m.dispatch_action(Action::ArmNfcDump, &mut out);
+        let fx = m.handle_event(&SystemEvent::NfcProbe { card: Some(card.clone()) }, Instant::from_millis(20));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::LoadDumpSummary { .. })));
+        assert!(m.cached_data.nfc_summary.as_ref().is_some_and(|s| s.classic.sectors.len() == 16));
+    }
+
+    #[test]
+    fn full_library_flags_the_unstored_scan() {
+        use crate::nfc::{CardIdentity, CardKind, TypeAInfo, Uid};
+        let mut m = fresh();
+        let mk = |b: u8| {
+            let mut uid: Uid = Uid::new();
+            uid.extend_from_slice(&[b, 0x11, 0x22, 0x33]).unwrap();
+            CardIdentity::Iso14443a(TypeAInfo {
+                uid, atqa: [0x04, 0x00], sak: 0x08, kind: CardKind::MifareClassic1K,
+            })
+        };
+        for b in 0..crate::card_library::MAX_CARDS as u8 {
+            let _ = m.handle_event(&SystemEvent::NfcProbe { card: Some(mk(b)) }, Instant::from_millis(0));
+        }
+        assert!(m.cached_data.card_library.is_full());
+        let _ = m.handle_event(&SystemEvent::NfcProbe { card: Some(mk(0xEE)) }, Instant::from_millis(0));
+        assert!(m.cached_data.nfc_library_full);
+        assert!(m.cached_data.nfc_highlight.is_none());
+        assert!(m.cached_data.nfc_open_card.is_none());
+        // Removing a card frees a slot and clears the flag.
+        let mut out: Effects = Vec::new();
+        let mut id: heapless::Vec<u8, 10> = heapless::Vec::new();
+        id.extend_from_slice(&[0x00, 0x11, 0x22, 0x33]).unwrap();
+        m.dispatch_action(Action::RemoveNfcCard { id }, &mut out);
+        assert!(!m.cached_data.nfc_library_full);
     }
 
     #[test]
