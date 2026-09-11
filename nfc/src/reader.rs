@@ -96,6 +96,21 @@ pub enum SweepEvent {
     },
 }
 
+/// What [`Reader::sweep_type2`] streams: every readable page as it is
+/// read.
+pub enum Type2Event {
+    Page { page: u8, data: [u8; type2::PAGE_SIZE] },
+}
+
+/// Result of [`Reader::sweep_type2`].
+pub struct Type2Sweep {
+    /// Per-page states, lock bits decoded, plus the chip and the
+    /// password configuration when it was readable.
+    pub summary: app_core::type2::Type2Summary,
+    /// Pages delivered to the callback.
+    pub pages_read: u16,
+}
+
 /// Tally returned by [`Reader::sweep_classic`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SweepStats {
@@ -225,6 +240,262 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
         let mut out = [0u8; type2::READ_LEN];
         out.copy_from_slice(&rx[..type2::READ_LEN]);
         Ok(out)
+    }
+
+    /// A Type 2 exchange: like [`transceive`](Self::transceive) but a
+    /// 4-bit NAK is a normal answer (a page out of range, one behind
+    /// the password, or GET_VERSION on a chip without it) and comes
+    /// back as `Ok(None)`. The chip flags the CRC-less NAK as an error
+    /// frame; a one-byte FIFO behind that flag is the NAK.
+    async fn transceive_t2(
+        &mut self,
+        what: &'static str,
+        tx: &[u8],
+        rx: &mut [u8],
+    ) -> Result<Option<usize>, NfcScanError> {
+        self.drv.direct_command(self.spi, regs::cmd::CLEAR_FIFO).map_err(hw)?;
+        self.drv.fifo_load(self.spi, tx).map_err(hw)?;
+        self.drv
+            .set_num_tx_bytes(self.spi, tx.len() as u16, 0)
+            .map_err(hw)?;
+        self.drv
+            .direct_command(self.spi, regs::cmd::TRANSMIT_WITH_CRC)
+            .map_err(hw)?;
+        for _ in 0..RX_POLL_TRIES {
+            self.delay.delay_ms(RX_POLL_GAP_MS).await;
+            let irqs = self.drv.read_interrupts(self.spi).map_err(hw)?;
+            let err_bits = irqs.error_wup
+                & (regs::irq_error_wup::CRC_ERROR
+                    | regs::irq_error_wup::PARITY_ERROR
+                    | regs::irq_error_wup::HARD_FRAMING_ERROR);
+            if err_bits != 0 || irqs.main & regs::irq_main::RX_END != 0 {
+                let st = self.drv.fifo_status(self.spi).map_err(hw)?;
+                let n = (st.bytes as usize).min(rx.len());
+                self.drv.fifo_read(self.spi, &mut rx[..n]).map_err(hw)?;
+                if n <= 1 {
+                    log::debug!("nfc-dbg: {} NAK tx={:02X?} rx={:02X?}", what, tx, &rx[..n]);
+                    return Ok(None);
+                }
+                if err_bits != 0 {
+                    log::warn!(
+                        "nfc-dbg: {} ERR tx={:02X?} main={:#04x} err={:#04x} fifo={} rx={:02X?}",
+                        what, tx, irqs.main, irqs.error_wup, st.bytes, &rx[..n],
+                    );
+                    return Err(NfcScanError::Hardware);
+                }
+                log::debug!("nfc-dbg: {} rx tx={:02X?} fifo={} rx={:02X?}", what, tx, st.bytes, &rx[..n]);
+                return Ok(Some(n));
+            }
+        }
+        log::debug!("nfc-dbg: {} no RX_END tx={:02X?}", what, tx);
+        Err(NfcScanError::NoCard)
+    }
+
+    /// GET_VERSION (NTAG21x 10.1, UL EV1 10.1): the 8 version bytes,
+    /// or `None` when the chip NAKs it (a plain Ultralight).
+    pub async fn get_version(&mut self) -> Result<Option<[u8; 8]>, NfcScanError> {
+        let mut rx = [0u8; 10];
+        match self.transceive_t2("getver", &[app_core::type2::GET_VERSION], &mut rx).await? {
+            Some(n) if n >= 8 => {
+                let mut v = [0u8; 8];
+                v.copy_from_slice(&rx[..8]);
+                Ok(Some(v))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// READ four pages from `page` as [`read_type2`](Self::read_type2),
+    /// with the card's NAK (out of range, or password-protected) as
+    /// `Ok(None)` instead of an error.
+    pub async fn read_type2_page(
+        &mut self,
+        page: u8,
+    ) -> Result<Option<[u8; type2::READ_LEN]>, NfcScanError> {
+        let mut rx = [0u8; type2::READ_LEN + 2];
+        match self.transceive_t2("t2read", &[type2::READ, page], &mut rx).await? {
+            Some(n) if n >= type2::READ_LEN => {
+                let mut out = [0u8; type2::READ_LEN];
+                out.copy_from_slice(&rx[..type2::READ_LEN]);
+                Ok(Some(out))
+            }
+            Some(n) => {
+                log::warn!("nfc-dbg: t2read page {} short reply n={}", page, n);
+                Err(NfcScanError::Hardware)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Read a whole Type 2 tag (Ultralight / NTAG): identify the chip
+    /// with GET_VERSION, read its password configuration, then every
+    /// readable page in READ steps of four, handing each page to
+    /// `on_event` as it arrives. Returns the per-page summary with
+    /// the lock bits decoded (static from page 2, dynamic from the
+    /// chip's dynamic lock page) and the pages behind the password
+    /// marked protected.
+    ///
+    /// Precondition: the card is SELECTED and ACTIVE. On return it is
+    /// still active (a Type 2 tag needs the plain HLTA afterwards).
+    ///
+    /// Roll-over (NTAG 10.2): a READ whose four pages cross the end
+    /// of memory, or the AUTH0 boundary, returns pages 0, 1, .. for
+    /// the part beyond. With the configuration readable the boundary
+    /// is known and those pages are simply not taken. With it
+    /// unreadable (AUTH0 at or below the config pages) the boundary
+    /// shows as a NAK on the next READ, and the previous reply's tail
+    /// is then checked against pages 0-3 - so every reply is held
+    /// back until the next one has answered.
+    pub async fn sweep_type2<F, Fut>(&mut self, mut on_event: F) -> Result<Type2Sweep, NfcScanError>
+    where
+        F: FnMut(Type2Event) -> Fut,
+        Fut: core::future::Future<Output = ()>,
+    {
+        use app_core::type2::{PageState, Type2Chip, Type2Config, Type2Summary};
+
+        let chip = match self.get_version().await? {
+            Some(v) => match Type2Chip::from_version(&v) {
+                Some(c) => c,
+                None => {
+                    log::warn!("nfc-dbg: t2 unknown GET_VERSION {:02X?} - reading as Ultralight", v);
+                    Type2Chip::Ultralight
+                }
+            },
+            None => Type2Chip::Ultralight,
+        };
+        let pages = chip.pages();
+        let mut summary = Type2Summary::begin(chip);
+        log::info!("NFC: t2 chip {} ({} pages)", chip.label(), pages);
+
+        // Password configuration: readable unless AUTH0 already covers
+        // the config pages themselves.
+        let mut limit = pages;
+        if let Some(cfg) = chip.cfg_page() {
+            if let Some(d) = self.read_type2_page(cfg).await? {
+                let c = Type2Config::decode(
+                    &[d[0], d[1], d[2], d[3]],
+                    &[d[4], d[5], d[6], d[7]],
+                );
+                summary.config = Some(c);
+                if c.prot && c.auth0 < pages {
+                    limit = c.auth0;
+                }
+                log::info!(
+                    "NFC: t2 config auth0 {:#04x} prot {} cfglck {} authlim {}",
+                    c.auth0, c.prot, c.cfglck, c.authlim,
+                );
+            } else {
+                log::info!("NFC: t2 config pages protected");
+            }
+        }
+
+        // Bit p set = page p read; 29 bytes cover 231 pages.
+        let mut read_bits = [0u8; 29];
+        let mut lock = [0u8; 2];
+        let mut dyn_lock: Option<[u8; 2]> = None;
+        let mut page0_3: Option<[u8; type2::READ_LEN]> = None;
+        let mut pending: Option<(u8, [u8; type2::READ_LEN])> = None;
+        let mut pages_read: u16 = 0;
+        // Pages from here on are behind the password.
+        let mut protected_from = limit;
+
+        // Hand the first `count` pages of a held-back reply on.
+        macro_rules! emit {
+            ($start:expr, $data:expr, $count:expr) => {{
+                let s: u8 = $start;
+                let d: [u8; type2::READ_LEN] = $data;
+                for k in 0..($count as usize) {
+                    let p = s as usize + k;
+                    if p >= pages as usize || p >= limit as usize {
+                        break;
+                    }
+                    let mut page = [0u8; type2::PAGE_SIZE];
+                    page.copy_from_slice(&d[k * 4..k * 4 + 4]);
+                    if p == 2 {
+                        lock = [page[2], page[3]];
+                    }
+                    if Some(p as u8) == chip.dyn_lock_page() {
+                        dyn_lock = Some([page[0], page[1]]);
+                    }
+                    read_bits[p / 8] |= 1 << (p % 8);
+                    pages_read += 1;
+                    on_event(Type2Event::Page { page: p as u8, data: page }).await;
+                }
+            }};
+        }
+
+        let mut start: u8 = 0;
+        let mut lost = false;
+        while (start as usize) < limit as usize {
+            let reply = match self.read_type2_page(start).await {
+                Ok(r) => r,
+                Err(NfcScanError::NoCard) => {
+                    // One re-wake and one retry; a card that stays
+                    // silent is gone, the rest stays "not read".
+                    if !self.reactivate_retrying(start).await {
+                        lost = true;
+                        break;
+                    }
+                    match self.read_type2_page(start).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            lost = true;
+                            break;
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+            match reply {
+                Some(d) => {
+                    if start == 0 {
+                        page0_3 = Some(d);
+                    }
+                    if let Some((ps, pd)) = pending.take() {
+                        emit!(ps, pd, 4);
+                    }
+                    pending = Some((start, d));
+                    match start.checked_add(4) {
+                        Some(s) => start = s,
+                        None => break,
+                    }
+                }
+                None => {
+                    // NAK: AUTH0 lies in (start - 4, start]. The held
+                    // reply's tail may already be roll-over data.
+                    protected_from = start;
+                    if let Some((ps, pd)) = pending.take() {
+                        let wrapped = page0_3.map_or(0, |p0| type2::wrapped_tail(&pd, &p0));
+                        emit!(ps, pd, 4 - wrapped);
+                        protected_from = ps.saturating_add((4 - wrapped) as u8);
+                    }
+                    log::info!("NFC: t2 pages from {} are password-protected", protected_from);
+                    break;
+                }
+            }
+        }
+        if let Some((ps, pd)) = pending.take() {
+            emit!(ps, pd, 4);
+        }
+        if lost {
+            log::warn!("nfc-dbg: t2 card lost at page {} - partial dump, {} pages read", start, pages_read);
+        }
+
+        for p in 0..pages {
+            let read = read_bits[p as usize / 8] & (1 << (p % 8)) != 0;
+            let state = if read {
+                match chip.page_locked(p, lock[0], lock[1], dyn_lock) {
+                    Some(true) => PageState::Locked,
+                    _ => PageState::Read,
+                }
+            } else if p >= protected_from {
+                PageState::Protected
+            } else {
+                PageState::NotRead
+            };
+            summary.set(p, state);
+        }
+        Ok(Type2Sweep { summary, pages_read })
     }
 
     /// HLTA: put the selected card into HALT so it stops answering

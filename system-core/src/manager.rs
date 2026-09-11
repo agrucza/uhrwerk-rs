@@ -71,9 +71,11 @@ fn dump_path(buf: &mut heapless::String<80>, id: &[u8]) -> core::fmt::Result {
     write!(buf, ".dump")
 }
 
-/// Blob version of a card's sector-summary file. 2: per-sector access
-/// conditions added (v1 files fail to load; the card is re-dumped).
-const SUMMARY_VERSION: u8 = 2;
+/// Envelope tag of a card's summary file: 1 = a flat TLV payload
+/// (`TechSummary`), the same fixed tag config and the card record
+/// use. It never changes: a new field or technology gets a new TLV
+/// id and old files keep loading.
+const SUMMARY_VERSION: u8 = 1;
 
 /// Build the sector-summary path `DUMP_DIR/<id-hex>.sum` for a card:
 /// the `ClassicSummary` of its stored dump, as a versioned blob. Lives
@@ -138,21 +140,38 @@ fn load_card_library(
     }
 }
 
-/// Serial rendering of a sector summary, one char per sector (R read,
-/// P partial, L locked, . not swept) plus the key count. Logged when a
-/// summary file is written or loaded - the check that it persisted.
-fn log_summary(what: &str, s: &app_core::card_library::ClassicSummary) {
-    let mut map: heapless::String<40> = heapless::String::new();
-    for i in 0..s.sectors.len() {
-        let ch = match s.sector(i).map(|x| x.state) {
-            Some(app_core::nfc::SectorState::Read) => 'R',
-            Some(app_core::nfc::SectorState::Partial) => 'P',
-            Some(app_core::nfc::SectorState::Locked) => 'L',
-            None => '.',
-        };
-        let _ = map.push(ch);
+/// Serial rendering of a summary. Classic: one char per sector (R
+/// read, P partial, L locked, . not swept) plus the key count. Type 2:
+/// the chip and the read / locked / protected page counts. Logged when
+/// a summary file is written or loaded - the check that it persisted.
+fn log_summary(what: &str, s: &app_core::card_library::TechSummary) {
+    match s {
+        app_core::card_library::TechSummary::Classic(s) => {
+            let mut map: heapless::String<40> = heapless::String::new();
+            for i in 0..s.sectors.len() {
+                let ch = match s.sector(i).map(|x| x.state) {
+                    Some(app_core::nfc::SectorState::Read) => 'R',
+                    Some(app_core::nfc::SectorState::Partial) => 'P',
+                    Some(app_core::nfc::SectorState::Locked) => 'L',
+                    None => '.',
+                };
+                let _ = map.push(ch);
+            }
+            log::info!("nfc summary {}: sectors {} keys {}", what, map.as_str(), s.keys.len());
+        }
+        app_core::card_library::TechSummary::Type2(t) => {
+            log::info!(
+                "nfc summary {}: {} pages read {}/{} locked {} protected {} auth0 {:?}",
+                what,
+                t.chip.label(),
+                t.read_count(),
+                t.chip.pages(),
+                t.locked_count(),
+                t.protected_count(),
+                t.config.map(|c| c.auth0),
+            );
+        }
     }
-    log::info!("nfc summary {}: sectors {} keys {}", what, map.as_str(), s.keys.len());
 }
 
 
@@ -868,7 +887,7 @@ impl<B: Board> SystemManager<'static, B> {
                         .nfc_summary
                         .as_ref()
                         .filter(|s| s.id == id)
-                        .map(|s| s.classic.clone());
+                        .map(|s| s.summary.clone());
                     if let Some(summary) = summary {
                         let mut path: heapless::String<80> = heapless::String::new();
                         if summary_path(&mut path, &id).is_ok() {
@@ -883,14 +902,14 @@ impl<B: Board> SystemManager<'static, B> {
                 Effect::LoadDumpSummary { id } => {
                     // A card detail opened: load its summary file into
                     // the RAM slot. No file (no dump, or one written
-                    // before summaries existed) leaves the slot empty.
+                    // in an earlier layout) leaves the slot empty.
                     let mut path: heapless::String<80> = heapless::String::new();
                     if summary_path(&mut path, &id).is_ok() {
                         let loaded = self
                             .store
                             .lock()
                             .await
-                            .load_blob::<app_core::card_library::ClassicSummary>(
+                            .load_blob::<app_core::card_library::TechSummary>(
                                 &path, SUMMARY_VERSION,
                             );
                         if let Some(summary) = loaded {

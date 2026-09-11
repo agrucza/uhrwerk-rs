@@ -635,9 +635,9 @@ impl Model {
     pub fn set_nfc_summary(
         &mut self,
         id: heapless::Vec<u8, 10>,
-        classic: crate::card_library::ClassicSummary,
+        summary: crate::card_library::TechSummary,
     ) {
-        self.cached_data.nfc_summary = Some(crate::card_library::CardSummary { id, classic });
+        self.cached_data.nfc_summary = Some(crate::card_library::CardSummary { id, summary });
         self.needs_redraw = true;
     }
 
@@ -771,7 +771,12 @@ impl Model {
                         // summary, and a file load landing after that
                         // would overwrite the sweep's live results.
                         let will_dump = self.cached_data.nfc_dump_armed
-                            && matches!(c, crate::nfc::CardIdentity::Iso14443a(a) if a.kind.is_mifare_classic());
+                            && matches!(
+                                c,
+                                crate::nfc::CardIdentity::Iso14443a(a)
+                                    if a.kind.is_mifare_classic()
+                                        || a.kind == crate::nfc::CardKind::MifareUltralight
+                            );
                         if !will_dump {
                             self.prepare_card_summary(&id, out);
                         }
@@ -785,14 +790,21 @@ impl Model {
                     if self.cached_data.nfc_dump_armed {
                         if let crate::nfc::CardIdentity::Iso14443a(a) = c {
                             if a.kind.is_mifare_classic() {
-                                let mut slot = crate::card_library::CardSummary {
+                                let mut classic = crate::card_library::ClassicSummary::default();
+                                classic.begin(a.kind.classic_sectors());
+                                self.cached_data.nfc_summary = Some(crate::card_library::CardSummary {
                                     id: id.clone(),
-                                    classic: Default::default(),
-                                };
-                                slot.classic.begin(a.kind.classic_sectors());
-                                self.cached_data.nfc_summary = Some(slot);
+                                    summary: crate::card_library::TechSummary::Classic(classic),
+                                });
                                 // Hold the display and sleep off until
                                 // NfcDumpComplete.
+                                self.nfc_dump_running = true;
+                            } else if a.kind == crate::nfc::CardKind::MifareUltralight {
+                                // A Type 2 sweep: the chip is known only
+                                // once GET_VERSION answers, so the slot
+                                // is created by NfcDumpType2. Drop any
+                                // stale slot for this card meanwhile.
+                                self.drop_summary_slot_if(&id);
                                 self.nfc_dump_running = true;
                             }
                         }
@@ -846,7 +858,23 @@ impl Model {
                         if slot_is_this {
                             let _ = out.push(Effect::SaveDumpSummary { id: id.clone() });
                         }
-                        self.cached_data.card_library.set_dump(&id, *blocks, *sectors)
+                        // The record's completeness denominator: blocks
+                        // for a Classic (from its kind), pages for a
+                        // Type 2 (from the chip the sweep identified).
+                        let total: u16 = match &self.cached_data.nfc_summary {
+                            Some(s) if slot_is_this => match &s.summary {
+                                crate::card_library::TechSummary::Classic(_) => match c {
+                                    crate::nfc::CardIdentity::Iso14443a(a) => a.kind.classic_blocks(),
+                                    _ => 0,
+                                },
+                                crate::card_library::TechSummary::Type2(t) => t.chip.pages() as u16,
+                            },
+                            _ => match c {
+                                crate::nfc::CardIdentity::Iso14443a(a) => a.kind.classic_blocks(),
+                                _ => 0,
+                            },
+                        };
+                        self.cached_data.card_library.set_dump(&id, *blocks, *sectors, total)
                     } else {
                         if slot_is_this {
                             self.cached_data.nfc_summary = None;
@@ -867,8 +895,52 @@ impl Model {
                 // NO redraw here: a 100-400 ms render between sectors
                 // made the clone card drop out mid-sweep (2026-09-08);
                 // the screen catches up on NfcDumpComplete.
-                if let Some(slot) = self.cached_data.nfc_summary.as_mut() {
-                    slot.classic.record(*sector, *state, *key, *key_is_a, *access);
+                if let Some(crate::card_library::CardSummary {
+                    summary: crate::card_library::TechSummary::Classic(classic),
+                    ..
+                }) = self.cached_data.nfc_summary.as_mut()
+                {
+                    classic.record(*sector, *state, *key, *key_is_a, *access);
+                }
+            }
+            SystemEvent::NfcDumpType2 { chip, config } => {
+                // A Type 2 sweep identified the chip: the slot for the
+                // card being dumped starts here, every page "not read",
+                // the password configuration attached when it could be
+                // read. The pages fill from NfcDumpPages.
+                if let crate::nfc::NfcScan::Card(c) = &self.cached_data.last_nfc {
+                    let mut id: heapless::Vec<u8, 10> = heapless::Vec::new();
+                    let _ = id.extend_from_slice(c.id_bytes());
+                    let mut t2 = crate::type2::Type2Summary::begin(*chip);
+                    t2.config = *config;
+                    self.cached_data.nfc_summary = Some(crate::card_library::CardSummary {
+                        id,
+                        summary: crate::card_library::TechSummary::Type2(t2),
+                    });
+                }
+            }
+            SystemEvent::NfcDumpPages { first, states } => {
+                // 32 pages' states, 2 bits each, from `first` on.
+                if let Some(crate::card_library::CardSummary {
+                    summary: crate::card_library::TechSummary::Type2(t2),
+                    ..
+                }) = self.cached_data.nfc_summary.as_mut()
+                {
+                    for (i, byte) in states.iter().enumerate() {
+                        for k in 0..4u32 {
+                            let page = *first as usize + i * 4 + k as usize;
+                            if page > 255 {
+                                break;
+                            }
+                            let state = match (byte >> (2 * k)) & 0b11 {
+                                1 => crate::type2::PageState::Read,
+                                2 => crate::type2::PageState::Locked,
+                                3 => crate::type2::PageState::Protected,
+                                _ => crate::type2::PageState::NotRead,
+                            };
+                            t2.set(page as u8, state);
+                        }
+                    }
                 }
             }
             SystemEvent::WifiStatusUpdated { state } => {
@@ -2631,7 +2703,7 @@ mod tests {
         assert!(!m.cached_data.nfc_library_full);
         assert!(!fx.iter().any(|e| matches!(e, Effect::LoadDumpSummary { .. })));
         // With a dump on record, a re-scan asks for the summary file.
-        assert!(m.cached_data.card_library.set_dump(card.id_bytes(), 64, 16));
+        assert!(m.cached_data.card_library.set_dump(card.id_bytes(), 64, 16, 64));
         let fx = m.handle_event(&SystemEvent::NfcProbe { card: Some(card.clone()) }, Instant::from_millis(10));
         assert!(fx.iter().any(|e| matches!(e, Effect::LoadDumpSummary { .. })));
         // Armed for a dump: the slot is the fresh sweep summary, and no
@@ -2640,7 +2712,12 @@ mod tests {
         m.dispatch_action(Action::ArmNfcDump, &mut out);
         let fx = m.handle_event(&SystemEvent::NfcProbe { card: Some(card.clone()) }, Instant::from_millis(20));
         assert!(!fx.iter().any(|e| matches!(e, Effect::LoadDumpSummary { .. })));
-        assert!(m.cached_data.nfc_summary.as_ref().is_some_and(|s| s.classic.sectors.len() == 16));
+        assert!(m
+            .cached_data
+            .nfc_summary
+            .as_ref()
+            .and_then(|s| s.summary.classic())
+            .is_some_and(|c| c.sectors.len() == 16));
     }
 
     #[test]

@@ -87,6 +87,12 @@ const GRID_CELL: i32 = 16;
 const GRID_PITCH: i32 = 22;
 const GRID_PER_LINE: usize = 16;
 
+/// Type 2 page grid: denser cells, 24 per line at a 13 px pitch (312
+/// px), so an NTAG216's 231 pages take ten lines.
+const PAGE_GRID_CELL: i32 = 10;
+const PAGE_GRID_PITCH: i32 = 13;
+const PAGE_GRID_PER_LINE: usize = 24;
+
 /// Pitch of the KEYS lines (body font).
 const KEY_LINE_H: i32 = 24;
 
@@ -296,14 +302,18 @@ impl NfcScreen {
         &self, display: &mut D, data: &SystemData, meta: &CardMeta, ctx: &RenderCtx,
     ) {
         let card = &meta.identity;
-        let lay = detail_layout(meta, &data.safe_area, key_lines(data, card.id_bytes()));
+        let lay = detail_layout(
+            meta, &data.safe_area, key_lines(data, card.id_bytes()), type2_pages(data, meta),
+        );
         let viewport = detail_viewport(&data.safe_area);
         // The summary slot, only when it is this card's.
-        let summary = data
+        let slot = data
             .nfc_summary
             .as_ref()
             .filter(|s| s.id.as_slice() == card.id_bytes())
-            .map(|s| &s.classic);
+            .map(|s| &s.summary);
+        let summary = slot.and_then(|s| s.classic());
+        let type2 = slot.and_then(|s| s.type2());
         let selected = self.selected_sector;
 
         // -- Scrollable body -------------------------------------------
@@ -332,10 +342,15 @@ impl NfcScreen {
                 // technology under a family headline.
                 fonts::draw_at(clip, &fonts::headline(), card_name(meta), x, y, theme::FG);
                 y += 42;
-                let sub = if meta.label.is_empty() {
-                    card.technology().label()
-                } else {
-                    card.label()
+                // A Type 2 card with a summary names its exact chip.
+                let mut sub_buf: String<32> = String::new();
+                let sub: &str = match type2 {
+                    Some(t2) => {
+                        let _ = write!(sub_buf, "{}  {} B", t2.chip.label(), t2.chip.user_bytes());
+                        sub_buf.as_str()
+                    }
+                    None if meta.label.is_empty() => card.technology().label(),
+                    None => card.label(),
                 };
                 fonts::draw_at(clip, &fonts::caption(), sub, x, y, theme::FG_MUTED);
                 y += 30;
@@ -361,29 +376,67 @@ impl NfcScreen {
                     SIDE_MARGIN + 4, sy(lay.seen_y), theme::FG_MUTED,
                 );
 
-                // -- Classic: SECTORS grid + KEYS ---------------------
-                let Some(sectors_total) = lay.sectors_total else {
+                // -- Technology section ---------------------------------
+                let Some(grid) = lay.grid else {
                     return;
                 };
                 let gx = SIDE_MARGIN;
-                tag_label(clip, gx, sy(lay.sectors_tag_y), "SECTORS", ACCENT, NOTCH);
-                // Completeness beside the tag: blocks read / total,
+                let (tag, unit) = match grid {
+                    Grid::Sectors(_) => ("SECTORS", "blk"),
+                    Grid::Pages(_) => ("PAGES", "pg"),
+                };
+                tag_label(clip, gx, sy(lay.sectors_tag_y), tag, ACCENT, NOTCH);
+                // Completeness beside the tag: units read / total,
                 // from the record (no summary needed).
                 if meta.has_dump {
-                    let total = match card {
-                        CardIdentity::Iso14443a(a) => a.kind.classic_blocks(),
-                        _ => 0,
-                    };
                     line.clear();
-                    let _ = write!(line, "{}/{} blk", meta.dump_blocks_read, total);
+                    let _ = write!(line, "{}/{} {}", meta.dump_blocks_read, dump_total(meta), unit);
                     fonts::draw_right(
                         clip, &fonts::caption(), line.as_str(),
                         theme::SCREEN_W as i32 - SIDE_MARGIN, sy(lay.sectors_tag_y) + 2,
                         theme::FG_MUTED,
                     );
                 }
-                for i in 0..sectors_total as usize {
-                    let cell = grid_cell_rect(i, lay.grid_top, scroll);
+
+                // -- Type 2: PAGES grid + status + PASSWORD ------------
+                if let Grid::Pages(n) = grid {
+                    for i in 0..n as usize {
+                        let cell = grid.cell_rect(i, lay.grid_top, scroll);
+                        draw_page_cell(clip, cell, type2.and_then(|t| t.page(i)), selected == Some(i as u8));
+                    }
+                    line.clear();
+                    let status_color = match selected {
+                        Some(p) => {
+                            page_status_line(&mut line, p, type2.and_then(|t| t.page(p as usize)));
+                            theme::FG
+                        }
+                        None => {
+                            let _ = if type2.is_some() {
+                                write!(line, "TAP A PAGE")
+                            } else if meta.has_dump {
+                                write!(line, "LOADING")
+                            } else {
+                                write!(line, "NO DUMP")
+                            };
+                            theme::FG_MUTED
+                        }
+                    };
+                    fonts::draw_at(
+                        clip, &fonts::caption(), line.as_str(), gx + 4, sy(lay.status_y), status_color,
+                    );
+                    if let Some(t2) = type2 {
+                        line.clear();
+                        password_line(&mut line, t2);
+                        fonts::draw_at(
+                            clip, &fonts::caption(), line.as_str(), gx + 4, sy(lay.pwd_y), theme::FG_MUTED,
+                        );
+                    }
+                    return;
+                }
+
+                // -- Classic: SECTORS grid + status + KEYS -------------
+                for i in 0..grid.count() {
+                    let cell = grid.cell_rect(i, lay.grid_top, scroll);
                     let info = summary.and_then(|s| s.sector(i));
                     draw_sector_cell(clip, cell, info, selected == Some(i as u8));
                 }
@@ -485,7 +538,8 @@ impl NfcScreen {
                 let (viewport_h, content_h) = match data.card_library.get_by_id(&id) {
                     Some(m) => (
                         detail_viewport(&data.safe_area).size.height as i32,
-                        detail_layout(m, &data.safe_area, key_lines(data, &id)).content_h,
+                        detail_layout(m, &data.safe_area, key_lines(data, &id), type2_pages(data, m))
+                            .content_h,
                     ),
                     None => return Action::None,
                 };
@@ -500,13 +554,15 @@ impl NfcScreen {
                 // A sector cell: select it (the status line names it).
                 // Same rect source as the render, shifted by the scroll.
                 if let Some(m) = data.card_library.get_by_id(&id) {
-                    let lay = detail_layout(m, &data.safe_area, key_lines(data, &id));
+                    let lay = detail_layout(
+                        m, &data.safe_area, key_lines(data, &id), type2_pages(data, m),
+                    );
                     let pt = Point::new(*x as i32, *y as i32);
-                    if let Some(total) = lay.sectors_total {
+                    if let Some(grid) = lay.grid {
                         if detail_viewport(&data.safe_area).contains(pt) {
                             let scroll = self.detail_scroll.offset();
-                            for i in 0..total as usize {
-                                if grid_cell_rect(i, lay.grid_top, scroll).contains(pt) {
+                            for i in 0..grid.count() {
+                                if grid.cell_rect(i, lay.grid_top, scroll).contains(pt) {
                                     self.confirm_remove = false;
                                     self.selected_sector = Some(i as u8);
                                     return Action::Redraw;
@@ -724,7 +780,24 @@ fn fmt_stamp(t: &TimeData) -> String<24> {
 
 /// Whether a card supports the dump sweep (MIFARE Classic families).
 fn is_dumpable(card: &CardIdentity) -> bool {
-    matches!(card, CardIdentity::Iso14443a(a) if a.kind.is_mifare_classic())
+    matches!(
+        card,
+        CardIdentity::Iso14443a(a)
+            if a.kind.is_mifare_classic() || a.kind == crate::nfc::CardKind::MifareUltralight
+    )
+}
+
+/// The record's completeness denominator: `dump_total` once a dump
+/// has stored it; for a Classic record dumped before that field
+/// existed, the kind's block count.
+fn dump_total(meta: &CardMeta) -> u16 {
+    if meta.dump_total != 0 {
+        return meta.dump_total;
+    }
+    match &meta.identity {
+        CardIdentity::Iso14443a(a) => a.kind.classic_blocks(),
+        _ => 0,
+    }
 }
 
 // -- Detail layout (one source for render AND hit-test) ----------------------
@@ -735,14 +808,69 @@ fn is_dumpable(card: &CardIdentity) -> bool {
 struct DetailLayout {
     panel_top: i32,
     seen_y: i32,
-    sectors_total: Option<u8>,
+    /// The technology section's grid, `None` for a card without one.
+    grid: Option<Grid>,
     sectors_tag_y: i32,
     grid_top: i32,
     status_y: i32,
     keys_tag_y: i32,
     keys_top: i32,
+    /// Type 2 only: the PASSWORD line.
+    pwd_y: i32,
     /// Total column height, for the scroll range.
     content_h: i32,
+}
+
+/// The cell grid of the technology section: Classic sectors (16 per
+/// line, 16 px cells) or Type 2 pages (24 per line, 10 px cells, so an
+/// NTAG216's 231 pages take ten lines).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grid {
+    Sectors(u8),
+    Pages(u8),
+}
+
+impl Grid {
+    fn count(self) -> usize {
+        match self {
+            Grid::Sectors(n) | Grid::Pages(n) => n as usize,
+        }
+    }
+
+    fn per_line(self) -> usize {
+        match self {
+            Grid::Sectors(_) => GRID_PER_LINE,
+            Grid::Pages(_) => PAGE_GRID_PER_LINE,
+        }
+    }
+
+    fn pitch(self) -> i32 {
+        match self {
+            Grid::Sectors(_) => GRID_PITCH,
+            Grid::Pages(_) => PAGE_GRID_PITCH,
+        }
+    }
+
+    fn cell(self) -> i32 {
+        match self {
+            Grid::Sectors(_) => GRID_CELL,
+            Grid::Pages(_) => PAGE_GRID_CELL,
+        }
+    }
+
+    fn lines(self) -> i32 {
+        self.count().div_ceil(self.per_line()) as i32
+    }
+
+    /// Rect of cell `i`, shifted by the scroll offset.
+    fn cell_rect(self, i: usize, grid_top: i32, scroll: i32) -> Rectangle {
+        let col = (i % self.per_line()) as i32;
+        let row = (i / self.per_line()) as i32;
+        Rectangle::new(
+            Point::new(SIDE_MARGIN + col * self.pitch(), grid_top + row * self.pitch() - scroll),
+            Size::new(self.cell() as u32, self.cell() as u32),
+        )
+    }
 }
 
 /// How many KEYS lines the column shows for this card: one per key in
@@ -752,54 +880,93 @@ fn key_lines(data: &SystemData, id: &[u8]) -> usize {
     data.nfc_summary
         .as_ref()
         .filter(|s| s.id.as_slice() == id)
-        .map(|s| s.classic.keys.len())
+        .and_then(|s| s.summary.classic())
+        .map(|c| c.keys.len())
         .unwrap_or(0)
         .max(1)
 }
 
 /// `key_lines` is the number of KEYS rows to reserve (see
 /// [`key_lines`]); the column ends right after them.
-fn detail_layout(meta: &CardMeta, safe: &SafeArea, key_lines: usize) -> DetailLayout {
+/// `key_lines` is the number of KEYS rows to reserve (Classic, see
+/// [`key_lines`]); `pages` the Type 2 page count to lay out (see
+/// [`type2_pages`]). The column ends right after its last section.
+fn detail_layout(meta: &CardMeta, safe: &SafeArea, key_lines: usize, pages: u8) -> DetailLayout {
     let top = app_content_top(safe);
     let panel_top = top + 8;
     let seen_y = panel_top + PANEL_H + 14;
-    let sectors_total = match &meta.identity {
+    let grid = match &meta.identity {
         CardIdentity::Iso14443a(a) if a.kind.is_mifare_classic() => {
-            Some(a.kind.classic_sectors())
+            Some(Grid::Sectors(a.kind.classic_sectors()))
+        }
+        CardIdentity::Iso14443a(a) if a.kind == crate::nfc::CardKind::MifareUltralight => {
+            Some(Grid::Pages(pages))
         }
         _ => None,
     };
-    let Some(total) = sectors_total else {
+    let Some(grid) = grid else {
         return DetailLayout {
             panel_top,
             seen_y,
-            sectors_total: None,
+            grid: None,
             sectors_tag_y: 0,
             grid_top: 0,
             status_y: 0,
             keys_tag_y: 0,
             keys_top: 0,
+            pwd_y: 0,
             content_h: seen_y + 14 + COLUMN_END_PAD - top,
         };
     };
     let sectors_tag_y = seen_y + 26;
     let grid_top = sectors_tag_y + TAG_LABEL_H + 10;
-    let lines = (total as usize).div_ceil(GRID_PER_LINE) as i32;
-    let status_y = grid_top + lines * GRID_PITCH + 4;
-    let keys_tag_y = status_y + 26;
-    let keys_top = keys_tag_y + TAG_LABEL_H + 10;
-    let keys_h = key_lines.max(1) as i32 * KEY_LINE_H;
-    DetailLayout {
-        panel_top,
-        seen_y,
-        sectors_total,
-        sectors_tag_y,
-        grid_top,
-        status_y,
-        keys_tag_y,
-        keys_top,
-        content_h: keys_top + keys_h + COLUMN_END_PAD - top,
+    let status_y = grid_top + grid.lines() * grid.pitch() + 4;
+    match grid {
+        Grid::Sectors(_) => {
+            let keys_tag_y = status_y + 26;
+            let keys_top = keys_tag_y + TAG_LABEL_H + 10;
+            let keys_h = key_lines.max(1) as i32 * KEY_LINE_H;
+            DetailLayout {
+                panel_top,
+                seen_y,
+                grid: Some(grid),
+                sectors_tag_y,
+                grid_top,
+                status_y,
+                keys_tag_y,
+                keys_top,
+                pwd_y: 0,
+                content_h: keys_top + keys_h + COLUMN_END_PAD - top,
+            }
+        }
+        Grid::Pages(_) => {
+            let pwd_y = status_y + 22;
+            DetailLayout {
+                panel_top,
+                seen_y,
+                grid: Some(grid),
+                sectors_tag_y,
+                grid_top,
+                status_y,
+                keys_tag_y: 0,
+                keys_top: 0,
+                pwd_y,
+                content_h: pwd_y + 14 + COLUMN_END_PAD - top,
+            }
+        }
     }
+}
+
+/// The Type 2 page count to lay out: the summary's chip when the slot
+/// is this card's, else the record's dump total (a dump was stored,
+/// the summary is still loading), else 0 (no grid).
+fn type2_pages(data: &SystemData, meta: &CardMeta) -> u8 {
+    data.nfc_summary
+        .as_ref()
+        .filter(|s| s.id.as_slice() == meta.identity.id_bytes())
+        .and_then(|s| s.summary.type2())
+        .map(|t| t.chip.pages())
+        .unwrap_or(meta.dump_total.min(u8::MAX as u16) as u8)
 }
 
 /// The detail body's scroll viewport: content top down to just above
@@ -812,14 +979,73 @@ fn detail_viewport(safe: &SafeArea) -> Rectangle {
     )
 }
 
-/// Rect of sector cell `i`, shifted by the scroll offset.
-fn grid_cell_rect(i: usize, grid_top: i32, scroll: i32) -> Rectangle {
-    let col = (i % GRID_PER_LINE) as i32;
-    let row = (i / GRID_PER_LINE) as i32;
-    Rectangle::new(
-        Point::new(SIDE_MARGIN + col * GRID_PITCH, grid_top + row * GRID_PITCH - scroll),
-        Size::new(GRID_CELL as u32, GRID_CELL as u32),
-    )
+/// One page cell of a Type 2 grid: green fill read, green with a dark
+/// centre dot read but write-locked, red outline behind the password,
+/// dim outline not read. The selected cell gets an accent ring.
+fn draw_page_cell<D: BlendTarget>(
+    d: &mut D, cell: Rectangle, state: Option<crate::type2::PageState>, selected: bool,
+) {
+    use crate::type2::PageState;
+    let x = cell.top_left.x;
+    let y = cell.top_left.y;
+    let w = cell.size.width as i32;
+    let h = cell.size.height as i32;
+    match state {
+        Some(PageState::Read) => d.fill_blend(x, y, w, h, theme::OK, 255),
+        Some(PageState::Locked) => {
+            d.fill_blend(x, y, w, h, theme::OK, 255);
+            d.fill_blend(x + w / 2 - 1, y + h / 2 - 1, 2, 2, theme::BG, 255);
+        }
+        Some(PageState::Protected) => {
+            cell.into_styled(PrimitiveStyle::with_stroke(theme::DANGER, 1)).draw(d).ok();
+        }
+        Some(PageState::NotRead) | None => {
+            cell.into_styled(PrimitiveStyle::with_stroke(theme::FG_DIM, 1)).draw(d).ok();
+        }
+    }
+    if selected {
+        Rectangle::new(
+            Point::new(x - 2, y - 2),
+            Size::new((w + 4) as u32, (h + 4) as u32),
+        )
+        .into_styled(PrimitiveStyle::with_stroke(ACCENT, 2))
+        .draw(d)
+        .ok();
+    }
+}
+
+/// The status line for a tapped page: "P004  READ", "P004  READ
+/// LOCKED", "P225  PROTECTED", "P010  NOT READ".
+fn page_status_line(out: &mut String<48>, page: u8, state: Option<crate::type2::PageState>) {
+    use crate::type2::PageState;
+    let _ = write!(out, "P{:03}  ", page);
+    let _ = match state {
+        Some(PageState::Read) => write!(out, "READ"),
+        Some(PageState::Locked) => write!(out, "READ  LOCKED"),
+        Some(PageState::Protected) => write!(out, "PROTECTED"),
+        Some(PageState::NotRead) | None => write!(out, "NOT READ"),
+    };
+}
+
+/// The PASSWORD line of a Type 2 detail, from the summary's config.
+fn password_line(out: &mut String<48>, t2: &crate::type2::Type2Summary) {
+    match t2.config {
+        Some(c) if c.protects(t2.chip.pages()) => {
+            let _ = write!(
+                out, "PASSWORD  from P{:03}, {}",
+                c.auth0, if c.prot { "read+write" } else { "write" },
+            );
+            if c.authlim != 0 {
+                let _ = write!(out, ", {} tries", c.authlim);
+            }
+        }
+        Some(_) => {
+            let _ = write!(out, "PASSWORD  none");
+        }
+        None => {
+            let _ = write!(out, "PASSWORD  config unreadable");
+        }
+    }
 }
 
 /// One grid cell. Fill = opened (green, "B" when key B opened it;
@@ -932,6 +1158,7 @@ mod tests {
             has_dump: true,
             dump_blocks_read: 64,
             dump_sectors_read: 16,
+            dump_total: 64,
             seq: 1,
         }
     }
@@ -940,17 +1167,63 @@ mod tests {
     fn grid_fits_the_panel_width_for_every_classic() {
         let safe = SafeArea::default();
         for kind in [CardKind::MifareClassicMini, CardKind::MifareClassic1K, CardKind::MifareClassic4K] {
-            let lay = detail_layout(&meta(kind), &safe, 1);
-            let total = lay.sectors_total.unwrap() as usize;
-            for i in 0..total {
-                let r = grid_cell_rect(i, lay.grid_top, 0);
+            let lay = detail_layout(&meta(kind), &safe, 1, 0);
+            let grid = lay.grid.unwrap();
+            for i in 0..grid.count() {
+                let r = grid.cell_rect(i, lay.grid_top, 0);
                 let right = r.top_left.x + r.size.width as i32;
                 assert!(right <= theme::SCREEN_W as i32 - SIDE_MARGIN, "{kind:?} cell {i}");
             }
             // The 4K needs three lines; the 1K one.
             let lines = (lay.status_y - 4 - lay.grid_top) / GRID_PITCH;
-            assert_eq!(lines as usize, total.div_ceil(GRID_PER_LINE));
+            assert_eq!(lines, grid.lines());
         }
+    }
+
+    #[test]
+    fn page_grid_fits_and_ntag216_takes_ten_lines() {
+        let safe = SafeArea::default();
+        // An NTAG216 (231 pages) at 24 per line: ten lines, all cells
+        // inside the panel width, PASSWORD line last.
+        let lay = detail_layout(&meta(CardKind::MifareUltralight), &safe, 1, 231);
+        let grid = lay.grid.unwrap();
+        assert_eq!(grid, Grid::Pages(231));
+        assert_eq!(grid.lines(), 10);
+        for i in 0..231 {
+            let r = grid.cell_rect(i, lay.grid_top, 0);
+            let right = r.top_left.x + r.size.width as i32;
+            assert!(right <= theme::SCREEN_W as i32 - SIDE_MARGIN, "page cell {i}");
+        }
+        assert!(lay.pwd_y > lay.status_y);
+        assert_eq!(lay.content_h, lay.pwd_y + 14 + COLUMN_END_PAD - app_content_top(&safe));
+        // No dump yet and no summary: an empty grid, short column.
+        let none = detail_layout(&meta(CardKind::MifareUltralight), &safe, 1, 0);
+        assert_eq!(none.grid, Some(Grid::Pages(0)));
+        assert!(none.content_h < lay.content_h);
+    }
+
+    #[test]
+    fn page_status_and_password_lines_format() {
+        use crate::type2::{PageState, Type2Chip, Type2Config, Type2Summary};
+        let mut s: String<48> = String::new();
+        page_status_line(&mut s, 4, Some(PageState::Locked));
+        assert_eq!(s.as_str(), "P004  READ  LOCKED");
+        s.clear();
+        page_status_line(&mut s, 225, Some(PageState::Protected));
+        assert_eq!(s.as_str(), "P225  PROTECTED");
+        s.clear();
+        let mut t2 = Type2Summary::begin(Type2Chip::Ntag216);
+        t2.config = Some(Type2Config { auth0: 0xE1, prot: true, cfglck: false, authlim: 3 });
+        password_line(&mut s, &t2);
+        assert_eq!(s.as_str(), "PASSWORD  from P225, read+write, 3 tries");
+        s.clear();
+        t2.config = Some(Type2Config { auth0: 0xFF, prot: false, cfglck: false, authlim: 0 });
+        password_line(&mut s, &t2);
+        assert_eq!(s.as_str(), "PASSWORD  none");
+        s.clear();
+        t2.config = None;
+        password_line(&mut s, &t2);
+        assert_eq!(s.as_str(), "PASSWORD  config unreadable");
     }
 
     #[test]
@@ -959,21 +1232,21 @@ mod tests {
         let viewport_h = detail_viewport(&safe).size.height as i32;
         // A 1K with one key fits without scrolling, and the column
         // ends right after that key line (no reserved empty space).
-        let one_k = detail_layout(&meta(CardKind::MifareClassic1K), &safe, 1);
+        let one_k = detail_layout(&meta(CardKind::MifareClassic1K), &safe, 1, 0);
         assert!(one_k.content_h <= viewport_h);
         assert_eq!(
             one_k.content_h,
             one_k.keys_top + KEY_LINE_H + COLUMN_END_PAD - app_content_top(&safe),
         );
         // More keys, longer column, one line each.
-        let three = detail_layout(&meta(CardKind::MifareClassic1K), &safe, 3);
+        let three = detail_layout(&meta(CardKind::MifareClassic1K), &safe, 3, 0);
         assert_eq!(three.content_h - one_k.content_h, 2 * KEY_LINE_H);
         // A 4K with many keys scrolls.
-        let four_k = detail_layout(&meta(CardKind::MifareClassic4K), &safe, 6);
+        let four_k = detail_layout(&meta(CardKind::MifareClassic4K), &safe, 6, 0);
         assert!(four_k.content_h > viewport_h);
-        // Non-Classic: no grid, short column.
-        let desfire = detail_layout(&meta(CardKind::MifareDesfire), &safe, 1);
-        assert!(desfire.sectors_total.is_none());
+        // DESFire: no grid, short column.
+        let desfire = detail_layout(&meta(CardKind::MifareDesfire), &safe, 1, 0);
+        assert!(desfire.grid.is_none());
         assert!(desfire.content_h < viewport_h);
     }
 
@@ -1094,13 +1367,11 @@ fn row_id_line(meta: &CardMeta) -> String<48> {
 fn row_seen_line(meta: &CardMeta) -> String<40> {
     let mut s: String<40> = String::new();
     let _ = write!(s, "{}", fmt_stamp(&meta.last_seen));
-    if let CardIdentity::Iso14443a(a) = &meta.identity {
-        if a.kind.is_mifare_classic() {
-            if meta.has_dump {
-                let _ = write!(s, "  DUMP {}/{}", meta.dump_blocks_read, a.kind.classic_blocks());
-            } else {
-                let _ = write!(s, "  NO DUMP");
-            }
+    if is_dumpable(&meta.identity) {
+        if meta.has_dump {
+            let _ = write!(s, "  DUMP {}/{}", meta.dump_blocks_read, dump_total(meta));
+        } else {
+            let _ = write!(s, "  NO DUMP");
         }
     }
     s

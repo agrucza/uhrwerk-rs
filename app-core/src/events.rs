@@ -227,6 +227,20 @@ pub enum SystemEvent {
         access: Option<[u8; 3]>,
     },
 
+    /// A Type 2 (Ultralight / NTAG) dump identified the chip and read
+    /// its password configuration (when readable). Sent before the
+    /// page events; the Model starts the summary slot on it.
+    NfcDumpType2 {
+        chip: crate::type2::Type2Chip,
+        config: Option<crate::type2::Type2Config>,
+    },
+
+    /// 32 pages' states of a Type 2 dump from page `first` on, 2 bits
+    /// each in the `Type2Summary` packing (page first+i at bits
+    /// 2*(i%4) of states[i/4]). Up to 8 per dump, in order, after the
+    /// sweep.
+    NfcDumpPages { first: u8, states: [u8; 8] },
+
     // -- WiFi --
     /// Progress of the current WiFi session (scan or sync), emitted
     /// by the WiFi task. Cached in `cached_data.wifi` for the

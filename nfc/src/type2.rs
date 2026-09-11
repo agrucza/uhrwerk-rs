@@ -32,9 +32,43 @@ pub fn uid_from_pages0_3(pages: &[u8; READ_LEN]) -> Option<[u8; 7]> {
     Some([pages[0], pages[1], pages[2], pages[4], pages[5], pages[6], pages[7]])
 }
 
+/// How many of a READ reply's trailing pages are roll-over copies of
+/// pages 0, 1, 2. READ wraps to page 00h past the end of the
+/// accessible memory, and "just before the AUTH0 page" when the rest
+/// is password-protected (NTAG 10.2, UL EV1 10.2). `page0_3` is the
+/// reply for page 0. Checked longest first: a genuine page that
+/// happens to equal the UID pages is the only false positive.
+pub fn wrapped_tail(reply: &[u8; READ_LEN], page0_3: &[u8; READ_LEN]) -> usize {
+    for c in (1..4).rev() {
+        if reply[(4 - c) * PAGE_SIZE..] == page0_3[..c * PAGE_SIZE] {
+            return c;
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapped_tail_finds_the_rolled_over_pages() {
+        let mut p0 = [0u8; READ_LEN];
+        for (i, b) in p0.iter_mut().enumerate() {
+            *b = 0xA0 + i as u8;
+        }
+        // AUTH0 = start + 2: the reply's last two pages are pages 0, 1.
+        let mut reply = [0x55u8; READ_LEN];
+        reply[8..16].copy_from_slice(&p0[..8]);
+        assert_eq!(wrapped_tail(&reply, &p0), 2);
+        // No wrap.
+        let reply = [0x55u8; READ_LEN];
+        assert_eq!(wrapped_tail(&reply, &p0), 0);
+        // Only the last page wrapped.
+        let mut reply = [0x55u8; READ_LEN];
+        reply[12..16].copy_from_slice(&p0[..4]);
+        assert_eq!(wrapped_tail(&reply, &p0), 1);
+    }
 
     #[test]
     fn page0_read_yields_uid_and_checks_bccs() {

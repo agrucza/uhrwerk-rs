@@ -80,6 +80,27 @@ const WAKEUP_REARM_SETTLE_MS: u64 = 200;
 /// read and whether the sweep (and its SD write, when present)
 /// completed cleanly. A false trip, or a non-dumpable card tapped while
 /// armed, leaves `dump` `None` so the arm stays standing.
+/// The structured-dump file of a card:
+/// `/system/nfc/dumps/<full-UID-hex>.dump`. Same stem as the card's
+/// meta blob, its own dir so the card enumeration never parses it.
+/// Flash-only (a full-UID name exceeds the SD FAT 8.3 limit). Built
+/// into the caller's fixed buffer - no heapless in this bin. Must
+/// match system-core's dump_path().
+fn dump_file_path<'b>(uid: &[u8], buf: &'b mut [u8; 64]) -> &'b str {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let prefix = b"/system/nfc/dumps/";
+    buf[..prefix.len()].copy_from_slice(prefix);
+    let mut len = prefix.len();
+    for &byte in uid.iter().take(10) {
+        buf[len] = HEX[(byte >> 4) as usize];
+        buf[len + 1] = HEX[(byte & 0x0F) as usize];
+        len += 2;
+    }
+    buf[len..len + 5].copy_from_slice(b".dump");
+    len += 5;
+    core::str::from_utf8(&buf[..len]).unwrap_or("/system/nfc/dumps/dump.dump")
+}
+
 struct ProbeOutcome {
     presentations: u32,
     /// A completed dump's `(blocks_read, sectors_unlocked, ok)`, or
@@ -375,19 +396,88 @@ async fn rf_probe(
                         if do_dump {
                             if let CardIdentity::Iso14443a(a) = &card {
                                 if a.kind == CardKind::MifareUltralight {
-                                    match reader.read_type2(0).await {
-                                        Ok(pages) => {
-                                            let check = match nfc::type2::uid_from_pages0_3(&pages) {
-                                                Some(u) if u.as_slice() == &a.uid[..] => "UID matches",
-                                                Some(_) => "UID MISMATCH",
-                                                None => "BCC FAIL",
-                                            };
-                                            log::info!(
-                                                "NFC: type2 pages 0-3 {:02X?} - {}",
-                                                pages, check,
-                                            );
+                                    // Type 2 dump: GET_VERSION names the
+                                    // chip, then every readable page is
+                                    // streamed to the dump file (header
+                                    // kind 3, 6-byte records: page, flags,
+                                    // 4 data bytes). Lock and password
+                                    // state come back in the summary and
+                                    // go to the UI after the sweep, as
+                                    // the Classic sector events do.
+                                    let mut pbuf = [0u8; 64];
+                                    let path = dump_file_path(&a.uid[..], &mut pbuf);
+                                    let header = [b'N', b'F', b'D', 1u8, 3u8, 4u8];
+                                    let created = {
+                                        let mut g = store.lock().await;
+                                        match g.flash_mut().write_file(path, &header) {
+                                            Ok(()) => true,
+                                            Err(e) => {
+                                                log::warn!("NFC: dump create {} failed: {:?}", path, e);
+                                                false
+                                            }
                                         }
-                                        Err(e) => log::warn!("NFC: type2 read failed: {:?}", e),
+                                    };
+                                    let dump_failed = core::cell::Cell::new(!created);
+                                    let dump_failed_ref = &dump_failed;
+                                    let on_page = move |ev: nfc::reader::Type2Event| async move {
+                                        let nfc::reader::Type2Event::Page { page, data } = ev;
+                                        // Per page: up to 231 lines per dump; the
+                                        // chip, config, boundary and "sweep done"
+                                        // lines at info tell the story.
+                                        log::debug!("NFC: t2 P{:03} {:02X?}", page, data);
+                                        if dump_failed_ref.get() {
+                                            return;
+                                        }
+                                        let mut rec = [0u8; 6];
+                                        rec[0] = page;
+                                        rec[2..6].copy_from_slice(&data);
+                                        let mut g = store.lock().await;
+                                        if g.flash_mut().append_line(path, &rec).is_err() {
+                                            log::warn!(
+                                                "NFC: dump write to {} failed at P{:03} - stopping, file incomplete",
+                                                path, page,
+                                            );
+                                            dump_failed_ref.set(true);
+                                        }
+                                    };
+                                    match reader.sweep_type2(on_page).await {
+                                        Ok(s) => {
+                                            let total = s.summary.chip.pages();
+                                            log::info!(
+                                                "NFC: t2 sweep done - {} {}/{} pages read{}",
+                                                s.summary.chip.label(),
+                                                s.pages_read,
+                                                total,
+                                                if dump_failed.get() {
+                                                    " (dump INCOMPLETE - write error)"
+                                                } else {
+                                                    " (saved to flash)"
+                                                },
+                                            );
+                                            // Chip + config first, then the
+                                            // page states 32 at a time.
+                                            EVENTS
+                                                .send(SystemEvent::NfcDumpType2 {
+                                                    chip: s.summary.chip,
+                                                    config: s.summary.config,
+                                                })
+                                                .await;
+                                            for (chunk, bytes) in s.summary.pages.chunks(8).enumerate() {
+                                                let mut states = [0u8; 8];
+                                                states[..bytes.len()].copy_from_slice(bytes);
+                                                EVENTS
+                                                    .send(SystemEvent::NfcDumpPages {
+                                                        first: (chunk * 32) as u8,
+                                                        states,
+                                                    })
+                                                    .await;
+                                            }
+                                            dump = Some((s.pages_read, 0, !dump_failed.get()));
+                                        }
+                                        Err(e) => {
+                                            log::warn!("NFC: t2 sweep failed: {:?}", e);
+                                            dump = Some((0, 0, false));
+                                        }
                                     }
                                 }
                                 // Step 4a/4b: MIFARE Classic - STREAMING sweep of
@@ -403,29 +493,9 @@ async fn rf_probe(
                                     let uid32 = nfc::mifare::uid_for_auth(&a.uid);
                                     // Structured dump streamed to a flash file,
                                     // one record per readable block - NOTHING
-                                    // accumulates in RAM. Path
-                                    // /system/nfc/dumps/<full-UID-hex>.dump: same
-                                    // stem as the card's meta blob, its own dir
-                                    // so the card enumeration never parses it.
-                                    // Flash-only - a full-UID name exceeds the SD
-                                    // FAT 8.3 limit, and the library is a flash
-                                    // feature. Built into a fixed ASCII buffer -
-                                    // no heapless in this bin. Must match
-                                    // system-core's dump_path().
-                                    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                                    // accumulates in RAM (see dump_file_path).
                                     let mut pbuf = [0u8; 64];
-                                    let prefix = b"/system/nfc/dumps/";
-                                    pbuf[..prefix.len()].copy_from_slice(prefix);
-                                    let mut plen = prefix.len();
-                                    for &byte in &a.uid[..] {
-                                        pbuf[plen] = HEX[(byte >> 4) as usize];
-                                        pbuf[plen + 1] = HEX[(byte & 0x0F) as usize];
-                                        plen += 2;
-                                    }
-                                    pbuf[plen..plen + 5].copy_from_slice(b".dump");
-                                    plen += 5;
-                                    let path = core::str::from_utf8(&pbuf[..plen])
-                                        .unwrap_or("/system/nfc/dumps/dump.dump");
+                                    let path = dump_file_path(&a.uid[..], &mut pbuf);
 
                                     // Truncate/create with a small header: magic
                                     // "NFD", format version, a card-kind byte

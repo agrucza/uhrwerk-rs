@@ -105,14 +105,166 @@ const ACCESS_DECODED: u16 = 1 << 15;
 /// `access` entry flag: trailer read but its access bits are malformed.
 const ACCESS_INVALID: u16 = 1 << 14;
 
+/// A card's dump summary, by technology. The per-card summary file
+/// holds one of these; a technology gains a variant when its read
+/// exists (DESFire later).
+///
+/// On flash it is a flat TLV record like [`CardMeta`]: a technology
+/// tag plus that technology's fields, each under a stable id, so the
+/// summary can grow (a new field, a new technology) without ever
+/// invalidating stored files. Never a versioned struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TechSummary {
+    Classic(ClassicSummary),
+    Type2(crate::type2::Type2Summary),
+}
+
+/// Stable TLV field ids for [`TechSummary`]. NEVER reuse a retired
+/// id; a type change allocates a new id. NEXT_FIELD_ID: 8.
+#[cfg(feature = "serde")]
+mod summary_field {
+    /// u8: 1 = Classic, 2 = Type 2. Mandatory.
+    pub const TECH: u16 = 1;
+    pub const CLASSIC_SECTORS: u16 = 2;
+    pub const CLASSIC_KEYS: u16 = 3;
+    pub const CLASSIC_ACCESS: u16 = 4;
+    pub const TYPE2_CHIP: u16 = 5;
+    pub const TYPE2_PAGES: u16 = 6;
+    pub const TYPE2_CONFIG: u16 = 7;
+}
+
+#[cfg(feature = "serde")]
+const TECH_CLASSIC: u8 = 1;
+#[cfg(feature = "serde")]
+const TECH_TYPE2: u8 = 2;
+
+/// Upper bound on a summary's TLV payload. Classic: 41 B sectors +
+/// 91 B keys + up to 121 B access words. Type 2: 59 B pages + chip +
+/// config. With entry headers and headroom; under the 512 B blob
+/// buffer.
+#[cfg(feature = "serde")]
+const SUMMARY_TAGGED_MAX: usize = 320;
+
+#[cfg(feature = "serde")]
+impl TechSummary {
+    fn encode_tagged(&self, buf: &mut [u8]) -> Result<usize, ()> {
+        use summary_field::*;
+        let mut at = 0usize;
+        match self {
+            TechSummary::Classic(c) => {
+                crate::tlv::put(buf, &mut at, TECH, &TECH_CLASSIC)?;
+                crate::tlv::put(buf, &mut at, CLASSIC_SECTORS, &c.sectors)?;
+                crate::tlv::put(buf, &mut at, CLASSIC_KEYS, &c.keys)?;
+                crate::tlv::put(buf, &mut at, CLASSIC_ACCESS, &c.access)?;
+            }
+            TechSummary::Type2(t) => {
+                crate::tlv::put(buf, &mut at, TECH, &TECH_TYPE2)?;
+                crate::tlv::put(buf, &mut at, TYPE2_CHIP, &t.chip)?;
+                crate::tlv::put(buf, &mut at, TYPE2_PAGES, &t.pages)?;
+                if let Some(cfg) = &t.config {
+                    crate::tlv::put(buf, &mut at, TYPE2_CONFIG, cfg)?;
+                }
+            }
+        }
+        Ok(at)
+    }
+
+    /// The technology tag is mandatory, and a Type 2 record needs its
+    /// chip; everything else defaults when missing.
+    fn decode_tagged(bytes: &[u8]) -> Option<TechSummary> {
+        use summary_field::*;
+        let mut tech: Option<u8> = None;
+        let mut classic = ClassicSummary::default();
+        let mut chip: Option<crate::type2::Type2Chip> = None;
+        let mut pages: Vec<u8, { crate::type2::PAGES_MAX.div_ceil(4) }> = Vec::new();
+        let mut config: Option<crate::type2::Type2Config> = None;
+        for (id, val) in crate::tlv::entries(bytes) {
+            match id {
+                TECH => tech = postcard::from_bytes(val).ok(),
+                CLASSIC_SECTORS => crate::tlv::get(val, &mut classic.sectors),
+                CLASSIC_KEYS => crate::tlv::get(val, &mut classic.keys),
+                CLASSIC_ACCESS => crate::tlv::get(val, &mut classic.access),
+                TYPE2_CHIP => chip = postcard::from_bytes(val).ok(),
+                TYPE2_PAGES => crate::tlv::get(val, &mut pages),
+                TYPE2_CONFIG => config = postcard::from_bytes(val).ok(),
+                _ => {} // written by a newer firmware - skip
+            }
+        }
+        match tech? {
+            TECH_CLASSIC => Some(TechSummary::Classic(classic)),
+            TECH_TYPE2 => {
+                let mut t = crate::type2::Type2Summary::begin(chip?);
+                if pages.len() == t.pages.len() {
+                    t.pages = pages;
+                }
+                t.config = config;
+                Some(TechSummary::Type2(t))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for TechSummary {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut buf = [0u8; SUMMARY_TAGGED_MAX];
+        let len = self
+            .encode_tagged(&mut buf)
+            .map_err(|_| ser::Error::custom("summary overflow"))?;
+        s.serialize_bytes(&buf[..len])
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for TechSummary {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct BytesVisitor;
+        impl<'de> de::Visitor<'de> for BytesVisitor {
+            type Value = TechSummary;
+            fn expecting(&self, f: &mut Formatter) -> fmt::Result {
+                f.write_str("summary bytes")
+            }
+            fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<TechSummary, E> {
+                TechSummary::decode_tagged(v).ok_or_else(|| E::custom("summary missing tech"))
+            }
+            fn visit_borrowed_bytes<E: de::Error>(self, v: &'de [u8]) -> Result<TechSummary, E> {
+                self.visit_bytes(v)
+            }
+        }
+        d.deserialize_bytes(BytesVisitor)
+    }
+}
+
+impl TechSummary {
+    pub fn classic(&self) -> Option<&ClassicSummary> {
+        match self {
+            TechSummary::Classic(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    pub fn type2(&self) -> Option<&crate::type2::Type2Summary> {
+        match self {
+            TechSummary::Type2(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// `access` entry flag: decoded from a read trailer.
+const ACCESS_DECODED: u16 = 1 << 15;
+/// `access` entry flag: trailer read but its access bits are malformed.
+const ACCESS_INVALID: u16 = 1 << 14;
+
 /// The one summary held in RAM: which card it belongs to, and the
 /// summary itself. Filled live by the sweep for the card being dumped,
 /// or loaded from that card's summary file when its detail opens. A
 /// screen renders it only when `id` matches the card it is showing.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardSummary {
     pub id: Vec<u8, 10>,
-    pub classic: ClassicSummary,
+    pub summary: TechSummary,
 }
 
 /// A decoded sector byte.
@@ -271,6 +423,11 @@ pub struct CardMeta {
     /// Sectors the stored dump opened with a default key (0 when
     /// `!has_dump`). Denominator is `CardKind::classic_sectors`.
     pub dump_sectors_read: u8,
+    /// Denominator of `dump_blocks_read`: blocks on a Classic, pages
+    /// on a Type 2, as the sweep determined it. 0 for a record whose
+    /// dump predates this field (a Classic; the kind's block count
+    /// then applies).
+    pub dump_total: u16,
     /// Monotonic order key: higher is newer. Assigned by
     /// [`CardLibrary::upsert`]; used to rebuild newest-first order
     /// after loading files in arbitrary order.
@@ -292,6 +449,7 @@ mod meta_field {
     pub const SEQ: u16 = 6;
     pub const DUMP_BLOCKS: u16 = 7;
     pub const DUMP_SECTORS: u16 = 8;
+    pub const DUMP_TOTAL: u16 = 9;
 }
 
 /// Upper bound on one card record's TLV payload. Identity ~16 B,
@@ -319,6 +477,7 @@ impl CardMeta {
         crate::tlv::put(buf, &mut at, SEQ, &self.seq)?;
         crate::tlv::put(buf, &mut at, DUMP_BLOCKS, &self.dump_blocks_read)?;
         crate::tlv::put(buf, &mut at, DUMP_SECTORS, &self.dump_sectors_read)?;
+        crate::tlv::put(buf, &mut at, DUMP_TOTAL, &self.dump_total)?;
         Ok(at)
     }
 
@@ -342,6 +501,7 @@ impl CardMeta {
         let mut seq = 0u32;
         let mut dump_blocks_read = 0u16;
         let mut dump_sectors_read = 0u8;
+        let mut dump_total = 0u16;
         for (id, val) in crate::tlv::entries(bytes) {
             match id {
                 IDENTITY => identity = postcard::from_bytes(val).ok(),
@@ -352,6 +512,7 @@ impl CardMeta {
                 SEQ => crate::tlv::get(val, &mut seq),
                 DUMP_BLOCKS => crate::tlv::get(val, &mut dump_blocks_read),
                 DUMP_SECTORS => crate::tlv::get(val, &mut dump_sectors_read),
+                DUMP_TOTAL => crate::tlv::get(val, &mut dump_total),
                 _ => {} // written by a newer firmware - skip
             }
         }
@@ -361,7 +522,7 @@ impl CardMeta {
         }
         Some(CardMeta {
             identity, label, first_seen, last_seen, has_dump, seq,
-            dump_blocks_read, dump_sectors_read,
+            dump_blocks_read, dump_sectors_read, dump_total,
         })
     }
 }
@@ -465,6 +626,7 @@ impl CardLibrary {
                 seq,
                 dump_blocks_read: 0,
                 dump_sectors_read: 0,
+                dump_total: 0,
             };
             // Room checked above.
             let _ = self.cards.insert(0, meta);
@@ -492,12 +654,13 @@ impl CardLibrary {
     /// Record a completed dump on the card carrying these id bytes:
     /// set `has_dump` and store the blocks/sectors captured. Returns
     /// `true` if a matching card was updated.
-    pub fn set_dump(&mut self, id: &[u8], blocks_read: u16, sectors_read: u8) -> bool {
+    pub fn set_dump(&mut self, id: &[u8], blocks_read: u16, sectors_read: u8, total: u16) -> bool {
         match self.cards.iter_mut().find(|c| c.identity.id_bytes() == id) {
             Some(c) => {
                 c.has_dump = true;
                 c.dump_blocks_read = blocks_read;
                 c.dump_sectors_read = sectors_read;
+                c.dump_total = total;
                 true
             }
             None => false,
@@ -531,6 +694,7 @@ impl CardLibrary {
                 c.has_dump = false;
                 c.dump_blocks_read = 0;
                 c.dump_sectors_read = 0;
+                c.dump_total = 0;
                 true
             }
             None => false,
@@ -698,6 +862,7 @@ mod tests {
                 seq,
                 dump_blocks_read: 0,
                 dump_sectors_read: 0,
+                dump_total: 0,
             });
         }
         lib.sort_newest_first();
@@ -792,10 +957,11 @@ mod tests {
 
     #[cfg(feature = "serde")]
     #[test]
-    fn summary_blob_round_trips_and_stays_small() {
-        // The summary is its own per-card flash file (postcard, via the
-        // generic blob envelope). Worst case: 40 sectors, every key
-        // slot used.
+    fn classic_summary_tlv_round_trips_and_stays_small() {
+        // Worst case: 40 sectors, every key slot used, every trailer
+        // decoded. 40 sector bytes + 15 keys + 40 access words (3-byte
+        // varints once bit 15 is set) must stay inside the storage
+        // layer's 512 B blob buffer.
         let mut s = ClassicSummary::default();
         s.begin(40);
         for i in 0..40u8 {
@@ -804,14 +970,54 @@ mod tests {
                 Some([0xFF, 0x07, 0x80]),
             );
         }
-        // 40 sector bytes + 15 keys + 40 access words (3-byte varints
-        // once the decoded flag sets bit 15) must stay well inside the
-        // storage layer's 512 B blob buffer.
+        let summary = TechSummary::Classic(s);
         let mut buf = [0u8; 512];
-        let encoded = postcard::to_slice(&s, &mut buf).expect("encode");
-        assert!(encoded.len() < 300, "summary {} B", encoded.len());
-        let decoded: ClassicSummary = postcard::from_bytes(encoded).expect("decode");
-        assert_eq!(decoded, s);
+        let encoded = postcard::to_slice(&summary, &mut buf).expect("encode");
+        assert!(encoded.len() < 320, "summary {} B", encoded.len());
+        let decoded: TechSummary = postcard::from_bytes(encoded).expect("decode");
+        assert_eq!(decoded, summary);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn type2_summary_tlv_round_trips_with_and_without_config() {
+        use crate::type2::{PageState, Type2Chip, Type2Config, Type2Summary};
+        let mut t = Type2Summary::begin(Type2Chip::Ntag216);
+        t.set(0, PageState::Locked);
+        t.set(4, PageState::Read);
+        t.set(230, PageState::Protected);
+        t.config = Some(Type2Config { auth0: 0xE1, prot: true, cfglck: false, authlim: 2 });
+        let summary = TechSummary::Type2(t.clone());
+        let mut buf = [0u8; 512];
+        let encoded = postcard::to_slice(&summary, &mut buf).expect("encode");
+        assert!(encoded.len() < 120, "summary {} B", encoded.len());
+        let decoded: TechSummary = postcard::from_bytes(encoded).expect("decode");
+        assert_eq!(decoded, summary);
+        // Config pages unreadable: the field is simply absent.
+        t.config = None;
+        let summary = TechSummary::Type2(t);
+        let encoded = postcard::to_slice(&summary, &mut buf).expect("encode");
+        let decoded: TechSummary = postcard::from_bytes(encoded).expect("decode");
+        assert_eq!(decoded, summary);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn summary_tlv_skips_unknown_fields_and_needs_the_tech_tag() {
+        let mut inner = [0u8; 64];
+        // A future field id, then the Classic tag: the field is skipped,
+        // the record still decodes as an empty Classic summary.
+        let mut at = 0;
+        crate::tlv::put(&mut inner, &mut at, 99u16, &0xABCDu16).unwrap();
+        crate::tlv::put(&mut inner, &mut at, summary_field::TECH, &TECH_CLASSIC).unwrap();
+        assert_eq!(
+            TechSummary::decode_tagged(&inner[..at]),
+            Some(TechSummary::Classic(ClassicSummary::default())),
+        );
+        // No tech tag: not a summary.
+        let mut at = 0;
+        crate::tlv::put(&mut inner, &mut at, summary_field::CLASSIC_KEYS, &[KEY_FF]).unwrap();
+        assert_eq!(TechSummary::decode_tagged(&inner[..at]), None);
     }
 
     #[cfg(feature = "serde")]
@@ -826,6 +1032,7 @@ mod tests {
             seq: 42,
             dump_blocks_read: 48,
             dump_sectors_read: 12,
+            dump_total: 64,
         };
         let mut buf = [0u8; 256];
         let encoded = postcard::to_slice(&meta, &mut buf).expect("encode");
@@ -845,6 +1052,7 @@ mod tests {
             seq: 1,
             dump_blocks_read: 0,
             dump_sectors_read: 0,
+            dump_total: 0,
         };
         let mut buf = [0u8; 256];
         let empty_len = meta.encode_tagged(&mut buf).unwrap();

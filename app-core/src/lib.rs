@@ -23,6 +23,7 @@ pub mod log;
 pub mod model;
 pub mod nav;
 pub mod nfc;
+pub mod type2;
 /// Shared TLV primitives for versioned flash records; only needed by
 /// the code that persists (config, card library), hence serde-gated.
 #[cfg(feature = "serde")]
