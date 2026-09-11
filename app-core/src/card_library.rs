@@ -43,7 +43,7 @@ use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 use heapless::{String, Vec};
 
 use crate::data::TimeData;
-use crate::nfc::{CardIdentity, SectorState};
+use crate::nfc::{CardIdentity, SectorAccess, SectorState};
 #[cfg(any(feature = "serde", test))]
 use crate::nfc::CardKind;
 
@@ -93,7 +93,17 @@ pub struct ClassicSummary {
     pub sectors: Vec<u8, CLASSIC_SECTORS_MAX>,
     /// Distinct keys that opened a sector, in order of first use.
     pub keys: Vec<[u8; 6], CLASSIC_KEYS_MAX>,
+    /// Per sector, parallel to `sectors`: the trailer's access
+    /// conditions packed by `SectorAccess::packed` plus
+    /// `ACCESS_DECODED`. 0 = trailer not read; `ACCESS_INVALID` = the
+    /// trailer's plain and inverted bits disagreed (format violation).
+    pub access: Vec<u16, CLASSIC_SECTORS_MAX>,
 }
+
+/// `access` entry flag: decoded from a read trailer.
+const ACCESS_DECODED: u16 = 1 << 15;
+/// `access` entry flag: trailer read but its access bits are malformed.
+const ACCESS_INVALID: u16 = 1 << 14;
 
 /// The one summary held in RAM: which card it belongs to, and the
 /// summary itself. Filled live by the sweep for the card being dumped,
@@ -112,6 +122,9 @@ pub struct SectorInfo {
     /// The key that opened it and whether it was key A - `None` for a
     /// locked sector or a key that could not be tabled.
     pub key: Option<([u8; 6], bool)>,
+    /// The trailer's access conditions: `Some(Ok)` decoded, `Some(Err)`
+    /// malformed, `None` when the trailer was not read.
+    pub access: Option<Result<SectorAccess, ()>>,
 }
 
 impl ClassicSummary {
@@ -120,14 +133,33 @@ impl ClassicSummary {
     pub fn begin(&mut self, sectors_total: u8) {
         self.sectors.clear();
         self.keys.clear();
+        self.access.clear();
         let n = (sectors_total as usize).min(CLASSIC_SECTORS_MAX);
         let _ = self.sectors.resize(n, SECTOR_NONE);
+        let _ = self.access.resize(n, 0);
     }
 
     /// Record one sector's outcome. A sector outside `begin`'s range is
     /// ignored. `key`/`key_is_a` are only consulted for an opened
-    /// sector.
-    pub fn record(&mut self, sector: u8, state: SectorState, key: [u8; 6], key_is_a: bool) {
+    /// sector. `trailer_access` is the trailer's bytes 6..=8 when it
+    /// was read; it is decoded here, a malformed one is kept as such.
+    pub fn record(
+        &mut self,
+        sector: u8,
+        state: SectorState,
+        key: [u8; 6],
+        key_is_a: bool,
+        trailer_access: Option<[u8; 3]>,
+    ) {
+        if let Some(a) = self.access.get_mut(sector as usize) {
+            *a = match trailer_access {
+                None => 0,
+                Some([b6, b7, b8]) => match SectorAccess::decode(b6, b7, b8) {
+                    Some(acc) => ACCESS_DECODED | acc.packed(),
+                    None => ACCESS_DECODED | ACCESS_INVALID,
+                },
+            };
+        }
         let Some(slot) = self.sectors.get_mut(sector as usize) else {
             return;
         };
@@ -168,7 +200,12 @@ impl ClassicSummary {
             let idx = byte & 0x0F;
             self.keys.get(idx as usize).map(|k| (*k, byte & (1 << 4) == 0))
         };
-        Some(SectorInfo { state, key })
+        let access = match self.access.get(i).copied().unwrap_or(0) {
+            0 => None,
+            a if a & ACCESS_INVALID != 0 => Some(Err(())),
+            a => Some(Ok(SectorAccess::unpack(a & 0x0FFF))),
+        };
+        Some(SectorInfo { state, key, access })
     }
 
     /// How many sectors key `idx` (into `keys`) opened.
@@ -190,6 +227,7 @@ impl ClassicSummary {
     pub fn clear(&mut self) {
         self.sectors.clear();
         self.keys.clear();
+        self.access.clear();
     }
 }
 
@@ -702,22 +740,34 @@ mod tests {
         assert_eq!(s.sectors.len(), 16);
         // Untouched sectors read as "not swept".
         assert_eq!(s.sector(3), None);
-        s.record(0, SectorState::Read, KEY_MAD, true);
-        s.record(1, SectorState::Read, KEY_FF, true);
-        s.record(2, SectorState::Partial, KEY_FF, false);
-        s.record(3, SectorState::Locked, [0; 6], true);
+        s.record(0, SectorState::Read, KEY_MAD, true, Some([0xFF, 0x07, 0x80]));
+        s.record(1, SectorState::Read, KEY_FF, true, Some([0xFF, 0x07, 0x81]));
+        s.record(2, SectorState::Partial, KEY_FF, false, None);
+        s.record(3, SectorState::Locked, [0; 6], true, None);
         // Out-of-range sector is ignored, not a panic.
-        s.record(40, SectorState::Read, KEY_FF, true);
+        s.record(40, SectorState::Read, KEY_FF, true, None);
         assert_eq!(&s.keys[..], &[KEY_MAD, KEY_FF]);
+        // Sector 0: transport trailer decoded. Sector 1: malformed
+        // trailer kept as such. Sector 2: trailer not read.
         assert_eq!(
             s.sector(0),
-            Some(SectorInfo { state: SectorState::Read, key: Some((KEY_MAD, true)) }),
+            Some(SectorInfo {
+                state: SectorState::Read,
+                key: Some((KEY_MAD, true)),
+                access: Some(Ok(crate::nfc::ACCESS_TRANSPORT)),
+            }),
         );
+        assert_eq!(s.sector(1).unwrap().access, Some(Err(())));
         assert_eq!(
             s.sector(2),
-            Some(SectorInfo { state: SectorState::Partial, key: Some((KEY_FF, false)) }),
+            Some(SectorInfo {
+                state: SectorState::Partial, key: Some((KEY_FF, false)), access: None,
+            }),
         );
-        assert_eq!(s.sector(3), Some(SectorInfo { state: SectorState::Locked, key: None }));
+        assert_eq!(
+            s.sector(3),
+            Some(SectorInfo { state: SectorState::Locked, key: None, access: None }),
+        );
         assert_eq!(s.sector(16), None);
         assert_eq!(s.key_sector_count(0), 1);
         assert_eq!(s.key_sector_count(1), 2);
@@ -731,7 +781,7 @@ mod tests {
         let mut s = ClassicSummary::default();
         s.begin(40);
         for i in 0..(CLASSIC_KEYS_MAX as u8 + 1) {
-            s.record(i, SectorState::Read, [i; 6], true);
+            s.record(i, SectorState::Read, [i; 6], true, None);
         }
         assert_eq!(s.keys.len(), CLASSIC_KEYS_MAX);
         // The 16th key has no table slot: still Read, key unknown.
@@ -749,11 +799,17 @@ mod tests {
         let mut s = ClassicSummary::default();
         s.begin(40);
         for i in 0..40u8 {
-            s.record(i, SectorState::Read, [i % CLASSIC_KEYS_MAX as u8; 6], i % 2 == 0);
+            s.record(
+                i, SectorState::Read, [i % CLASSIC_KEYS_MAX as u8; 6], i % 2 == 0,
+                Some([0xFF, 0x07, 0x80]),
+            );
         }
-        let mut buf = [0u8; 256];
+        // 40 sector bytes + 15 keys + 40 access words (3-byte varints
+        // once the decoded flag sets bit 15) must stay well inside the
+        // storage layer's 512 B blob buffer.
+        let mut buf = [0u8; 512];
         let encoded = postcard::to_slice(&s, &mut buf).expect("encode");
-        assert!(encoded.len() < 160, "summary {} B", encoded.len());
+        assert!(encoded.len() < 300, "summary {} B", encoded.len());
         let decoded: ClassicSummary = postcard::from_bytes(encoded).expect("decode");
         assert_eq!(decoded, s);
     }

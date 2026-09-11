@@ -803,7 +803,7 @@ impl Model {
                 self.needs_redraw = true;
                 let _ = out.push(Effect::MotorClick);
             }
-            SystemEvent::NfcDumpSector { sector, state, key, key_is_a } => {
+            SystemEvent::NfcDumpSector { sector, state, key, key_is_a, access } => {
                 // One sector of the running sweep: fill the summary
                 // slot, which NfcProbe pointed at the card being dumped.
                 // The summary is persisted once on NfcDumpComplete.
@@ -811,7 +811,7 @@ impl Model {
                 // made the clone card drop out mid-sweep (2026-09-08);
                 // the screen catches up on NfcDumpComplete.
                 if let Some(slot) = self.cached_data.nfc_summary.as_mut() {
-                    slot.classic.record(*sector, *state, *key, *key_is_a);
+                    slot.classic.record(*sector, *state, *key, *key_is_a, *access);
                 }
             }
             SystemEvent::WifiStatusUpdated { state } => {

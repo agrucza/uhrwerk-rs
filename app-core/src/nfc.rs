@@ -170,6 +170,127 @@ pub enum SectorState {
     Locked,
 }
 
+// ============================================================================
+// MIFARE Classic access conditions (MF1S50/MF1S70 datasheets, 8.7)
+// ============================================================================
+
+/// Which key may perform an operation (Tables 7 and 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRight {
+    Never,
+    KeyA,
+    KeyB,
+    KeyAB,
+}
+
+impl KeyRight {
+    /// Short form for the detail's status line.
+    pub fn short(self) -> &'static str {
+        match self {
+            KeyRight::Never => "-",
+            KeyRight::KeyA => "A",
+            KeyRight::KeyB => "B",
+            KeyRight::KeyAB => "AB",
+        }
+    }
+}
+
+/// The 3-bit access condition of one block group, `C1 C2 C3` packed
+/// as `c1 << 2 | c2 << 1 | c3`. Groups 0..2 are the data blocks (on a
+/// 4K's big sectors: blocks 0-4, 5-9, 10-14), group 3 is the trailer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct SectorAccess {
+    pub groups: [u8; 4],
+}
+
+/// Transport (delivery) configuration: data groups 000, trailer 001.
+pub const ACCESS_TRANSPORT: SectorAccess = SectorAccess { groups: [0, 0, 0, 0b001] };
+
+impl SectorAccess {
+    /// Decode trailer bytes 6, 7, 8 (Figure 10). Each condition bit is
+    /// stored plain and inverted; a mismatch is a format violation
+    /// (the card blocks such a sector for good) and yields `None`.
+    ///
+    /// byte 6 = ~C2[3..0] | ~C1[3..0], byte 7 = C1[3..0] | ~C3[3..0],
+    /// byte 8 = C3[3..0] | C2[3..0]; bit i of a nibble is group i.
+    pub fn decode(b6: u8, b7: u8, b8: u8) -> Option<Self> {
+        let c1 = b7 >> 4;
+        let c2 = b8 & 0x0F;
+        let c3 = b8 >> 4;
+        let ok = (b6 >> 4) == (!c2 & 0x0F)
+            && (b6 & 0x0F) == (!c1 & 0x0F)
+            && (b7 & 0x0F) == (!c3 & 0x0F);
+        if !ok {
+            return None;
+        }
+        let mut groups = [0u8; 4];
+        for (i, g) in groups.iter_mut().enumerate() {
+            let bit = |v: u8| (v >> i) & 1;
+            *g = bit(c1) << 2 | bit(c2) << 1 | bit(c3);
+        }
+        Some(Self { groups })
+    }
+
+    /// Pack into 12 bits (group i at bits 3i..3i+2) for the summary.
+    pub fn packed(self) -> u16 {
+        self.groups
+            .iter()
+            .enumerate()
+            .fold(0u16, |acc, (i, g)| acc | ((*g as u16 & 0x7) << (3 * i)))
+    }
+
+    pub fn unpack(v: u16) -> Self {
+        let mut groups = [0u8; 4];
+        for (i, g) in groups.iter_mut().enumerate() {
+            *g = ((v >> (3 * i)) & 0x7) as u8;
+        }
+        Self { groups }
+    }
+
+    pub fn is_transport(self) -> bool {
+        self == ACCESS_TRANSPORT
+    }
+
+    /// Table 7: key B is returned in the clear (and, per the note to
+    /// Table 8, cannot authenticate) for trailer conditions 000, 010
+    /// and 001.
+    pub fn key_b_readable(self) -> bool {
+        matches!(self.groups[3], 0b000 | 0b010 | 0b001)
+    }
+
+    /// Table 8 for data group `g` (0..2): who may read, write,
+    /// increment, and decrement/transfer/restore.
+    pub fn data_rights(self, g: usize) -> DataRights {
+        use KeyRight::*;
+        let (read, write, inc, dec) = match self.groups[g.min(2)] {
+            0b000 => (KeyAB, KeyAB, KeyAB, KeyAB),
+            0b010 => (KeyAB, Never, Never, Never),
+            0b100 => (KeyAB, KeyB, Never, Never),
+            0b110 => (KeyAB, KeyB, KeyB, KeyAB),
+            0b001 => (KeyAB, Never, Never, KeyAB),
+            0b011 => (KeyB, KeyB, Never, Never),
+            0b101 => (KeyB, Never, Never, Never),
+            _ => (Never, Never, Never, Never),
+        };
+        DataRights { read, write, inc, dec }
+    }
+
+    /// Whether all three data groups share one condition.
+    pub fn data_uniform(self) -> bool {
+        self.groups[0] == self.groups[1] && self.groups[1] == self.groups[2]
+    }
+}
+
+/// Per-operation rights of a data block group (Table 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataRights {
+    pub read: KeyRight,
+    pub write: KeyRight,
+    pub inc: KeyRight,
+    pub dec: KeyRight,
+}
+
 /// What every Type A card yields from anticollision, before any
 /// authentication.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,4 +442,57 @@ pub enum NfcScanError {
     SelectFailed,
     /// The RF front end or SPI path faulted.
     Hardware,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_trailer_decodes_and_round_trips() {
+        // FF 07 80: every card on the desk. Data groups 000, trailer
+        // 001 (MF1S50 8.6.3 / Figure 10).
+        let a = SectorAccess::decode(0xFF, 0x07, 0x80).unwrap();
+        assert_eq!(a, ACCESS_TRANSPORT);
+        assert!(a.is_transport());
+        assert!(a.key_b_readable());
+        assert!(a.data_uniform());
+        assert_eq!(
+            a.data_rights(0),
+            DataRights {
+                read: KeyRight::KeyAB, write: KeyRight::KeyAB,
+                inc: KeyRight::KeyAB, dec: KeyRight::KeyAB,
+            },
+        );
+        assert_eq!(SectorAccess::unpack(a.packed()), a);
+    }
+
+    #[test]
+    fn inverted_mismatch_is_a_format_violation() {
+        // Flip one plain bit without its inverted twin.
+        assert!(SectorAccess::decode(0xFF, 0x07, 0x81).is_none());
+        assert!(SectorAccess::decode(0xFE, 0x07, 0x80).is_none());
+    }
+
+    #[test]
+    fn custom_conditions_decode_per_group() {
+        // A common personalised layout: data 100 (read A|B, write B),
+        // trailer 011 (key B hidden). Build bytes from the codes:
+        // C1 = 0b1111? no - group bits: g0..g2 C1=1,C2=0,C3=0; g3
+        // C1=0,C2=1,C3=1.
+        let c1: u8 = 0b0111; // groups 0..2
+        let c2: u8 = 0b1000; // group 3
+        let c3: u8 = 0b1000; // group 3
+        let b6 = ((!c2 & 0xF) << 4) | (!c1 & 0xF);
+        let b7 = (c1 << 4) | (!c3 & 0xF);
+        let b8 = (c3 << 4) | c2;
+        let a = SectorAccess::decode(b6, b7, b8).unwrap();
+        assert_eq!(a.groups, [0b100, 0b100, 0b100, 0b011]);
+        assert!(!a.is_transport());
+        assert!(!a.key_b_readable());
+        assert_eq!(a.data_rights(1).write, KeyRight::KeyB);
+        assert_eq!(a.data_rights(1).read, KeyRight::KeyAB);
+        assert_eq!(a.data_rights(1).inc, KeyRight::Never);
+        assert_eq!(SectorAccess::unpack(a.packed()), a);
+    }
 }

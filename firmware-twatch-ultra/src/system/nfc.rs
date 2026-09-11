@@ -464,10 +464,11 @@ async fn rf_probe(
                                     // next WUPA (2026-09-08); the sweep's timing
                                     // must stay exactly the verified one. 40 =
                                     // the 4K's sector count.
-                                    type SectorOutcome = (u8, app_core::nfc::SectorState, [u8; 6], bool);
+                                    type SectorOutcome =
+                                        (u8, app_core::nfc::SectorState, [u8; 6], bool, Option<[u8; 3]>);
                                     let outcomes: core::cell::RefCell<([SectorOutcome; 40], usize)> =
                                         core::cell::RefCell::new((
-                                            [(0u8, app_core::nfc::SectorState::Locked, [0u8; 6], true); 40],
+                                            [(0u8, app_core::nfc::SectorState::Locked, [0u8; 6], true, None); 40],
                                             0,
                                         ));
                                     let outcomes_ref = &outcomes;
@@ -476,11 +477,11 @@ async fn rf_probe(
                                         // sector outcome - a locked sector is
                                         // simply absent there.
                                         let b = match ev {
-                                            nfc::reader::SweepEvent::Sector { sector, state, key, key_is_a } => {
+                                            nfc::reader::SweepEvent::Sector { sector, state, key, key_is_a, access } => {
                                                 let mut o = outcomes_ref.borrow_mut();
                                                 let n = o.1;
                                                 if n < o.0.len() {
-                                                    o.0[n] = (sector, state, key, key_is_a);
+                                                    o.0[n] = (sector, state, key, key_is_a, access);
                                                     o.1 = n + 1;
                                                 }
                                                 return;
@@ -568,9 +569,11 @@ async fn rf_probe(
                                         let o = outcomes.borrow();
                                         (o.0, o.1)
                                     };
-                                    for &(sector, state, key, key_is_a) in &list[..n] {
+                                    for &(sector, state, key, key_is_a, access) in &list[..n] {
                                         EVENTS
-                                            .send(SystemEvent::NfcDumpSector { sector, state, key, key_is_a })
+                                            .send(SystemEvent::NfcDumpSector {
+                                                sector, state, key, key_is_a, access,
+                                            })
                                             .await;
                                     }
                                     // The sweep leaves the card HALTED (encrypted

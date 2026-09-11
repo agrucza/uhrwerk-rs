@@ -40,6 +40,13 @@ const RX_POLL_GAP_MS: u32 = 2;
 const REACTIVATE_TRIES: u32 = 3;
 const REACTIVATE_RETRY_GAP_MS: u32 = 30;
 
+/// Read passes per opened sector: after the first pass, each further
+/// one re-authenticates with the same key and re-reads only the blocks
+/// still missing. A block that fails a read is a transient far more
+/// often than a real refusal (the 4K lost 4 of 256 reads on a resting
+/// card, 2026-09-09), so a sector is Partial only after all passes.
+const SECTOR_READ_PASSES: u32 = 3;
+
 /// Reader over one chip seat. Borrows the SPI device and a delay for
 /// the reader's lifetime; the field must already be up.
 pub struct Reader<'a, S: SpiDevice, D: DelayNs> {
@@ -83,6 +90,9 @@ pub enum SweepEvent {
         /// The key that opened it (`Read`/`Partial`); zeros for `Locked`.
         key: [u8; 6],
         key_is_a: bool,
+        /// Trailer bytes 6..=8 (the access conditions) when the
+        /// trailer was read this sweep.
+        access: Option<[u8; 3]>,
     },
 }
 
@@ -595,6 +605,29 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
         Ok(())
     }
 
+    /// [`reactivate`](Self::reactivate) with retries. A wake failure
+    /// usually means the card left the field (the small coil decouples
+    /// easily on a long sweep) - but a single unanswered WUPA is also
+    /// what a transient looks like (the blank 1K dropped at sector 1
+    /// while resting still, 2026-09-08). Tries [`REACTIVATE_TRIES`]
+    /// times with a short gap and logs which attempt won; `false`
+    /// only when every attempt failed, i.e. the card is gone.
+    async fn reactivate_retrying(&mut self, sector: u8) -> bool {
+        for attempt in 0..REACTIVATE_TRIES {
+            if self.reactivate().await.is_ok() {
+                if attempt > 0 {
+                    log::warn!(
+                        "nfc-dbg: sweep sector {} reactivate ok on retry {}",
+                        sector, attempt,
+                    );
+                }
+                return true;
+            }
+            self.delay.delay_ms(REACTIVATE_RETRY_GAP_MS).await;
+        }
+        false
+    }
+
     /// Stream every readable block of a MIFARE Classic to `on_event`
     /// as a [`SweepEvent::Block`], one block at a time, plus one
     /// [`SweepEvent::Sector`] per sector once its outcome is known,
@@ -636,36 +669,21 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
             let first = mifare::sector_first_block(sector) as u8;
             let nblk = mifare::blocks_in_sector(sector);
 
-            // Find a working key: key A dictionary, then key B. Every
-            // attempt re-activates first, because a failed auth leaves
-            // the card unselected.
+            // Find a working key: the key A dictionary, the key A
+            // dictionary AGAIN, then key B. The repeat is deliberate:
+            // in the transport configuration key B is readable and
+            // "cannot serve for authentication" (MF1S50 Table 8 note
+            // 1) - a genuine card accepts the auth and then refuses
+            // every read. One transient NAK on the right key A must
+            // not fall through to that. Every attempt re-activates
+            // first, because a failed auth leaves the card unselected.
             let mut opened: Option<(Crypto1, [u8; 6], bool)> = None;
-            'keys: for &key_is_a in &[true, false] {
+            'keys: for &key_is_a in &[true, true, false] {
                 for &key in mifare::DEFAULT_KEYS {
-                    // A wake/re-select failure here usually means the
-                    // card left the field (the small coil decouples
-                    // easily on a long sweep) - but a single unanswered
-                    // WUPA is also what a transient looks like (the
-                    // blank 1K dropped at sector 1 while resting still,
-                    // 2026-09-08). Retry a few times with a short gap
-                    // and log which attempt won: a removed card fails
-                    // them all. Only then is the sweep over - keep
-                    // whatever was already read and return it.
-                    let mut woke = false;
-                    for attempt in 0..REACTIVATE_TRIES {
-                        if self.reactivate().await.is_ok() {
-                            if attempt > 0 {
-                                log::warn!(
-                                    "nfc-dbg: sweep sector {} reactivate ok on retry {}",
-                                    sector, attempt,
-                                );
-                            }
-                            woke = true;
-                            break;
-                        }
-                        self.delay.delay_ms(REACTIVATE_RETRY_GAP_MS).await;
-                    }
-                    if !woke {
+                    // A card that answers none of the wake attempts is
+                    // gone: the sweep is over - keep whatever was
+                    // already read and return it.
+                    if !self.reactivate_retrying(sector).await {
                         log::warn!(
                             "nfc-dbg: sweep card lost at sector {} ({} wake attempts) - partial dump, {} blocks read",
                             sector, REACTIVATE_TRIES, stats.blocks_read,
@@ -682,40 +700,81 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
             match opened {
                 Some((mut cipher, key, key_is_a)) => {
                     stats.sectors_unlocked += 1;
-                    let mut read_here: u8 = 0;
-                    for b in 0..nblk {
-                        let block = first + b;
-                        match self.mifare_read_block(&mut cipher, block).await {
-                            Ok(data) => {
-                                stats.blocks_read += 1;
-                                read_here += 1;
-                                on_event(SweepEvent::Block(SweepBlock {
-                                    sector,
-                                    block,
-                                    is_trailer: b + 1 == nblk,
-                                    key,
-                                    key_is_a,
-                                    data,
-                                }))
-                                .await;
+                    // Bit b set = block b of this sector read. 16 bits
+                    // cover the 4K's 16-block sectors.
+                    let mut got: u16 = 0;
+                    let all: u16 = if nblk >= 16 { u16::MAX } else { (1u16 << nblk) - 1 };
+                    let mut access: Option<[u8; 3]> = None;
+                    for pass in 0..SECTOR_READ_PASSES {
+                        if pass > 0 {
+                            // Re-open the sector with the key that
+                            // worked and read only what is missing. A
+                            // card that will not wake is gone.
+                            if !self.reactivate_retrying(sector).await {
+                                log::warn!(
+                                    "nfc-dbg: sweep card lost at sector {} ({} wake attempts) - partial dump, {} blocks read",
+                                    sector, REACTIVATE_TRIES, stats.blocks_read,
+                                );
+                                return Ok(stats);
                             }
-                            Err(e) => log::warn!(
-                                "nfc-dbg: sweep sector {} block {} read failed: {:?}",
-                                sector, block, e,
-                            ),
+                            match self.mifare_auth(key, key_is_a, first, uid32).await {
+                                Ok(c) => cipher = c,
+                                Err(e) => {
+                                    log::warn!(
+                                        "nfc-dbg: sweep sector {} re-auth for pass {} failed: {:?}",
+                                        sector, pass, e,
+                                    );
+                                    break;
+                                }
+                            }
+                            log::warn!(
+                                "nfc-dbg: sweep sector {} pass {} for {} missing block(s)",
+                                sector, pass, (all & !got).count_ones(),
+                            );
+                        }
+                        for b in 0..nblk {
+                            if got & (1 << b) != 0 {
+                                continue;
+                            }
+                            let block = first + b;
+                            match self.mifare_read_block(&mut cipher, block).await {
+                                Ok(data) => {
+                                    got |= 1 << b;
+                                    stats.blocks_read += 1;
+                                    if b + 1 == nblk {
+                                        access = Some([data[6], data[7], data[8]]);
+                                    }
+                                    on_event(SweepEvent::Block(SweepBlock {
+                                        sector,
+                                        block,
+                                        is_trailer: b + 1 == nblk,
+                                        key,
+                                        key_is_a,
+                                        data,
+                                    }))
+                                    .await;
+                                }
+                                Err(e) => log::warn!(
+                                    "nfc-dbg: sweep sector {} block {} read failed: {:?}",
+                                    sector, block, e,
+                                ),
+                            }
+                        }
+                        // End the crypto session so the card is HALTED
+                        // for the next auth or the next sector's WUPA.
+                        if let Err(e) = self.mifare_halt(&mut cipher).await {
+                            log::warn!("nfc-dbg: sweep sector {} halt failed: {:?}", sector, e);
+                        }
+                        if got == all {
+                            break;
                         }
                     }
-                    // End the crypto session so the card is HALTED for
-                    // the next sector's WUPA.
-                    if let Err(e) = self.mifare_halt(&mut cipher).await {
-                        log::warn!("nfc-dbg: sweep sector {} halt failed: {:?}", sector, e);
-                    }
-                    let state = if read_here == nblk {
+                    let state = if got == all {
                         SectorState::Read
                     } else {
                         SectorState::Partial
                     };
-                    on_event(SweepEvent::Sector { sector, state, key, key_is_a }).await;
+                    on_event(SweepEvent::Sector { sector, state, key, key_is_a, access }).await;
                 }
                 None => {
                     log::warn!("nfc-dbg: sweep sector {} locked (no default key)", sector);
@@ -724,6 +783,7 @@ impl<'a, S: SpiDevice, D: DelayNs> Reader<'a, S, D> {
                         state: SectorState::Locked,
                         key: [0; 6],
                         key_is_a: true,
+                        access: None,
                     })
                     .await;
                 }

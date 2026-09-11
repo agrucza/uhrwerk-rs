@@ -71,8 +71,9 @@ fn dump_path(buf: &mut heapless::String<80>, id: &[u8]) -> core::fmt::Result {
     write!(buf, ".dump")
 }
 
-/// Blob version of a card's sector-summary file.
-const SUMMARY_VERSION: u8 = 1;
+/// Blob version of a card's sector-summary file. 2: per-sector access
+/// conditions added (v1 files fail to load; the card is re-dumped).
+const SUMMARY_VERSION: u8 = 2;
 
 /// Build the sector-summary path `DUMP_DIR/<id-hex>.sum` for a card:
 /// the `ClassicSummary` of its stored dump, as a versioned blob. Lives

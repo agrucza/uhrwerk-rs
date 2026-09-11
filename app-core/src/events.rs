@@ -222,6 +222,9 @@ pub enum SystemEvent {
         state: crate::nfc::SectorState,
         key: [u8; 6],
         key_is_a: bool,
+        /// Trailer bytes 6..=8 (access conditions) when the trailer
+        /// was read.
+        access: Option<[u8; 3]>,
     },
 
     // -- WiFi --

@@ -797,10 +797,20 @@ fn draw_sector_cell<D: BlendTarget>(
     let w = cell.size.width as i32;
     let h = cell.size.height as i32;
     match info {
-        Some(SectorInfo { state: SectorState::Read, key }) => {
+        Some(SectorInfo { state: SectorState::Read, key, access }) => {
             d.fill_blend(x, y, w, h, theme::OK, 255);
             if matches!(key, Some((_, false))) {
                 fonts::draw_centered_in_rect(d, &fonts::caption(), "B", cell, theme::BG);
+            }
+            // Corner mark: the sector is not in transport configuration
+            // (cyan), or its trailer's access bits are malformed (amber).
+            let mark = match access {
+                Some(Ok(a)) if !a.is_transport() => Some(ACCENT_HOT),
+                Some(Err(())) => Some(theme::WARN),
+                _ => None,
+            };
+            if let Some(c) = mark {
+                d.fill_blend(x + w - 5, y + 1, 4, 4, c, 255);
             }
         }
         Some(SectorInfo { state: SectorState::Partial, .. }) => {
@@ -842,6 +852,29 @@ fn sector_status_line(out: &mut String<48>, sector: u8, info: Option<SectorInfo>
         for b in &key {
             let _ = write!(out, "{:02X}", b);
         }
+    }
+    // The trailer's access conditions: TRANSPORT for a factory card,
+    // else the data rights (read/write by which key; "mixed" when the
+    // three data groups differ) and whether key B is exposed.
+    match info.access {
+        Some(Ok(a)) if a.is_transport() => {
+            let _ = write!(out, "  TRANSPORT");
+        }
+        Some(Ok(a)) => {
+            if a.data_uniform() {
+                let r = a.data_rights(0);
+                let _ = write!(out, "  r{} w{}", r.read.short(), r.write.short());
+            } else {
+                let _ = write!(out, "  mixed");
+            }
+            if a.key_b_readable() {
+                let _ = write!(out, " kB!");
+            }
+        }
+        Some(Err(())) => {
+            let _ = write!(out, "  BAD ACC");
+        }
+        None => {}
     }
 }
 
@@ -912,11 +945,28 @@ mod tests {
     fn status_line_formats() {
         let mut s: String<48> = String::new();
         sector_status_line(&mut s, 7, Some(SectorInfo {
-            state: SectorState::Read, key: Some(([0xFF; 6], true)),
+            state: SectorState::Read, key: Some(([0xFF; 6], true)), access: None,
         }));
         assert_eq!(s.as_str(), "S07  READ  A FFFFFFFFFFFF");
         s.clear();
-        sector_status_line(&mut s, 3, Some(SectorInfo { state: SectorState::Locked, key: None }));
+        sector_status_line(&mut s, 7, Some(SectorInfo {
+            state: SectorState::Read,
+            key: Some(([0xFF; 6], true)),
+            access: Some(Ok(crate::nfc::ACCESS_TRANSPORT)),
+        }));
+        assert_eq!(s.as_str(), "S07  READ  A FFFFFFFFFFFF  TRANSPORT");
+        s.clear();
+        // Personalised: data 100 (read A|B, write B), trailer 011.
+        let custom = crate::nfc::SectorAccess { groups: [0b100, 0b100, 0b100, 0b011] };
+        sector_status_line(&mut s, 8, Some(SectorInfo {
+            state: SectorState::Read, key: Some(([0xFF; 6], true)), access: Some(Ok(custom)),
+        }));
+        assert_eq!(s.as_str(), "S08  READ  A FFFFFFFFFFFF  rAB wB");
+        assert!(s.len() <= 44);
+        s.clear();
+        sector_status_line(&mut s, 3, Some(SectorInfo {
+            state: SectorState::Locked, key: None, access: None,
+        }));
         assert_eq!(s.as_str(), "S03  LOCKED");
         s.clear();
         sector_status_line(&mut s, 9, None);
